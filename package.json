@@ -1,6 +1,6 @@
 {
   "name": "ziki-auto-work",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Autonomous Ziki work loop for your repo, powered by opencode, Claude Code, Codex, or Gemini.",
   "type": "module",
   "license": "MIT",

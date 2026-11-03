@@ -2,8 +2,9 @@
 
 ```
 src/
-  cli.ts             commands, init wizard, detect, models
-  config.ts          config v2, defaults, validation, migration, env
+  cli.ts             commands, init wizard, detect, models, keys, uninstall
+  config.ts          config v3, defaults, validation, env
+  keys.ts            key import, validation and role assignment
   types.ts           shared types
   orchestrator.ts    the loop and state machine
   ziki.ts            typed Ziki API client
@@ -17,9 +18,10 @@ src/
   checks.ts          generic check runner, baseline, secrets, protected files
   doctor.ts          environment validation
   service.ts         systemd/launchd/Task Scheduler/detached process
+  uninstall.ts       service, shim, config and state cleanup
   platform/          paths, spawn, platform detection
   log.ts             structured logs
-  state.ts           per-job state, locks, pause/stop
+  state.ts           per-profile state, locks, pause/stop
 ```
 
 ## The cycle
@@ -28,7 +30,7 @@ src/
 2. `memory` — refresh instructions, shared notes, private notes, mistakes.
 3. `feed` — merge worker and manager work feeds with ETags.
 4. `platform` — refresh the platform's issues and ideas (10 min cache).
-5. `queue` — filter to this job's platform, prioritise, skip recent/blocked.
+5. `queue` — filter to this profile's platform, prioritise, skip recent/blocked.
 6. `heartbeat` — keep active claims alive.
 7. `baseline` — once per base SHA, record pre-existing check failures.
 8. `owner` — handle one owner request.
@@ -47,13 +49,13 @@ reads it and decides what to do. The contract is provider-independent.
 
 ## State
 
-Each job has its own state directory. `state.json` holds tasks, escalations,
+Each profile has its own state directory. `state.json` holds tasks, escalations,
 counters, feed ETags and baseline failures. `status.json` is the human-readable
-snapshot. Locks are per job, so `start --all` can run multiple jobs.
+snapshot. Locks are per profile, so `start --all` can run multiple profiles.
 
 ## Worktrees
 
-The harness clones the fork into `jobs/<job>/repos/repo`, fetches `upstream`,
+The harness clones the fork into `profiles/<profile>/repos/repo`, fetches `upstream`,
 and creates a worktree per ticket and per review. `.env` is copied from the
 clone so builds work. Worktrees are removed after delivery/review failures and
 cleaned up after tasks finish.

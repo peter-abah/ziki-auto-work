@@ -98,7 +98,7 @@ export interface HitlConfig {
   notifyCommand?: string | null;
 }
 
-export interface JobConfig {
+export interface ProfileConfig {
   ziki: ZikiConfig;
   stack?: string;
   repo: RepoConfig;
@@ -117,10 +117,10 @@ export interface JobConfig {
 }
 
 export interface Config {
-  version: 2;
-  activeJob: string;
-  defaults?: Partial<JobConfig>;
-  jobs: Record<string, JobConfig>;
+  version: 3;
+  activeProfile: string;
+  defaults?: Partial<ProfileConfig>;
+  profiles: Record<string, ProfileConfig>;
 }
 
 export interface Paths {
@@ -132,7 +132,9 @@ export interface Paths {
   stateDir: string;
   cacheDir: string;
   bin: string;
-  jobsDir: string;
+  profilesDir: string;
+  legacyShareDir: string;
+  legacyStateDir: string;
   packageRoot: string;
   promptsDir: string;
   configSamplesDir: string;
@@ -142,7 +144,7 @@ export interface Paths {
   launchdPlist: string;
 }
 
-export interface JobPaths {
+export interface ProfilePaths {
   stateDir: string;
   stateFile: string;
   statusFile: string;
@@ -165,12 +167,12 @@ export interface AgentKey {
   key: string;
 }
 
-export interface LoadedJob {
+export interface LoadedProfile {
   config: Config;
-  jobName: string;
-  job: JobConfig;
+  profileName: string;
+  profile: ProfileConfig;
   paths: Paths;
-  jobPaths: JobPaths;
+  profilePaths: ProfilePaths;
   env: Record<string, string>;
   keys: { workers: AgentKey[]; managers: AgentKey[] };
   getKey: (name: string) => string | null;
@@ -399,7 +401,7 @@ export interface Counters {
 
 export interface State {
   version: 1;
-  job: string | null;
+  profile: string | null;
   startedAt: string | null;
   stoppedAt: string | null;
   lastCycleAt: string | null;
@@ -483,8 +485,8 @@ export interface ProviderAdapter {
     resultPath: string;
     model: string | null;
   }): ProviderCommand;
-  doctor(job: JobConfig): Promise<{ ok: boolean; detail: string }>;
-  models(job: JobConfig): Promise<{ items: string[]; note?: string }>;
+  doctor(profile: ProfileConfig): Promise<{ ok: boolean; detail: string }>;
+  models(profile: ProfileConfig): Promise<{ items: string[]; note?: string }>;
 }
 
 export interface QueueEntry {

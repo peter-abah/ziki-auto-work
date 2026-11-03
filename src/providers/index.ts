@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { JobConfig, ProviderAdapter, ProviderCommand, ProviderName } from "../types.js";
+import type { ProfileConfig, ProviderAdapter, ProviderCommand, ProviderName } from "../types.js";
 import { runCommand } from "../platform/spawn.js";
 
 function modelArgs(provider: ProviderName, model: string | null): string[] {
@@ -19,21 +19,21 @@ function modelArgs(provider: ProviderName, model: string | null): string[] {
   }
 }
 
-function extra(job: JobConfig): string[] {
-  return job.executor.extraArgs ?? [];
+function extra(profile: ProfileConfig): string[] {
+  return profile.executor.extraArgs ?? [];
 }
 
-function promptMode(job: JobConfig): "arg" | "stdin" {
-  return job.executor.promptMode ?? "arg";
+function promptMode(profile: ProfileConfig): "arg" | "stdin" {
+  return profile.executor.promptMode ?? "arg";
 }
 
-function opencode(job: JobConfig): ProviderAdapter {
-  const command = job.executor.command || "opencode";
+function opencode(profile: ProfileConfig): ProviderAdapter {
+  const command = profile.executor.command || "opencode";
   return {
     name: "opencode",
     build({ prompt, cwd, model }) {
-      const args = ["run", "--auto", "--format", "default", "--dir", cwd, ...modelArgs("opencode", model), ...extra(job)];
-      if (promptMode(job) === "stdin") return { command, args, stdin: prompt };
+      const args = ["run", "--auto", "--format", "default", "--dir", cwd, ...modelArgs("opencode", model), ...extra(profile)];
+      if (promptMode(profile) === "stdin") return { command, args, stdin: prompt };
       return { command, args: [...args, prompt] };
     },
     async doctor() {
@@ -48,17 +48,17 @@ function opencode(job: JobConfig): ProviderAdapter {
   };
 }
 
-function claude(job: JobConfig): ProviderAdapter {
-  const command = job.executor.command || "claude";
+function claude(profile: ProfileConfig): ProviderAdapter {
+  const command = profile.executor.command || "claude";
   const permission =
-    job.executor.permissionMode === "safe"
+    profile.executor.permissionMode === "safe"
       ? ["--permission-mode", "acceptEdits"]
       : ["--dangerously-skip-permissions"];
   return {
     name: "claude",
     build({ prompt, cwd, model }) {
-      const args = ["-p", ...permission, ...modelArgs("claude", model), ...extra(job)];
-      if (promptMode(job) === "stdin") return { command, args, stdin: prompt };
+      const args = ["-p", ...permission, ...modelArgs("claude", model), ...extra(profile)];
+      if (promptMode(profile) === "stdin") return { command, args, stdin: prompt };
       return { command, args: [...args, prompt] };
     },
     async doctor() {
@@ -74,17 +74,17 @@ function claude(job: JobConfig): ProviderAdapter {
   };
 }
 
-function codex(job: JobConfig): ProviderAdapter {
-  const command = job.executor.command || "codex";
+function codex(profile: ProfileConfig): ProviderAdapter {
+  const command = profile.executor.command || "codex";
   const permission =
-    job.executor.permissionMode === "safe"
+    profile.executor.permissionMode === "safe"
       ? ["-s", "workspace-write"]
       : ["--dangerously-bypass-approvals-and-sandbox"];
   return {
     name: "codex",
     build({ prompt, cwd, model }) {
-      const args = ["exec", ...permission, "-C", cwd, ...modelArgs("codex", model), ...extra(job)];
-      if (promptMode(job) === "stdin") return { command, args, stdin: prompt };
+      const args = ["exec", ...permission, "-C", cwd, ...modelArgs("codex", model), ...extra(profile)];
+      if (promptMode(profile) === "stdin") return { command, args, stdin: prompt };
       return { command, args: [...args, prompt] };
     },
     async doctor() {
@@ -105,15 +105,15 @@ function codex(job: JobConfig): ProviderAdapter {
   };
 }
 
-function gemini(job: JobConfig): ProviderAdapter {
-  const command = job.executor.command || "gemini";
+function gemini(profile: ProfileConfig): ProviderAdapter {
+  const command = profile.executor.command || "gemini";
   const permission =
-    job.executor.permissionMode === "safe" ? ["--approval-mode", "auto_edit"] : ["--yolo", "--skip-trust"];
+    profile.executor.permissionMode === "safe" ? ["--approval-mode", "auto_edit"] : ["--yolo", "--skip-trust"];
   return {
     name: "gemini",
     build({ prompt, cwd, model }) {
-      const args = ["-p", ...permission, ...modelArgs("gemini", model), ...extra(job)];
-      if (promptMode(job) === "stdin") return { command, args, stdin: prompt };
+      const args = ["-p", ...permission, ...modelArgs("gemini", model), ...extra(profile)];
+      if (promptMode(profile) === "stdin") return { command, args, stdin: prompt };
       return { command, args: [...args, prompt] };
     },
     async doctor() {
@@ -126,9 +126,9 @@ function gemini(job: JobConfig): ProviderAdapter {
   };
 }
 
-function custom(job: JobConfig): ProviderAdapter {
-  const command = job.executor.command || "";
-  const template = job.executor.args ?? [];
+function custom(profile: ProfileConfig): ProviderAdapter {
+  const command = profile.executor.command || "";
+  const template = profile.executor.args ?? [];
   const render = (value: string, vars: Record<string, string>): string =>
     value.replace(/\{\{([a-zA-Z0-9_]+)\}\}/g, (_, key: string) => vars[key] ?? "");
 
@@ -137,7 +137,7 @@ function custom(job: JobConfig): ProviderAdapter {
     build({ prompt, cwd, model, resultPath }) {
       const vars = { prompt, cwd, model: model ?? "", resultPath };
       const args = template.map((arg) => render(arg, vars));
-      if (promptMode(job) === "stdin") return { command, args, stdin: prompt };
+      if (promptMode(profile) === "stdin") return { command, args, stdin: prompt };
       const hasPrompt = template.some((arg) => arg.includes("{{prompt}}"));
       return { command, args: hasPrompt ? args : [...args, prompt] };
     },
@@ -152,7 +152,7 @@ function custom(job: JobConfig): ProviderAdapter {
   };
 }
 
-const ADAPTERS: Record<ProviderName, (job: JobConfig) => ProviderAdapter> = {
+const ADAPTERS: Record<ProviderName, (profile: ProfileConfig) => ProviderAdapter> = {
   opencode,
   claude,
   codex,
@@ -160,17 +160,17 @@ const ADAPTERS: Record<ProviderName, (job: JobConfig) => ProviderAdapter> = {
   custom
 };
 
-export function getProvider(name: ProviderName, job: JobConfig): ProviderAdapter {
+export function getProvider(name: ProviderName, profile: ProfileConfig): ProviderAdapter {
   const factory = ADAPTERS[name];
   if (!factory) throw new Error(`Unknown provider "${name}"`);
-  return factory(job);
+  return factory(profile);
 }
 
-export function providerCommand(job: JobConfig, input: {
+export function providerCommand(profile: ProfileConfig, input: {
   prompt: string;
   cwd: string;
   resultPath: string;
   model: string | null;
 }): ProviderCommand {
-  return getProvider(job.executor.provider, job).build(input);
+  return getProvider(profile.executor.provider, profile).build(input);
 }

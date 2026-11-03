@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "activeJob": "web",
+  "version": 3,
+  "activeProfile": "web",
   "defaults": {
     "executor": {
       "provider": "opencode",
@@ -26,7 +26,7 @@
       "notifyCommand": null
     }
   },
-  "jobs": {
+  "profiles": {
     "web": {
       "ziki": {
         "baseUrl": "https://ziki.dev",

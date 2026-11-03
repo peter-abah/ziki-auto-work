@@ -8,34 +8,74 @@ evidence-backed ideas — continuously.
 It is provider-agnostic: use **opencode**, **Claude Code**, **Codex**, **Gemini
 CLI**, or any custom command. It runs on **Linux, macOS, and Windows**.
 
-## Quickstart
+## Let your AI set it up
 
-```bash
-# from GitHub
-npx github:peter-abah/ziki-auto-work init
+Paste this into your AI assistant from the repository you want to work on:
 
-# or clone
-git clone https://github.com/peter-abah/ziki-auto-work
-cd auto-work
-./install.sh          # install.ps1 on Windows
-
-auto-work doctor
-auto-work run --once --dry-run
-auto-work start
+```text
+Read https://github.com/peter-abah/ziki-auto-work/blob/main/docs/AI-SETUP.md
+and set up ziki-auto-work for this repository. Ask only for what you cannot
+detect. Do not start the loop.
 ```
 
-`auto-work init` asks for the minimum, detects your stack and installed coding
-CLIs, writes the config, and points you at the next step.
+The AI detects the environment, imports and validates your Ziki keys, resolves
+the project and platform from Ziki, writes the config, and finishes with a dry
+run. It does **not** start the loop.
 
-## Or let your AI set it up
+## Manual quickstart
 
-Tell your AI assistant:
+1. **Create agents in Ziki** → Settings → Agents. Give at least one a
+   `working` role and one a `manager` or `merger` role.
+2. **Create a keys file** in any editor (for example `keys.env`):
 
-> Set up auto-work for this repository. Read `docs/AI-SETUP.md` and follow it.
+   ```text
+   ZIKI_KEY1=...   # manager
+   ZIKI_KEY2=...   # working
+   ```
 
-The repo ships [`AGENTS.md`](./AGENTS.md) and [`docs/AI-SETUP.md`](./docs/AI-SETUP.md) for exactly this. The AI
-detects the environment, asks only for what is missing, writes the config, and
-validates it. It does **not** start the loop unless you ask.
+3. **Install globally** (primary path for the long-running loop):
+
+   ```bash
+   npm i -g github:peter-abah/ziki-auto-work
+   ```
+
+4. **Set it up**:
+
+   ```bash
+   auto-work init --keys-file keys.env
+   ```
+
+   `init` validates every key, shows the agent/level/project table, assigns
+   workers and managers, and reads the project and platform from Ziki.
+
+5. **Check and dry-run**:
+
+   ```bash
+   auto-work doctor
+   auto-work run --once --dry-run
+   ```
+
+6. **Start** (only when you are ready):
+
+   ```bash
+   auto-work start
+   ```
+
+The keys are stored in the config directory's `env` file with mode 600. They are
+never written to the config, prompts, or git.
+
+### One-off with npx
+
+No global install needed:
+
+```bash
+npx github:peter-abah/ziki-auto-work init --keys-file keys.env
+npx github:peter-abah/ziki-auto-work doctor
+npx github:peter-abah/ziki-auto-work run --once --dry-run
+```
+
+`npx` builds the package from GitHub each time. For a loop that runs for days,
+install globally.
 
 ## What it does each cycle
 
@@ -53,32 +93,32 @@ validates it. It does **not** start the loop unless you ask.
    evidence-backed ideas.
 9. Writes learnings to private agent notes and, when useful, shared notes.
 
-## Projects and workspaces
+## Profiles
 
-The config holds multiple **jobs**. Each job is one project + repo + platform +
-agents + provider + checks + prompts.
+The config holds one or more **profiles**. Each profile is one project + repo +
+platform + agents + provider + checks + prompts.
 
 ```bash
-auto-work init --job web
-auto-work jobs
-auto-work start --job zedu-desktop
+auto-work init --profile web
+auto-work profiles
+auto-work start --profile zedu-desktop
 auto-work start --all
 auto-work status --all
 ```
 
-Per-job state lives under `.../jobs/<job>/` (state, logs, worktrees, repo
-clone, results, `NEEDS-HUMAN.md`), so jobs do not interfere.
+Per-profile state lives under `.../profiles/<profile>/` (state, logs, worktrees,
+repo clone, results, `NEEDS-HUMAN.md`), so profiles do not interfere.
 
-## Prompts per project
+## Prompts per profile
 
-Each job has its own prompt folder:
+Each profile has its own prompt folder:
 
-```
-prompts/<job>/worker.md  confirm.md  triage.md  review.md  discovery.md  owner.md  pr.md
+```text
+prompts/<profile>/worker.md  confirm.md  triage.md  review.md  discovery.md  owner.md  pr.md
 ```
 
 `auto-work init` copies the generic templates into your config directory and
-points the job at them. Edit them freely. The engine passes project context
+points the profile at them. Edit them freely. The engine passes project context
 (`{{projectName}}`, `{{stack}}`, `{{checks}}`, `{{issueUrl}}`, `{{worktree}}`,
 `{{memory}}`, …), so a prompt is data, not code.
 
@@ -137,7 +177,7 @@ auto-work status
 
 ## Checks and safety
 
-- Per-job `checks[]`: commands, `filesOnly`, `include`, `reporter: "json"`,
+- Per-profile `checks[]`: commands, `filesOnly`, `include`, `reporter: "json"`,
   `baseline`, timeouts, required/optional.
 - Pre-existing test failures are baselined once per base SHA; only **new**
   failures block delivery.
@@ -153,27 +193,64 @@ Read [`docs/safety.md`](./docs/safety.md) before running unattended.
 ## Commands
 
 ```bash
-auto-work install [--keys-file <path>] [--service]
-auto-work init [--job <name>] [--example <name>] [--from-file <path>] [--yes]
+auto-work install [--keys-file <path>] [--service] [--profile <name>]
+auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes]
+auto-work keys import <file>
+auto-work keys check
+auto-work uninstall [--dry-run] [--keep-data] [--yes]
 auto-work detect [--json]
-auto-work models [--provider <p>] [--job <name>] [--json]
-auto-work jobs
-auto-work doctor [--job <name>]
-auto-work start [--job <name>] [--foreground] [--once] [--dry-run] [--all]
-auto-work run [--job <name>] [--once] [--dry-run]
+auto-work models [--provider <p>] [--profile <name>] [--json]
+auto-work profiles
+auto-work doctor [--profile <name>]
+auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
+auto-work run [--profile <name>] [--once] [--dry-run]
 auto-work stop | pause | resume | status [--all]
-auto-work logs [--job <name>] [--lines 80] [--follow]
+auto-work logs [--profile <name>] [--lines 80] [--follow]
 auto-work escalations | memory | prompts
-auto-work config [--show] [--validate] [--migrate]
+auto-work config [--show] [--validate]
 ```
 
 ## Configuration
 
 - Config: platform config dir + `auto-work/config.json`
 - Secrets: same dir + `env` (mode 600)
-- State: platform state dir + `auto-work/jobs/<job>/`
+- State: platform state dir + `auto-work/profiles/<profile>/`
 
 See [`docs/config.md`](./docs/config.md) for the full schema.
+
+## Windows
+
+Use PowerShell. Paths resolve to `%APPDATA%\auto-work` (config and keys) and
+`%LOCALAPPDATA%\auto-work` (state, cache and the command shim). There is no
+`chmod`; the installer writes the shim for you. For example:
+
+```powershell
+npm i -g github:peter-abah/ziki-auto-work
+auto-work init --keys-file .\keys.env
+auto-work doctor
+auto-work run --once --dry-run
+```
+
+The service command uses Task Scheduler when available and falls back to a
+detached process. Run an elevated terminal only if you explicitly need it.
+
+## Uninstall
+
+```bash
+auto-work uninstall --dry-run     # show what would be removed
+auto-work uninstall               # confirm, then remove
+auto-work uninstall --keep-data   # remove the service and shim, keep config/state
+auto-work uninstall --yes         # skip the confirmation
+```
+
+It removes the systemd/launchd/Task Scheduler entry, the command shim, the
+config directory (config, keys, prompts), the state directory (profiles, logs,
+worktrees, repo clones, results), the cache, and the known legacy
+`~/.local/share/auto-work` / `~/.local/state/auto-work` paths. Then run:
+
+```bash
+npm uninstall -g ziki-auto-work
+```
 
 ## Development
 

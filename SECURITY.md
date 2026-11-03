@@ -9,7 +9,7 @@ Include the version, platform, a minimal reproduction, and the impact.
 
 ## Supported versions
 
-The latest `0.1.x` release is supported. Security fixes are released as patch
+The latest `0.2.x` release is supported. Security fixes are released as patch
 versions.
 
 ## Scope and expectations

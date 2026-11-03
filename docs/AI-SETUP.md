@@ -10,46 +10,91 @@ You are setting up **auto-work** for a user. Follow this checklist exactly.
   prompts, or git.
 - Ask only for what you cannot detect.
 - If the user wants full-auto flags, explain the risk first.
+- Keys come first. Do not ask for a project ID or platform before you have a
+  valid key.
 
-## 1. Detect the environment
+## 1. Install and detect
 
 ```bash
+npm i -g github:peter-abah/ziki-auto-work
 auto-work detect --json
-auto-work models --provider <detected-provider> --json
 ```
+
+If the user prefers a one-off, replace `auto-work` with
+`npx github:peter-abah/ziki-auto-work`.
 
 This reports the OS, Node version, stack files, installed coding CLIs, the
-current config path, and the active job.
+config path and the active profile.
 
-If `auto-work` is not installed yet:
+## 2. Get the keys
 
-```bash
-npx github:peter-abah/ziki-auto-work detect --json
-# or, from a clone:
-./install.sh
+Tell the user to create agents in **Ziki → Settings → Agents**. They need at
+least one `working` agent. A `manager` or `merger` agent is strongly recommended
+(awards, confirmations and merge reviews use it).
+
+Ask them to save the keys in a file:
+
+```text
+ZIKI_KEY1=...
+ZIKI_KEY2=...
 ```
 
-## 2. Ask only the minimum
+Then import and validate:
 
-Ask the user for:
+```bash
+auto-work keys import keys.env
+```
 
-1. Ziki base URL (usually `https://ziki.dev`).
-2. Ziki project ID and project slug.
-3. Platform slug (`desktop`, `web`, `mobile`, or their own).
-4. Repo clone URL (their fork) and upstream URL.
-5. Base branch and GitHub repo (`owner/name`), fork owner, default branch.
-6. Team lead handle (optional; needed for the PR template).
-7. Agent key env names (workers and managers).
-8. Coding CLI: `opencode`, `claude`, `codex`, `gemini`, or custom.
-9. Model preference (optional; blank means provider default). Offer the
+`keys import` writes the keys to the env file (mode 600) and checks each one
+with `GET /api/v1/agents/me`. It prints a table of env name, agent, level and
+project, and assigns `working` → workers and `manager`/`merger` → managers.
+Warn if there is no manager key.
+
+If the user prefers to do it in one command:
+
+```bash
+auto-work init --keys-file keys.env
+```
+
+`init` runs the same import and validation before it asks anything else.
+
+If the user has no keys, print the instructions above and stop. Do not ask for a
+project or platform first.
+
+## 3. Resolve the project and platform from Ziki
+
+The validated key already belongs to a project. `init` reads `project_id`,
+`project_slug` and `projects` from `GET /api/v1/agents/me`, and reads the real
+platform slugs from `GET /api/v1/platforms` (usually `desktop`, `mobile`,
+`web`). Prefer the platform that matches the repository; never use the stack as
+the platform.
+
+If the key lists several projects, show them and let the user pick. The default
+is the key's own project.
+
+## 4. Stack, repo and checks
+
+Detect the stack separately from the platform:
+
+- `pubspec.yaml` → Flutter → checks preset `flutter`
+- `package.json` → Node → checks preset `node`
+- `pyproject.toml` → Python → checks preset `python`
+- `go.mod` / `Cargo.toml` → Go / Rust (no preset; ask for commands)
+
+Ask for:
+
+1. Repo clone URL (their fork) and upstream URL.
+2. Base branch, GitHub repo (`owner/name`), fork owner, default branch.
+3. Team lead handle (optional; needed for the PR template).
+4. Provider (`opencode`, `claude`, `codex`, `gemini`, `custom`).
+5. Model preference (optional; blank means provider default). Offer the
    candidates from `auto-work models`. Mention that per-role models can make
    triage/review cheaper.
-10. Checks: use the detected stack preset (`flutter`, `node`, `python`) or ask
-    for the commands.
+6. Checks preset or the explicit commands.
 
 Do not ask for values you can detect from the repo or the CLI.
 
-## 3. Write the config
+## 5. Write the config
 
 Preferred: create a JSON file and apply it.
 
@@ -61,7 +106,28 @@ auto-work config --validate
 Or use the interactive wizard:
 
 ```bash
-auto-work init
+auto-work init --keys-file keys.env
+```
+
+The config is version 3 and has `profiles` + `activeProfile`:
+
+```json
+{
+  "version": 3,
+  "activeProfile": "my-project",
+  "profiles": {
+    "my-project": {
+      "ziki": { "baseUrl": "https://ziki.dev", "projectId": "project_...", "projectSlug": "my-project", "platform": "web" },
+      "stack": "Next.js + TypeScript",
+      "repo": { "url": "...", "upstream": "...", "base": "main", "githubRepo": "owner/repo", "forkOwner": "me", "defaultBranch": "main" },
+      "agents": { "workers": ["ZIKI_KEY2"], "managers": ["ZIKI_KEY1"] },
+      "executor": { "provider": "opencode", "model": null },
+      "checks": [],
+      "prompts": { "dir": "prompts/my-project" },
+      "pr": { "templateFile": "prompts/my-project/pr.md" }
+    }
+  }
+}
 ```
 
 The config is written to the platform config directory:
@@ -70,45 +136,23 @@ The config is written to the platform config directory:
 - macOS: `~/Library/Preferences/auto-work/config.json`
 - Windows: `%APPDATA%\auto-work\config.json`
 
-See [`config.md`](./config.md) for the full schema. The important parts:
+See [`config.md`](./config.md) for the full schema.
 
-- `ziki`: base URL, project ID, slug, platform.
-- `repo`: fork clone, upstream, base, GitHub repo, fork owner, default branch,
-  team lead, protected files, baseline file.
-- `agents`: env var names for workers and managers.
-- `executor`: provider, model, per-role models, timeout, permission mode.
-- `checks`: the commands the loop runs before delivering.
-- `prompts.dir`: per-project prompt folder.
-- `pr.templateFile`: per-project PR template.
-- `platformMatch`: keywords/regex used to filter the work feed.
-- `discovery.parityFile`: optional parity/context file.
-
-## 4. Add the Ziki keys
-
-Create the env file next to the config, mode 600:
-
-```bash
-auto-work install --keys-file /path/to/keys.env
-```
-
-The file is `KEY=value` lines. The job references the names in
-`agents.workers` and `agents.managers`. Never put keys in `config.json`.
-
-## 5. Prompts
+## 6. Prompts
 
 `auto-work init` copies the generic prompts into the config directory and sets
 `prompts.dir` to that folder. If you are writing the config by hand, copy them:
 
 ```bash
-auto-work prompts --job <job>
+auto-work prompts --profile <profile>
 ```
 
-Then edit `prompts/<job>/worker.md`, `review.md`, `confirm.md`, `triage.md`,
+Then edit `prompts/<profile>/worker.md`, `review.md`, `confirm.md`, `triage.md`,
 `discovery.md`, `owner.md`, and `pr.md` for the project. The engine fills
 `{{projectName}}`, `{{stack}}`, `{{checks}}`, `{{issueUrl}}`, `{{worktree}}`,
 `{{memory}}`, `{{previousError}}`, and other placeholders.
 
-## 6. Validate and dry-run
+## 7. Validate and dry-run
 
 ```bash
 auto-work config --validate
@@ -116,15 +160,16 @@ auto-work doctor
 auto-work run --once --dry-run
 ```
 
-`doctor` checks keys, the selected provider, `gh` auth, the repo clone, the base
-branch, fork access, and disk space. The dry run builds the queue and performs
-**no Ziki or GitHub writes**.
+`doctor` prints the key table, checks the selected provider, `gh` auth, the repo
+clone, the base branch, fork access, and disk space. The dry run builds the
+queue and performs **no Ziki or GitHub writes**.
 
-## 7. Report back
+## 8. Report back
 
 Tell the user:
 
-- the config path and active job,
+- the config path and active profile,
+- the key table (env name, agent, level, project),
 - the provider and resolved models,
 - the checks that will run,
 - the number of items in the dry-run queue,
@@ -145,16 +190,20 @@ Tell the user:
 
 ## Windows
 
-Use `install.ps1` or `npm i -g github:peter-abah/ziki-auto-work`. Paths resolve to
-`%APPDATA%` and `%LOCALAPPDATA%`. The service command uses Task Scheduler when
-available and falls back to a detached process. There is no `sudo`; run an
-elevated terminal only if the user explicitly needs it.
+Use `install.ps1` or `npm i -g github:peter-abah/ziki-auto-work`. Paths resolve
+to `%APPDATA%\auto-work` (config, keys) and `%LOCALAPPDATA%\auto-work` (state,
+cache, shim). There is no `chmod`; the installer writes the shim. The service
+command uses Task Scheduler when available and falls back to a detached process.
+Run an elevated terminal only if the user explicitly needs it.
 
 ## If something fails
 
 - `doctor` FAIL lines are the source of truth.
+- `auto-work keys check` fixes key problems (invalid, revoked, wrong level).
 - `gh auth status` fixes GitHub access.
 - `ssh-add` fixes fork access.
 - `auto-work config --validate` fixes config shape.
 - `auto-work models` fixes model names.
+- An old v1/v2 config is not migrated: run `auto-work init` to write a v3
+  config.
 - Do not paper over a failing check by starting the loop.

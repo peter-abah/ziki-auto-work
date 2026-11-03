@@ -5,7 +5,7 @@ import type {
   Idea,
   InboxItem,
   Issue,
-  JobConfig,
+  ProfileConfig,
   TestVerdict,
   WorkFeed,
   WorkItem
@@ -600,12 +600,12 @@ export class ZikiClient {
   }
 }
 
-export function clientForAgent(agent: AgentKey, job: JobConfig): ZikiClient {
+export function clientForAgent(agent: AgentKey, profile: ProfileConfig): ZikiClient {
   return new ZikiClient({
-    baseUrl: job.ziki.baseUrl,
+    baseUrl: profile.ziki.baseUrl,
     apiKey: agent.key,
-    projectId: job.ziki.projectId,
-    projectSlug: job.ziki.projectSlug,
+    projectId: profile.ziki.projectId,
+    projectSlug: profile.ziki.projectSlug,
     agentName: agent.name
   });
 }

@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { EscalationRecord, EscalationType, Issue, JobConfig, JobPaths, State } from "./types.js";
+import type { EscalationRecord, EscalationType, Issue, ProfileConfig, ProfilePaths, State } from "./types.js";
 import type { ZikiClient } from "./ziki.js";
 import { escalationUrl } from "./urls.js";
 import { setTask } from "./state.js";
@@ -31,8 +31,8 @@ async function notify(command: string | null | undefined, title: string, body: s
 
 export async function escalate(
   client: ZikiClient,
-  job: JobConfig,
-  jobPaths: JobPaths,
+  profile: ProfileConfig,
+  profilePaths: ProfilePaths,
   state: State,
   options: {
     issue?: Issue | null;
@@ -93,20 +93,20 @@ export async function escalate(
     });
   }
 
-  const link = escalationUrl(job, record.issueNumber);
+  const link = escalationUrl(profile, record.issueNumber);
   options.logger?.warn(`Needs human (${type}) #${record.issueNumber ?? "?"}: ${body}`, {
     escalationId: record.id,
     link
   });
   await notify(options.notifyCommand, `auto-work needs you: #${record.issueNumber ?? "?"}`, `${body}\n${link}`);
-  await writeNeedsHuman(state, job, jobPaths);
+  await writeNeedsHuman(state, profile, profilePaths);
   return { ok: true, escalation: record, link };
 }
 
 export async function poll(
   client: ZikiClient,
-  job: JobConfig,
-  jobPaths: JobPaths,
+  profile: ProfileConfig,
+  profilePaths: ProfilePaths,
   state: State,
   options: {
     logger?: Logger;
@@ -165,11 +165,11 @@ export async function poll(
     options.logger?.warn(`Could not read inbox: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  await writeNeedsHuman(state, job, jobPaths);
+  await writeNeedsHuman(state, profile, profilePaths);
   return { resolved, inbox };
 }
 
-export async function writeNeedsHuman(state: State, job: JobConfig, jobPaths: JobPaths): Promise<void> {
+export async function writeNeedsHuman(state: State, profile: ProfileConfig, profilePaths: ProfilePaths): Promise<void> {
   const open = openEscalations(state);
   const lines = [
     "# Auto-work needs you",
@@ -185,12 +185,12 @@ export async function writeNeedsHuman(state: State, job: JobConfig, jobPaths: Jo
       "",
       escalation.body,
       "",
-      `- Answer in Ziki: ${escalationUrl(job, escalation.issueNumber)}`,
+      `- Answer in Ziki: ${escalationUrl(profile, escalation.issueNumber)}`,
       `- Escalation id: \`${escalation.id}\``,
       `- Opened: ${escalation.createdAt}`,
       ""
     );
   }
-  await mkdir(path.dirname(jobPaths.needsHumanFile), { recursive: true });
-  await writeFile(jobPaths.needsHumanFile, `${lines.join("\n")}\n`, "utf8");
+  await mkdir(path.dirname(profilePaths.needsHumanFile), { recursive: true });
+  await writeFile(profilePaths.needsHumanFile, `${lines.join("\n")}\n`, "utf8");
 }

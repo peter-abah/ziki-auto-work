@@ -1,17 +1,17 @@
 # Configuration reference
 
-The config is a **workspace** with one or more **jobs**.
+The config is a **workspace** with one or more **profiles** (config version 3).
 
 ```json
 {
-  "version": 2,
-  "activeJob": "web",
+  "version": 3,
+  "activeProfile": "web",
   "defaults": {
     "executor": { "provider": "opencode", "model": null },
     "limits": { "maxActiveClaims": 2 },
     "pollSeconds": 120
   },
-  "jobs": {
+  "profiles": {
     "web": {
       "ziki": {
         "baseUrl": "https://ziki.dev",
@@ -77,18 +77,25 @@ The config is a **workspace** with one or more **jobs**.
 }
 ```
 
+Version 2 configs (`jobs` / `activeJob`) are **not migrated**. Run
+`auto-work init` to write a version 3 config.
+
 ## defaults
 
-`defaults` is deep-merged into every job (arrays replace). Use it for executor,
-limits, poll interval and HITL so jobs stay short.
+`defaults` is deep-merged into every profile (arrays replace). Use it for
+executor, limits, poll interval and HITL so profiles stay short.
 
 ## ziki
 
 - `baseUrl`: Ziki site.
 - `projectId`, `projectSlug`: the project the agent keys belong to.
-- `platform`: the platform slug used to filter issues and ideas.
+- `platform`: the Ziki platform slug used to filter issues and ideas. Get the
+  real values from `GET /api/v1/platforms` (`desktop`, `mobile`, `web`, …).
 - `projectName`: human name used in prompts.
 - `platformCategoryId`: optional platform id, for discovery.
+
+`stack` is separate from `platform`: it is the technology label used in prompts
+and check presets (`Flutter`, `Next.js`, …).
 
 ## repo
 
@@ -104,8 +111,10 @@ limits, poll interval and HITL so jobs stay short.
 
 ## agents
 
-Env var names, not keys. Example: `workers: ["ZIKI_KEY1"]`. The env file lives
-next to the config and is mode 600.
+Env var names, not keys. Example: `workers: ["ZIKI_KEY2"]`,
+`managers: ["ZIKI_KEY1"]`. `init` assigns `working` keys to workers and
+`manager`/`merger` keys to managers. The env file lives next to the config and is
+mode 600.
 
 ## executor
 
@@ -136,7 +145,7 @@ Each check:
 
 ## prompts and pr
 
-`prompts.dir` is the per-job prompt folder. `pr.templateFile` is the PR body
+`prompts.dir` is the per-profile prompt folder. `pr.templateFile` is the PR body
 template. Both are relative to the package root or absolute. The engine fills
 placeholders such as `{{projectName}}`, `{{stack}}`, `{{checks}}`,
 `{{issueUrl}}`, `{{worktree}}`, `{{memory}}`, `{{previousError}}`,
@@ -144,7 +153,7 @@ placeholders such as `{{projectName}}`, `{{stack}}`, `{{checks}}`,
 
 ## platformMatch
 
-Keywords or a regex. Used to decide whether a work item belongs to this job.
+Keywords or a regex. Used to decide whether a work item belongs to this profile.
 Issues already tagged with the platform are included regardless.
 
 ## discovery
@@ -158,9 +167,9 @@ escalation cap.
 
 ## State locations
 
-- Linux: `~/.local/state/auto-work/jobs/<job>/`
-- macOS: `~/Library/Application Support/auto-work/jobs/<job>/`
-- Windows: `%LOCALAPPDATA%\auto-work\jobs\<job>\`
+- Linux: `~/.local/state/auto-work/profiles/<profile>/`
+- macOS: `~/Library/Application Support/auto-work/profiles/<profile>/`
+- Windows: `%LOCALAPPDATA%\auto-work\profiles\<profile>\`
 
-Each job has `state.json`, `status.json`, `logs/`, `worktrees/`, `repos/`,
+Each profile has `state.json`, `status.json`, `logs/`, `worktrees/`, `repos/`,
 `results/`, `NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.

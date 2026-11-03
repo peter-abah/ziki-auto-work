@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import type { JobPaths, State, TaskState } from "./types.js";
+import type { ProfilePaths, State, TaskState } from "./types.js";
 
 export function emptyState(): State {
   return {
     version: 1,
-    job: null,
+    profile: null,
     startedAt: null,
     stoppedAt: null,
     lastCycleAt: null,
@@ -29,21 +29,21 @@ function todayKey(date = new Date()): string {
   return date.toISOString().slice(0, 10);
 }
 
-export async function loadState(jobPaths: JobPaths): Promise<State> {
-  if (!existsSync(jobPaths.stateFile)) return emptyState();
+export async function loadState(profilePaths: ProfilePaths): Promise<State> {
+  if (!existsSync(profilePaths.stateFile)) return emptyState();
   try {
-    const parsed = JSON.parse(await readFile(jobPaths.stateFile, "utf8")) as Partial<State>;
+    const parsed = JSON.parse(await readFile(profilePaths.stateFile, "utf8")) as Partial<State>;
     return { ...emptyState(), ...parsed };
   } catch {
     return emptyState();
   }
 }
 
-export async function saveState(jobPaths: JobPaths, state: State): Promise<void> {
-  await mkdir(jobPaths.stateDir, { recursive: true });
-  const tmp = `${jobPaths.stateFile}.${process.pid}.tmp`;
+export async function saveState(profilePaths: ProfilePaths, state: State): Promise<void> {
+  await mkdir(profilePaths.stateDir, { recursive: true });
+  const tmp = `${profilePaths.stateFile}.${process.pid}.tmp`;
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await rename(tmp, jobPaths.stateFile);
+  await rename(tmp, profilePaths.stateFile);
 }
 
 export function counterFor(state: State, date = new Date()): State["counters"][string] {
@@ -75,64 +75,64 @@ export function isAlive(pid: number): boolean {
   }
 }
 
-export async function acquireLock(jobPaths: JobPaths): Promise<{ acquired: boolean; pid: number }> {
-  await mkdir(jobPaths.stateDir, { recursive: true });
-  if (existsSync(jobPaths.lockFile)) {
-    const raw = await readFile(jobPaths.lockFile, "utf8").catch(() => "");
+export async function acquireLock(profilePaths: ProfilePaths): Promise<{ acquired: boolean; pid: number }> {
+  await mkdir(profilePaths.stateDir, { recursive: true });
+  if (existsSync(profilePaths.lockFile)) {
+    const raw = await readFile(profilePaths.lockFile, "utf8").catch(() => "");
     const pid = Number(raw.trim());
     if (pid && isAlive(pid)) return { acquired: false, pid };
-    await unlink(jobPaths.lockFile).catch(() => {});
+    await unlink(profilePaths.lockFile).catch(() => {});
   }
-  await writeFile(jobPaths.lockFile, String(process.pid), "utf8");
+  await writeFile(profilePaths.lockFile, String(process.pid), "utf8");
   return { acquired: true, pid: process.pid };
 }
 
-export async function releaseLock(jobPaths: JobPaths): Promise<void> {
-  const raw = await readFile(jobPaths.lockFile, "utf8").catch(() => "");
+export async function releaseLock(profilePaths: ProfilePaths): Promise<void> {
+  const raw = await readFile(profilePaths.lockFile, "utf8").catch(() => "");
   if (Number(raw.trim()) === process.pid) {
-    await unlink(jobPaths.lockFile).catch(() => {});
+    await unlink(profilePaths.lockFile).catch(() => {});
   }
 }
 
-export async function readPid(jobPaths: JobPaths): Promise<number | null> {
-  const raw = await readFile(jobPaths.pidFile, "utf8").catch(() => "");
+export async function readPid(profilePaths: ProfilePaths): Promise<number | null> {
+  const raw = await readFile(profilePaths.pidFile, "utf8").catch(() => "");
   const pid = Number(raw.trim());
   return pid && isAlive(pid) ? pid : null;
 }
 
-export async function writePid(jobPaths: JobPaths, pid: number): Promise<void> {
-  await mkdir(jobPaths.stateDir, { recursive: true });
-  await writeFile(jobPaths.pidFile, String(pid), "utf8");
+export async function writePid(profilePaths: ProfilePaths, pid: number): Promise<void> {
+  await mkdir(profilePaths.stateDir, { recursive: true });
+  await writeFile(profilePaths.pidFile, String(pid), "utf8");
 }
 
-export async function clearPid(jobPaths: JobPaths): Promise<void> {
-  await unlink(jobPaths.pidFile).catch(() => {});
+export async function clearPid(profilePaths: ProfilePaths): Promise<void> {
+  await unlink(profilePaths.pidFile).catch(() => {});
 }
 
-export async function setPaused(jobPaths: JobPaths, paused: boolean): Promise<void> {
+export async function setPaused(profilePaths: ProfilePaths, paused: boolean): Promise<void> {
   if (paused) {
-    await mkdir(jobPaths.stateDir, { recursive: true });
-    await writeFile(jobPaths.pauseFile, new Date().toISOString(), "utf8");
+    await mkdir(profilePaths.stateDir, { recursive: true });
+    await writeFile(profilePaths.pauseFile, new Date().toISOString(), "utf8");
   } else {
-    await unlink(jobPaths.pauseFile).catch(() => {});
+    await unlink(profilePaths.pauseFile).catch(() => {});
   }
 }
 
-export async function isPaused(jobPaths: JobPaths): Promise<boolean> {
-  return existsSync(jobPaths.pauseFile);
+export async function isPaused(profilePaths: ProfilePaths): Promise<boolean> {
+  return existsSync(profilePaths.pauseFile);
 }
 
-export async function setStopped(jobPaths: JobPaths, stopped: boolean): Promise<void> {
+export async function setStopped(profilePaths: ProfilePaths, stopped: boolean): Promise<void> {
   if (stopped) {
-    await mkdir(jobPaths.stateDir, { recursive: true });
-    await writeFile(jobPaths.stopFile, new Date().toISOString(), "utf8");
+    await mkdir(profilePaths.stateDir, { recursive: true });
+    await writeFile(profilePaths.stopFile, new Date().toISOString(), "utf8");
   } else {
-    await unlink(jobPaths.stopFile).catch(() => {});
+    await unlink(profilePaths.stopFile).catch(() => {});
   }
 }
 
-export async function isStopped(jobPaths: JobPaths): Promise<boolean> {
-  return existsSync(jobPaths.stopFile);
+export async function isStopped(profilePaths: ProfilePaths): Promise<boolean> {
+  return existsSync(profilePaths.stopFile);
 }
 
 export function taskKey(issue: { id?: string | null; number?: number | string | null } | null | undefined): string {

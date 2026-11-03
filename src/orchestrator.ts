@@ -7,9 +7,9 @@ import type {
   Config,
   Idea,
   Issue,
-  JobConfig,
-  JobPaths,
-  LoadedJob,
+  ProfileConfig,
+  ProfilePaths,
+  LoadedProfile,
   Queue,
   QueueEntry,
   State,
@@ -17,7 +17,7 @@ import type {
   WorkFeed,
   WorkItem
 } from "./types.js";
-import { loadJob, resolveParityFile } from "./config.js";
+import { loadProfile, resolveParityFile } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
 import type { Logger } from "./log.js";
 import {
@@ -52,7 +52,7 @@ import type { MemoryContext } from "./memory.js";
 import { escalate, poll, writeNeedsHuman } from "./hitl.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { runChecks, scanSecrets, protectedFiles } from "./checks.js";
-import { jobPaths, paths } from "./platform/paths.js";
+import { profilePaths, paths } from "./platform/paths.js";
 import { issueUrl } from "./urls.js";
 
 const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
@@ -65,11 +65,11 @@ interface AgentClient {
 }
 
 interface Context {
-  loaded: LoadedJob;
+  loaded: LoadedProfile;
   config: Config;
-  job: JobConfig;
-  jobName: string;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profileName: string;
+  profilePaths: ProfilePaths;
   state: State;
   logger: Logger;
   clients: { workers: AgentClient[]; managers: AgentClient[] };
@@ -133,12 +133,12 @@ async function writeStatus(ctx: Context, extra: Record<string, unknown> = {}): P
   const tasks = Object.values(ctx.state.tasks);
   const open = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open");
   const status = {
-    job: ctx.jobName,
+    profile: ctx.profileName,
     pid: process.pid,
     running: extra.running ?? true,
     dryRun: Boolean(ctx.dryRun),
-    paused: await isPaused(ctx.jobPaths),
-    stopped: await isStopped(ctx.jobPaths),
+    paused: await isPaused(ctx.profilePaths),
+    stopped: await isStopped(ctx.profilePaths),
     startedAt: ctx.state.startedAt,
     lastCycleAt: ctx.state.lastCycleAt,
     lastCycleMs: ctx.state.lastCycleMs,
@@ -167,13 +167,13 @@ async function writeStatus(ctx: Context, extra: Record<string, unknown> = {}): P
     lastError: ctx.state.lastError,
     ...extra
   };
-  await mkdir(ctx.jobPaths.stateDir, { recursive: true });
-  await writeFile(ctx.jobPaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  await mkdir(ctx.profilePaths.stateDir, { recursive: true });
+  await writeFile(ctx.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
   return status;
 }
 
 async function save(ctx: Context): Promise<void> {
-  await saveState(ctx.jobPaths, ctx.state);
+  await saveState(ctx.profilePaths, ctx.state);
   await writeStatus(ctx);
 }
 
@@ -217,7 +217,7 @@ async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
 }
 
 async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
-  const file = ctx.jobPaths.desktopCacheFile;
+  const file = ctx.profilePaths.desktopCacheFile;
   let cached: Context["platform"] | null = null;
   if (existsSync(file)) {
     try {
@@ -231,8 +231,8 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
   }
   try {
     const [issues, ideas] = await Promise.all([
-      ctx.primary.client.listAllIssues({ platform: ctx.job.ziki.platform, max: 600 }),
-      ctx.primary.client.listAllIdeas({ platform: ctx.job.ziki.platform, max: 600 })
+      ctx.primary.client.listAllIssues({ platform: ctx.profile.ziki.platform, max: 600 }),
+      ctx.primary.client.listAllIdeas({ platform: ctx.profile.ziki.platform, max: 600 })
     ]);
     const data: Context["platform"] = {
       fetchedAt: new Date().toISOString(),
@@ -277,7 +277,7 @@ async function heartbeatPass(ctx: Context): Promise<void> {
 }
 
 async function withScratch<T>(ctx: Context, label: string, fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = path.join(ctx.jobPaths.worktreesDir, `scratch-${slugify(label, 60)}`);
+  const dir = path.join(ctx.profilePaths.worktreesDir, `scratch-${slugify(label, 60)}`);
   await ctx.github.createScratchWorktree(dir);
   try {
     return await fn(dir);
@@ -296,8 +296,8 @@ async function ownerPass(ctx: Context): Promise<void> {
 
   const result = await withScratch(ctx, `owner-${requestId}`, (dir) =>
     runOwner({
-      job: ctx.job,
-      jobPaths: ctx.jobPaths,
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
       request,
       memoryText: ctx.memoryText,
       repoDir: dir,
@@ -336,12 +336,12 @@ async function writeOwnerResult(ctx: Context, requestId: string, request: string
   ]
     .filter(Boolean)
     .join("\n");
-  const existing = existsSync(ctx.jobPaths.ownerRequestsFile) ? await readFile(ctx.jobPaths.ownerRequestsFile, "utf8") : "# Owner requests\n\n";
-  await writeFile(ctx.jobPaths.ownerRequestsFile, `${existing}${block}\n`, "utf8");
+  const existing = existsSync(ctx.profilePaths.ownerRequestsFile) ? await readFile(ctx.profilePaths.ownerRequestsFile, "utf8") : "# Owner requests\n\n";
+  await writeFile(ctx.profilePaths.ownerRequestsFile, `${existing}${block}\n`, "utf8");
 }
 
 async function deliveryPass(ctx: Context): Promise<void> {
-  const limits = ctx.job.limits;
+  const limits = ctx.profile.limits;
   if (counter(ctx).deliveries >= limits.maxDeliveriesPerDay) return;
   if (activeClaims(ctx).length >= limits.maxActiveClaims) return;
   const item = ctx.queue?.work.find((entry) => {
@@ -369,7 +369,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
     markRecent(ctx, item.key);
     return;
   }
-  if (issue.platform?.slug && issue.platform.slug !== ctx.job.ziki.platform) {
+  if (issue.platform?.slug && issue.platform.slug !== ctx.profile.ziki.platform) {
     markRecent(ctx, item.key);
     return;
   }
@@ -400,7 +400,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
 
   const worker = claim.agent;
   const branch = branchName(issue, issue.title);
-  const dir = await prepareWorktree(ctx.github, ctx.jobPaths, issue, branch);
+  const dir = await prepareWorktree(ctx.github, ctx.profilePaths, issue, branch);
   setTask(ctx.state, issue, {
     status: "working",
     agentName: worker.name,
@@ -427,13 +427,13 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
   let result;
   try {
     result = await runWorker({
-      job: ctx.job,
-      jobPaths: ctx.jobPaths,
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
       issue,
       memoryText: ctx.memoryText,
       worktree: dir,
       branch,
-      base: ctx.job.repo.base,
+      base: ctx.profile.repo.base,
       previousError: ctx.state.tasks[taskKey(issue)]?.lastError ?? "",
       issueContext,
       logger: ctx.logger
@@ -453,13 +453,13 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
   if (changed.length > 5) {
     return handleWorkFailure(ctx, issue, item, { error: `change touches ${changed.length} files (max 5)` }, worker, dir);
   }
-  const protectedHits = protectedFiles(changed, ctx.job.repo.protectedFiles);
+  const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
   if (protectedHits.length) {
     return handleWorkFailure(ctx, issue, item, { error: `protected files changed: ${protectedHits.join(", ")}` }, worker, dir);
   }
 
   const diff = await ctx.github
-    .git(["diff", "--cached", `upstream/${ctx.job.repo.base}`], { cwd: dir })
+    .git(["diff", "--cached", `upstream/${ctx.profile.repo.base}`], { cwd: dir })
     .then((output) => output.stdout)
     .catch(() => "");
   const secretHits = scanSecrets(diff);
@@ -467,7 +467,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
     return handleWorkFailure(ctx, issue, item, { error: `possible secret in diff: ${secretHits[0]}` }, worker, dir);
   }
 
-  const checks = await runChecks(ctx.job, dir, {
+  const checks = await runChecks(ctx.profile, dir, {
     changedFiles: changed,
     baselineFailures: ctx.state.baselineFailures,
     logger: ctx.logger
@@ -487,7 +487,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
   }
 
   await ctx.github.pushBranch(dir, branch);
-  const body = await buildPrBody(ctx.job, {
+  const body = await buildPrBody(ctx.profile, {
     issue,
     summary: result.summary ?? `Fix #${issue.number}`,
     description: result.description ?? "",
@@ -538,7 +538,7 @@ async function handleWorkFailure(
 ): Promise<void> {
   const task = ctx.state.tasks[taskKey(issue)];
   const attempts = (task?.attempts ?? 0) + 1;
-  const maxAttempts = ctx.job.limits.maxAttemptsPerTask;
+  const maxAttempts = ctx.profile.limits.maxAttemptsPerTask;
   const error = result.error ?? result.blocker ?? "unknown failure";
   ctx.logger.warn(`#${issue.number} attempt ${attempts} failed: ${truncate(error, 300)}`);
   ctx.state.lastError = { at: new Date().toISOString(), issue: issue.number, error: truncate(error, 500) };
@@ -546,14 +546,14 @@ async function handleWorkFailure(
   await cleanupWorktree(ctx.github, dir);
 
   if (result.blocked) {
-    const escalation = await escalate(worker.client, ctx.job, ctx.jobPaths, ctx.state, {
+    const escalation = await escalate(worker.client, ctx.profile, ctx.profilePaths, ctx.state, {
       issue,
       type: "blocker",
       body: `#${issue.number} needs a human: ${result.blocker ?? result.summary ?? error}`,
       agentName: worker.name,
       logger: ctx.logger,
-      notifyCommand: ctx.job.hitl.notifyCommand,
-      maxOpen: ctx.job.limits.maxOpenEscalations
+      notifyCommand: ctx.profile.hitl.notifyCommand,
+      maxOpen: ctx.profile.limits.maxOpenEscalations
     });
     if (!escalation.ok && !escalation.skipped) {
       setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined });
@@ -575,8 +575,8 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
     if (!manager) return false;
     const result = await withScratch(ctx, `confirm-${issue.number}`, (dir) =>
       runConfirm({
-        job: ctx.job,
-        jobPaths: ctx.jobPaths,
+        profile: ctx.profile,
+        profilePaths: ctx.profilePaths,
         issue,
         memoryText: ctx.memoryText,
         repoDir: dir,
@@ -585,14 +585,14 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
     );
     if (!result.ok) {
       if (result.blocked) {
-        await escalate(manager.client, ctx.job, ctx.jobPaths, ctx.state, {
+        await escalate(manager.client, ctx.profile, ctx.profilePaths, ctx.state, {
           issue,
           type: "blocker",
           body: `Cannot confirm #${issue.number}: ${result.blocker ?? result.summary ?? result.error ?? "unknown"}`,
           agentName: manager.name,
           logger: ctx.logger,
-          notifyCommand: ctx.job.hitl.notifyCommand,
-          maxOpen: ctx.job.limits.maxOpenEscalations
+          notifyCommand: ctx.profile.hitl.notifyCommand,
+          maxOpen: ctx.profile.limits.maxOpenEscalations
         });
       }
       return false;
@@ -634,7 +634,7 @@ async function ensureBidAndAward(ctx: Context, issue: Issue): Promise<{ agent: A
   if (!bidId) {
     const summary = `I can fix #${issue.number}: ${truncate(issue.title, 120)}`;
     const description = [
-      `Plan: reproduce the issue in ${ctx.job.ziki.platform}, make the smallest scoped fix, add a regression test, run the configured checks, and deliver a PR with evidence.`,
+      `Plan: reproduce the issue in ${ctx.profile.ziki.platform}, make the smallest scoped fix, add a regression test, run the configured checks, and deliver a PR with evidence.`,
       "",
       `Ticket: #${issue.number} ${issue.title}`,
       issue.summary ? `Reported: ${issue.summary}` : ""
@@ -696,7 +696,7 @@ async function ensureClaim(ctx: Context, issue: Issue): Promise<{ agent: AgentCl
 }
 
 async function reviewPass(ctx: Context): Promise<void> {
-  if (counter(ctx).reviews >= ctx.job.limits.maxReviewsPerDay) return;
+  if (counter(ctx).reviews >= ctx.profile.limits.maxReviewsPerDay) return;
   const item = ctx.queue?.review[0];
   if (!item) return;
   try {
@@ -729,12 +729,12 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
     return;
   }
 
-  const dir = await prepareReviewWorktree(ctx.github, ctx.jobPaths, prNumber);
+  const dir = await prepareReviewWorktree(ctx.github, ctx.profilePaths, prNumber);
   let result;
   try {
     result = await runReview({
-      job: ctx.job,
-      jobPaths: ctx.jobPaths,
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
       issue,
       memoryText: ctx.memoryText,
       worktree: dir,
@@ -818,7 +818,7 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
 }
 
 async function auxPass(ctx: Context): Promise<void> {
-  const limit = ctx.job.limits.maxAuxPerCycle;
+  const limit = ctx.profile.limits.maxAuxPerCycle;
   let handled = 0;
   for (const item of ctx.queue?.aux ?? []) {
     if (handled >= limit) break;
@@ -914,8 +914,8 @@ async function reportPrStatusWith(
 async function isInDefaultBranch(ctx: Context, sha: string | null): Promise<boolean> {
   if (!sha) return false;
   try {
-    await ctx.github.git(["fetch", "upstream", ctx.job.repo.defaultBranch]);
-    const result = await ctx.github.git(["merge-base", "--is-ancestor", sha, `upstream/${ctx.job.repo.defaultBranch}`]);
+    await ctx.github.git(["fetch", "upstream", ctx.profile.repo.defaultBranch]);
+    const result = await ctx.github.git(["merge-base", "--is-ancestor", sha, `upstream/${ctx.profile.repo.defaultBranch}`]);
     return result.ok;
   } catch {
     return false;
@@ -988,20 +988,20 @@ async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolea
     const issues = await manager.client.listAllIssues({ platform: "none", max: 100 });
     for (const issue of issues) {
       if (did >= 5) break;
-      if (!textMatchesPlatform(ctx.job, `${issue.title} ${issue.summary ?? ""}`)) continue;
+      if (!textMatchesPlatform(ctx.profile, `${issue.title} ${issue.summary ?? ""}`)) continue;
       await manager.client.categorizeIssue(issue.id, {
-        platform: ctx.job.ziki.platform,
-        reason: "Title/summary matches this job's platform."
+        platform: ctx.profile.ziki.platform,
+        reason: "Title/summary matches this profile's platform."
       });
       did += 1;
     }
     const ideas = await manager.client.listAllIdeas({ platform: "none", max: 100 });
     for (const idea of ideas) {
       if (did >= 5) break;
-      if (!textMatchesPlatform(ctx.job, `${idea.title} ${idea.summary ?? ""}`)) continue;
+      if (!textMatchesPlatform(ctx.profile, `${idea.title} ${idea.summary ?? ""}`)) continue;
       await manager.client.categorizeIdea(idea.id, {
-        platform: ctx.job.ziki.platform,
-        reason: "Title/summary matches this job's platform."
+        platform: ctx.profile.ziki.platform,
+        reason: "Title/summary matches this profile's platform."
       });
       did += 1;
     }
@@ -1027,8 +1027,8 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boole
   }
   const result = await withScratch(ctx, `triage-${idea.number}`, (dir) =>
     runTriage({
-      job: ctx.job,
-      jobPaths: ctx.jobPaths,
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
       idea,
       memoryText: ctx.memoryText,
       repoDir: dir,
@@ -1072,8 +1072,8 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
   if (!manager) return false;
   const result = await withScratch(ctx, `confirm-aux-${issue.number}`, (dir) =>
     runConfirm({
-      job: ctx.job,
-      jobPaths: ctx.jobPaths,
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
       issue,
       memoryText: ctx.memoryText,
       repoDir: dir,
@@ -1098,9 +1098,9 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
 }
 
 async function discoveryPass(ctx: Context): Promise<void> {
-  if (!ctx.job.discovery.enabled) return;
-  if (counter(ctx).discoveries >= ctx.job.limits.maxDiscoveriesPerDay) return;
-  const every = ctx.job.discovery.maxCyclesBeforeRun ?? ctx.job.limits.maxCyclesBeforeDiscovery;
+  if (!ctx.profile.discovery.enabled) return;
+  if (counter(ctx).discoveries >= ctx.profile.limits.maxDiscoveriesPerDay) return;
+  const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
   if (ctx.state.cycles % every !== 0) return;
 
   const existing = (ctx.platform.issues ?? [])
@@ -1109,18 +1109,18 @@ async function discoveryPass(ctx: Context): Promise<void> {
     .map((issue) => `#${issue.number} ${issue.title}`)
     .join("\n");
 
-  const parityFile = resolveParityFile(ctx.job);
+  const parityFile = resolveParityFile(ctx.profile);
   const parity = parityFile && existsSync(parityFile) ? await readFile(parityFile, "utf8") : "(no parity map yet)";
 
   const result = await withScratch(ctx, "discovery", (dir) =>
     runDiscovery({
-      job: ctx.job,
-      jobPaths: ctx.jobPaths,
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
       memoryText: ctx.memoryText,
       repoDir: dir,
       parity,
       existingIssues: existing,
-      maxIdeas: ctx.job.discovery.maxIdeasPerRun ?? 3,
+      maxIdeas: ctx.profile.discovery.maxIdeasPerRun ?? 3,
       logger: ctx.logger
     })
   );
@@ -1129,7 +1129,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
     ctx.logger.warn(`Discovery failed: ${result.error ?? result.blocker ?? "unknown"}`);
     return;
   }
-  const ideas = (result.ideas ?? []).slice(0, ctx.job.discovery.maxIdeasPerRun ?? 3);
+  const ideas = (result.ideas ?? []).slice(0, ctx.profile.discovery.maxIdeasPerRun ?? 3);
   for (const idea of ideas) {
     if (!idea?.title || !idea?.description) continue;
     try {
@@ -1139,8 +1139,8 @@ async function discoveryPass(ctx: Context): Promise<void> {
         title: idea.title.slice(0, 200),
         summary: summary.slice(0, 300),
         description: idea.description.slice(0, 5000),
-        platform: ctx.job.ziki.platform,
-        idempotencyKey: `aw-${ctx.jobName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
+        platform: ctx.profile.ziki.platform,
+        idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
         acknowledgeSimilar: false
       });
       const createdIdea = normalizeIdea(created);
@@ -1162,16 +1162,16 @@ async function discoveryPass(ctx: Context): Promise<void> {
 }
 
 async function ensureBaseline(ctx: Context): Promise<void> {
-  const baselineChecks = ctx.job.checks.filter((check) => check.baseline);
+  const baselineChecks = ctx.profile.checks.filter((check) => check.baseline);
   if (!baselineChecks.length) return;
   const sha = await ctx.github.baseSha().catch(() => null);
   if (ctx.state.baselineSha === sha && ctx.state.baselineAt) return;
 
-  const dir = path.join(ctx.jobPaths.worktreesDir, "scratch-baseline");
+  const dir = path.join(ctx.profilePaths.worktreesDir, "scratch-baseline");
   await ctx.github.createScratchWorktree(dir);
   try {
-    const changedFiles = ctx.job.repo.baselineFile ? [ctx.job.repo.baselineFile] : [];
-    const checks = await runChecks(ctx.job, dir, { changedFiles, baselineFailures: {}, logger: ctx.logger });
+    const changedFiles = ctx.profile.repo.baselineFile ? [ctx.profile.repo.baselineFile] : [];
+    const checks = await runChecks(ctx.profile, dir, { changedFiles, baselineFailures: {}, logger: ctx.logger });
     for (const check of checks.results) {
       if (!baselineChecks.some((spec) => spec.name === check.name)) continue;
       const failures = check.failures ?? [];
@@ -1203,22 +1203,22 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
   const started = Date.now();
   ctx.state.cycles += 1;
 
-  if (await isStopped(ctx.jobPaths)) return { stopped: true };
-  if (await isPaused(ctx.jobPaths)) {
+  if (await isStopped(ctx.profilePaths)) return { stopped: true };
+  if (await isPaused(ctx.profilePaths)) {
     ctx.logger.info("Paused; waiting for resume");
     return { paused: true };
   }
 
-  await poll(ctx.primary.client, ctx.job, ctx.jobPaths, ctx.state, {
+  await poll(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
     logger: ctx.logger,
     markInboxRead: !ctx.dryRun,
     clientForName: (name) => clientByName(ctx, name)?.client ?? null
   });
 
-  const maxAge = ctx.job.memoryRefreshMinutes;
+  const maxAge = ctx.profile.memoryRefreshMinutes;
   const loadedAt = ctx.memory?.loadedAt ? new Date(ctx.memory.loadedAt).getTime() : 0;
   if (!ctx.memory || Date.now() - loadedAt > maxAge * 60 * 1000) {
-    ctx.memory = await loadMemoryContext(ctx.primary.client, ctx.jobPaths, { maxAgeMinutes: maxAge });
+    ctx.memory = await loadMemoryContext(ctx.primary.client, ctx.profilePaths, { maxAgeMinutes: maxAge });
     ctx.memoryText = formatMemoryForPrompt(ctx.memory);
     ctx.logger.info("Memory refreshed", { notes: ctx.memory.ownNotes.length });
   }
@@ -1242,7 +1242,7 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
   const platformIdeaNumbers = new Set(ctx.platform.ideas.map((idea) => idea.number));
   ctx.queue = buildQueue({
     feed,
-    job: ctx.job,
+    profile: ctx.profile,
     platformNumbers,
     platformIdeaNumbers,
     state: ctx.state
@@ -1285,10 +1285,10 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
   return { ok: true };
 }
 
-async function createContext(loaded: LoadedJob, state: State, logger: Logger, options: { dryRun: boolean }): Promise<Context> {
-  const { job, jobName, keys } = loaded;
+async function createContext(loaded: LoadedProfile, state: State, logger: Logger, options: { dryRun: boolean }): Promise<Context> {
+  const { profile, profileName, keys } = loaded;
   const toClients = (agents: AgentKey[]): AgentClient[] =>
-    agents.map((agent) => ({ ...agent, client: clientForAgent(agent, job) }));
+    agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile) }));
   const clients = {
     workers: toClients(keys.workers),
     managers: toClients(keys.managers)
@@ -1296,7 +1296,7 @@ async function createContext(loaded: LoadedJob, state: State, logger: Logger, op
   const primary = clients.workers[0] ?? clients.managers[0];
   if (!primary) throw new Error("No valid agent keys. Add them to the env file.");
 
-  const github = new GitHub({ job, jobName, reposDir: loaded.jobPaths.reposDir, logger });
+  const github = new GitHub({ profile, profileName, reposDir: loaded.profilePaths.reposDir, logger });
   let repoReady = false;
   try {
     await github.ensureRepo();
@@ -1305,16 +1305,16 @@ async function createContext(loaded: LoadedJob, state: State, logger: Logger, op
     logger.error(`Repo not ready: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const memory = await loadMemoryContext(primary.client, loaded.jobPaths, {
-    maxAgeMinutes: job.memoryRefreshMinutes
+  const memory = await loadMemoryContext(primary.client, loaded.profilePaths, {
+    maxAgeMinutes: profile.memoryRefreshMinutes
   }).catch(() => null);
 
   return {
     loaded,
     config: loaded.config,
-    job,
-    jobName,
-    jobPaths: loaded.jobPaths,
+    profile,
+    profileName,
+    profilePaths: loaded.profilePaths,
     state,
     logger,
     clients,
@@ -1332,40 +1332,40 @@ async function createContext(loaded: LoadedJob, state: State, logger: Logger, op
 }
 
 export async function runLoop(options: {
-  jobName?: string;
+  profileName?: string;
   foreground?: boolean;
   once?: boolean;
   dryRun?: boolean;
 } = {}): Promise<number> {
-  const loaded = await loadJob(options.jobName);
+  const loaded = await loadProfile(options.profileName);
   const logger = createLogger({
-    name: `auto-work.${loaded.jobName}`,
-    logDir: loaded.jobPaths.logsDir,
+    name: `auto-work.${loaded.profileName}`,
+    logDir: loaded.profilePaths.logsDir,
     foreground: options.foreground !== false
   });
-  const lock = await acquireLock(loaded.jobPaths);
+  const lock = await acquireLock(loaded.profilePaths);
   if (!lock.acquired) {
-    logger.error(`Another auto-work loop is running for job "${loaded.jobName}" (pid ${lock.pid}).`);
+    logger.error(`Another auto-work loop is running for profile "${loaded.profileName}" (pid ${lock.pid}).`);
     return 1;
   }
 
-  const state = await loadState(loaded.jobPaths);
-  state.job = loaded.jobName;
+  const state = await loadState(loaded.profilePaths);
+  state.profile = loaded.profileName;
   state.startedAt ??= new Date().toISOString();
   state.stoppedAt = null;
   for (const task of Object.values(state.tasks)) {
     if (task.status === "working") task.status = "queued";
   }
-  await saveState(loaded.jobPaths, state);
-  await writePid(loaded.jobPaths, process.pid);
+  await saveState(loaded.profilePaths, state);
+  await writePid(loaded.profilePaths, process.pid);
 
   let ctx: Context;
   try {
     ctx = await createContext(loaded, state, logger, { dryRun: Boolean(options.dryRun) });
   } catch (error) {
     logger.error(`Startup failed: ${error instanceof Error ? error.message : String(error)}`);
-    await releaseLock(loaded.jobPaths);
-    await clearPid(loaded.jobPaths);
+    await releaseLock(loaded.profilePaths);
+    await clearPid(loaded.profilePaths);
     return 1;
   }
 
@@ -1379,19 +1379,19 @@ export async function runLoop(options: {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   logger.info("Auto-work loop started", {
-    job: ctx.jobName,
-    provider: ctx.job.executor.provider,
+    profile: ctx.profileName,
+    provider: ctx.profile.executor.provider,
     workers: ctx.clients.workers.map((agent) => agent.name),
     managers: ctx.clients.managers.map((agent) => agent.name),
-    pollSeconds: ctx.job.pollSeconds,
+    pollSeconds: ctx.profile.pollSeconds,
     repoReady: ctx.repoReady
   });
   await writeStatus(ctx, { running: true });
 
   try {
     do {
-      if (controller.signal.aborted || (await isStopped(ctx.jobPaths))) break;
-      if (await isPaused(ctx.jobPaths)) {
+      if (controller.signal.aborted || (await isStopped(ctx.profilePaths))) break;
+      if (await isPaused(ctx.profilePaths)) {
         await sleep(30_000, controller.signal);
         continue;
       }
@@ -1407,19 +1407,19 @@ export async function runLoop(options: {
         await save(ctx).catch(() => {});
       }
       if (options.once) break;
-      await sleep(ctx.job.pollSeconds * 1000, controller.signal);
+      await sleep(ctx.profile.pollSeconds * 1000, controller.signal);
     } while (!controller.signal.aborted);
   } finally {
     state.stoppedAt = new Date().toISOString();
-    await saveState(loaded.jobPaths, state).catch(() => {});
+    await saveState(loaded.profilePaths, state).catch(() => {});
     await writeStatus(ctx, { running: false }).catch(() => {});
-    await releaseLock(loaded.jobPaths);
-    await clearPid(loaded.jobPaths);
+    await releaseLock(loaded.profilePaths);
+    await clearPid(loaded.profilePaths);
     logger.info("Auto-work loop stopped");
   }
   return 0;
 }
 
-export async function runOnceDry(jobName?: string): Promise<number> {
-  return runLoop({ jobName, foreground: true, once: true, dryRun: true });
+export async function runOnceDry(profileName?: string): Promise<number> {
+  return runLoop({ profileName, foreground: true, once: true, dryRun: true });
 }

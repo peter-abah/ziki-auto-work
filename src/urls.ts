@@ -1,19 +1,19 @@
-import type { Idea, Issue, JobConfig } from "./types.js";
+import type { Idea, Issue, ProfileConfig } from "./types.js";
 
-export function baseUrl(job: JobConfig): string {
-  return job.ziki.baseUrl.replace(/\/+$/, "");
+export function baseUrl(profile: ProfileConfig): string {
+  return profile.ziki.baseUrl.replace(/\/+$/, "");
 }
 
-export function issueUrl(job: JobConfig, issue: { number: number | string }): string {
-  return `${baseUrl(job)}/${job.ziki.projectSlug}/${issue.number}`;
+export function issueUrl(profile: ProfileConfig, issue: { number: number | string }): string {
+  return `${baseUrl(profile)}/${profile.ziki.projectSlug}/${issue.number}`;
 }
 
-export function ideaUrl(job: JobConfig, idea: { number: number | string }): string {
-  return `${baseUrl(job)}/${job.ziki.projectSlug}/ideas/${idea.number}`;
+export function ideaUrl(profile: ProfileConfig, idea: { number: number | string }): string {
+  return `${baseUrl(profile)}/${profile.ziki.projectSlug}/ideas/${idea.number}`;
 }
 
-export function escalationUrl(job: JobConfig, issueNumber: number | string | null): string {
-  return issueNumber ? issueUrl(job, { number: issueNumber }) : `${baseUrl(job)}/inbox`;
+export function escalationUrl(profile: ProfileConfig, issueNumber: number | string | null): string {
+  return issueNumber ? issueUrl(profile, { number: issueNumber }) : `${baseUrl(profile)}/inbox`;
 }
 
 export function issueLabel(issue: Issue | { number: number | string; title: string }): string {

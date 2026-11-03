@@ -46,7 +46,7 @@ block waiting for approval, which is not suitable for unattended runs.
 - `maxActiveClaims` limits concurrent claims.
 - `auto-work pause` stops work without killing the process.
 - `auto-work stop` sends SIGTERM and kills active agents.
-- `STOP` in the job state directory is a file-based kill switch.
+- `STOP` in the profile state directory is a file-based kill switch.
 - `auto-work status` shows the open escalations and counters.
 
 ## Human escalation

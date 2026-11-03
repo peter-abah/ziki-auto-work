@@ -1,14 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { JobConfig, WorkFeed } from "./types.js";
-import { DEFAULT_LIMITS, deepMerge, migrateConfig, resolveModel, validateConfig } from "./config.js";
+import type { ProfileConfig, WorkFeed } from "./types.js";
+import { DEFAULT_LIMITS, deepMerge, defaultConfig, resolveModel, validateConfig } from "./config.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { parseTestFailures, protectedFiles, scanSecrets } from "./checks.js";
 import { branchName, buildPrBody, summarizeChecks } from "./github.js";
 import { getProvider } from "./providers/index.js";
+import { assignRoles, formatKeyTable, projectSummary } from "./keys.js";
 
-function fixtureJob(overrides: Partial<JobConfig> = {}): JobConfig {
+function fixtureProfile(overrides: Partial<ProfileConfig> = {}): ProfileConfig {
   return {
     ziki: {
       baseUrl: "https://ziki.dev",
@@ -51,70 +52,108 @@ test("deepMerge merges objects and replaces arrays", () => {
   assert.deepEqual(merged, { a: { b: 1, c: 3 }, list: [9] });
 });
 
+test("defaultConfig is version 3 with profiles", () => {
+  const config = defaultConfig();
+  assert.equal(config.version, 3);
+  assert.equal(config.activeProfile, "");
+  assert.deepEqual(config.profiles, {});
+});
+
 test("validateConfig merges defaults", () => {
   const config = {
-    version: 2 as const,
-    activeJob: "demo",
-    defaults: { executor: { provider: "opencode" as const, model: null }, limits: { ...DEFAULT_LIMITS }, pollSeconds: 120 },
-    jobs: {
-      demo: fixtureJob()
+    version: 3 as const,
+    activeProfile: "demo",
+    defaults: {
+      executor: { provider: "opencode" as const, model: null },
+      limits: { ...DEFAULT_LIMITS },
+      pollSeconds: 120
+    },
+    profiles: {
+      demo: fixtureProfile()
     }
   };
   const result = validateConfig(config);
   assert.equal(result.ok, true, result.errors.join("; "));
 });
 
-test("migrateConfig converts the old flat shape", () => {
-  const migrated = migrateConfig({
-    version: 1,
-    activeJob: "zedu-desktop",
-    jobs: {
-      "zedu-desktop": {
-        projectId: "project_zedu",
-        projectSlug: "zedu",
-        platform: "desktop",
-        repo: {
-          url: "git@github.com:zedu-vulcan/zedu-desktop.git",
-          upstream: "https://github.com/zeduchat/zedu-desktop.git",
-          base: "staging",
-          githubRepo: "zeduchat/zedu-desktop",
-          forkOwner: "zedu-vulcan",
-          defaultBranch: "main",
-          teamLead: "@lead"
-        },
-        agents: { workers: ["ZIKI_KEY1"], managers: ["ZIKI_KEY2"] },
-        toolchain: { flutter: "flutter" }
-      }
-    }
+test("validateConfig allows managers-only or workers-only profiles", () => {
+  const managersOnly = validateConfig({
+    version: 3,
+    activeProfile: "demo",
+    profiles: { demo: fixtureProfile({ agents: { workers: [], managers: ["ZIKI_KEY1"] } }) }
   });
-  assert.equal(migrated.version, 2);
-  assert.equal(migrated.jobs["zedu-desktop"]!.ziki.projectId, "project_zedu");
-  assert.equal(migrated.jobs["zedu-desktop"]!.checks.length, 4);
-  assert.equal(migrated.jobs["zedu-desktop"]!.prompts.dir, "prompts/zedu-desktop");
+  assert.equal(managersOnly.ok, true, managersOnly.errors.join("; "));
+
+  const workersOnly = validateConfig({
+    version: 3,
+    activeProfile: "demo",
+    profiles: { demo: fixtureProfile({ agents: { workers: ["ZIKI_KEY2"], managers: [] } }) }
+  });
+  assert.equal(workersOnly.ok, true, workersOnly.errors.join("; "));
+});
+
+test("validateConfig rejects a non-v3 config", () => {
+  const result = validateConfig({
+    version: 2 as unknown as 3,
+    activeJob: "demo",
+    jobs: { demo: fixtureProfile() }
+  } as unknown as ReturnType<typeof defaultConfig>);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("version must be 3")));
+});
+
+test("assignRoles sends working keys to workers and managers to managers", () => {
+  const roles = assignRoles([
+    { envName: "ZIKI_KEY1", key: "", ok: true, level: "manager" },
+    { envName: "ZIKI_KEY2", key: "", ok: true, level: "working" },
+    { envName: "ZIKI_KEY3", key: "", ok: true, level: "merger" },
+    { envName: "ZIKI_KEY4", key: "", ok: true, level: "working" },
+    { envName: "ZIKI_BAD", key: "", ok: false, error: "401" }
+  ]);
+  assert.deepEqual(roles.workers, ["ZIKI_KEY2", "ZIKI_KEY4"]);
+  assert.deepEqual(roles.managers, ["ZIKI_KEY1", "ZIKI_KEY3"]);
+});
+
+test("projectSummary picks the most common key project", () => {
+  const summary = projectSummary([
+    { envName: "A", key: "", ok: true, projectId: "p1", projectSlug: "one" },
+    { envName: "B", key: "", ok: true, projectId: "p2", projectSlug: "two" },
+    { envName: "C", key: "", ok: true, projectId: "p2", projectSlug: "two" }
+  ]);
+  assert.deepEqual(summary, { id: "p2", slug: "two", name: undefined });
+});
+
+test("formatKeyTable marks invalid keys", () => {
+  const table = formatKeyTable([
+    { envName: "ZIKI_KEY1", key: "", ok: true, agent: "Duncan", level: "manager", projectSlug: "zedu" },
+    { envName: "ZIKI_BAD", key: "", ok: false, error: "401" }
+  ]);
+  assert.match(table, /ZIKI_KEY1/);
+  assert.match(table, /INVALID/);
 });
 
 test("resolveModel prefers role over default", () => {
-  const job = fixtureJob({
+  const profile = fixtureProfile({
     executor: { provider: "claude", model: "default-model", models: { triage: "cheap-model" } }
   });
-  assert.equal(resolveModel(job, "worker"), "default-model");
-  assert.equal(resolveModel(job, "triage"), "cheap-model");
+  assert.equal(resolveModel(profile, "worker"), "default-model");
+  assert.equal(resolveModel(profile, "triage"), "cheap-model");
 });
 
-test("urls use the job base URL and slug", () => {
-  const job = fixtureJob();
-  assert.equal(issueUrl(job, { number: 42 }), "https://ziki.dev/demo/42");
-  assert.equal(ideaUrl(job, { number: 7 }), "https://ziki.dev/demo/ideas/7");
+test("urls use the profile base URL and slug", () => {
+  const profile = fixtureProfile();
+  assert.equal(issueUrl(profile, { number: 42 }), "https://ziki.dev/demo/42");
+  assert.equal(ideaUrl(profile, { number: 7 }), "https://ziki.dev/demo/ideas/7");
 });
 
 test("textMatchesPlatform supports keywords and regex", () => {
-  assert.equal(textMatchesPlatform(fixtureJob(), "A desktop bug"), true);
-  assert.equal(textMatchesPlatform(fixtureJob(), "A web bug"), false);
-  const regexJob = fixtureJob({ platformMatch: { regex: "\\bweb\\b" } });
-  assert.equal(textMatchesPlatform(regexJob, "A web bug"), true);
+  assert.equal(textMatchesPlatform(fixtureProfile(), "A desktop bug"), true);
+  assert.equal(textMatchesPlatform(fixtureProfile(), "A web bug"), false);
+  const regexProfile = fixtureProfile({ platformMatch: { regex: "\\bweb\\b" } });
+  assert.equal(textMatchesPlatform(regexProfile, "A web bug"), true);
 });
 
-test("buildQueue keeps the job's platform and skips recent keys", () => {
+test("buildQueue keeps the profile's platform and skips recent keys", () => {
   const feed: WorkFeed = {
     project: { id: "p", slug: "demo", name: "Demo" },
     agent: { id: "a", name: "Agent", level: "working" },
@@ -159,7 +198,7 @@ test("buildQueue keeps the job's platform and skips recent keys", () => {
   };
   const queue = buildQueue({
     feed,
-    job: fixtureJob(),
+    profile: fixtureProfile(),
     platformNumbers: new Set([1, 3]),
     state: { recentFeedKeys: { recent: Date.now() } } as never
   });
@@ -196,8 +235,8 @@ test("branchName and summarizeChecks", () => {
   assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "FAILURE" }]), "failing");
 });
 
-test("buildPrBody renders the job template", async () => {
-  const body = await buildPrBody(fixtureJob(), {
+test("buildPrBody renders the profile template", async () => {
+  const body = await buildPrBody(fixtureProfile(), {
     issue: { id: "i1", number: 42, title: "A bug", status: "open", substatus: "open", summary: "It breaks." },
     summary: "Fixed it.",
     description: "Changed a file.",
@@ -214,41 +253,41 @@ test("buildPrBody renders the job template", async () => {
 test("providers build the right commands", () => {
   const input = { prompt: "PROMPT", cwd: "/work", resultPath: "/result.json", model: "model-x" };
 
-  const opencode = getProvider("opencode", fixtureJob()).build(input);
+  const opencode = getProvider("opencode", fixtureProfile()).build(input);
   assert.equal(opencode.command, "opencode");
   assert.deepEqual(opencode.args.slice(0, 5), ["run", "--auto", "--format", "default", "--dir"]);
   assert.ok(opencode.args.includes("/work"));
   assert.ok(opencode.args.includes("PROMPT"));
 
-  const claude = getProvider("claude", fixtureJob({ executor: { provider: "claude" } })).build(input);
+  const claude = getProvider("claude", fixtureProfile({ executor: { provider: "claude" } })).build(input);
   assert.equal(claude.command, "claude");
   assert.ok(claude.args.includes("--dangerously-skip-permissions"));
   assert.ok(claude.args.includes("model-x"));
 
-  const codex = getProvider("codex", fixtureJob({ executor: { provider: "codex" } })).build(input);
+  const codex = getProvider("codex", fixtureProfile({ executor: { provider: "codex" } })).build(input);
   assert.equal(codex.command, "codex");
   assert.ok(codex.args.includes("--dangerously-bypass-approvals-and-sandbox"));
   assert.ok(codex.args.includes("-C"));
 
-  const gemini = getProvider("gemini", fixtureJob({ executor: { provider: "gemini" } })).build(input);
+  const gemini = getProvider("gemini", fixtureProfile({ executor: { provider: "gemini" } })).build(input);
   assert.equal(gemini.command, "gemini");
   assert.ok(gemini.args.includes("--yolo"));
 
-  const customJob = fixtureJob({
+  const customProfile = fixtureProfile({
     executor: {
       provider: "custom",
       command: "mycli",
       args: ["--prompt", "{{prompt}}", "--cwd", "{{cwd}}"]
     }
   });
-  const custom = getProvider("custom", customJob).build(input);
+  const custom = getProvider("custom", customProfile).build(input);
   assert.equal(custom.command, "mycli");
   assert.deepEqual(custom.args, ["--prompt", "PROMPT", "--cwd", "/work"]);
 
-  const stdinJob = fixtureJob({
+  const stdinProfile = fixtureProfile({
     executor: { provider: "claude", promptMode: "stdin" }
   });
-  const stdin = getProvider("claude", stdinJob).build(input);
+  const stdin = getProvider("claude", stdinProfile).build(input);
   assert.equal(stdin.stdin, "PROMPT");
   assert.equal(stdin.args.includes("PROMPT"), false);
 });
