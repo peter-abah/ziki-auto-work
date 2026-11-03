@@ -68,3 +68,16 @@ test("scheduler starts two deliveries and one review concurrently", async () => 
   gates.forEach((release) => release());
   await pool.drain(1000);
 });
+
+test("TaskPool.list reports in-flight kind and age for status", async () => {
+  const pool = new TaskPool({ delivery: 2, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+  const gate = gated();
+  pool.reserve("issue-9", "delivery", gate.run);
+  const list = pool.list();
+  assert.equal(list.length, 1);
+  assert.equal(list[0]!.key, "issue-9");
+  assert.equal(list[0]!.kind, "delivery");
+  assert.ok(list[0]!.ageMs >= 0);
+  gate.release();
+  await pool.drain(1000);
+});
