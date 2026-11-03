@@ -1,0 +1,59 @@
+{
+  "name": "ziki-auto-work",
+  "version": "0.1.0",
+  "description": "Autonomous Ziki work loop for your repo, powered by opencode, Claude Code, Codex, or Gemini.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "auto-work": "./bin/auto-work.mjs"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "prompts",
+    "config",
+    "examples",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test dist/config.test.js",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.10.0",
+    "@types/cross-spawn": "^6.0.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/peter-abah/ziki-auto-work.git"
+  },
+  "homepage": "https://github.com/peter-abah/ziki-auto-work#readme",
+  "bugs": {
+    "url": "https://github.com/peter-abah/ziki-auto-work/issues"
+  },
+  "keywords": [
+    "ziki",
+    "autonomous",
+    "agents",
+    "opencode",
+    "claude",
+    "codex",
+    "gemini"
+  ]
+}

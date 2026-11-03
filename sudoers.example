@@ -1,0 +1,19 @@
+# Optional scoped sudo for the auto-work user.
+#
+# The loop does NOT need sudo for normal operation: Flutter, Dart, git, gh and
+# opencode run as your user. If a ticket genuinely needs a system package, grant
+# only the exact commands you are comfortable with. Replace "peter" with your
+# username.
+#
+# Install:
+#   sudo cp sudoers.example /etc/sudoers.d/auto-work
+#   sudo chown root:root /etc/sudoers.d/auto-work
+#   sudo chmod 440 /etc/sudoers.d/auto-work
+#
+# Validate before relying on it:
+#   sudo visudo -c
+#
+# Deliberately NOT granted: a blanket ALL=(ALL) NOPASSWD:ALL, shells, editors,
+# rm, dd, or anything that can rewrite arbitrary files.
+
+peter ALL=(root) NOPASSWD: /usr/bin/apt-get

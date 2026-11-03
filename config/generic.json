@@ -1,0 +1,69 @@
+{
+  "version": 2,
+  "activeJob": "default",
+  "defaults": {
+    "executor": {
+      "provider": "opencode",
+      "model": null,
+      "timeoutMs": 2700000,
+      "permissionMode": "auto"
+    },
+    "limits": {
+      "maxDeliveriesPerDay": 10,
+      "maxReviewsPerDay": 20,
+      "maxDiscoveriesPerDay": 5,
+      "maxAuxPerCycle": 4,
+      "maxActiveClaims": 2,
+      "maxAttemptsPerTask": 3,
+      "maxCyclesBeforeDiscovery": 6,
+      "maxOpenEscalations": 5
+    },
+    "pollSeconds": 120,
+    "memoryRefreshMinutes": 30,
+    "hitl": {
+      "enabled": true,
+      "defaultType": "question",
+      "notifyCommand": null
+    }
+  },
+  "jobs": {
+    "default": {
+      "ziki": {
+        "baseUrl": "https://ziki.dev",
+        "projectId": "REPLACE_WITH_PROJECT_ID",
+        "projectSlug": "REPLACE_WITH_PROJECT_SLUG",
+        "platform": "REPLACE_WITH_PLATFORM",
+        "projectName": "REPLACE_WITH_PROJECT_NAME"
+      },
+      "stack": "REPLACE_WITH_STACK",
+      "repo": {
+        "url": "REPLACE_WITH_YOUR_FORK_CLONE_URL",
+        "upstream": "REPLACE_WITH_UPSTREAM_URL",
+        "base": "main",
+        "githubRepo": "REPLACE_WITH_OWNER/REPO",
+        "forkOwner": "REPLACE_WITH_FORK_OWNER",
+        "defaultBranch": "main",
+        "teamLead": ""
+      },
+      "agents": {
+        "workers": ["ZIKI_KEY1"],
+        "managers": ["ZIKI_KEY2"]
+      },
+      "toolchain": {},
+      "checks": [],
+      "platformMatch": {
+        "keywords": ["REPLACE_WITH_PLATFORM"]
+      },
+      "prompts": {
+        "dir": "prompts/generic"
+      },
+      "pr": {
+        "templateFile": "prompts/generic/pr.md"
+      },
+      "discovery": {
+        "enabled": false,
+        "maxIdeasPerRun": 3
+      }
+    }
+  }
+}

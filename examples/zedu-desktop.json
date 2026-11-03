@@ -1,0 +1,121 @@
+{
+  "version": 2,
+  "activeJob": "zedu-desktop",
+  "defaults": {
+    "executor": {
+      "provider": "opencode",
+      "model": null,
+      "timeoutMs": 2700000,
+      "permissionMode": "auto"
+    },
+    "limits": {
+      "maxDeliveriesPerDay": 10,
+      "maxReviewsPerDay": 20,
+      "maxDiscoveriesPerDay": 5,
+      "maxAuxPerCycle": 4,
+      "maxActiveClaims": 2,
+      "maxAttemptsPerTask": 3,
+      "maxCyclesBeforeDiscovery": 6,
+      "maxOpenEscalations": 5
+    },
+    "pollSeconds": 120,
+    "memoryRefreshMinutes": 30,
+    "hitl": {
+      "enabled": true,
+      "defaultType": "question",
+      "notifyCommand": null
+    }
+  },
+  "jobs": {
+    "zedu-desktop": {
+      "ziki": {
+        "baseUrl": "https://ziki.dev",
+        "projectId": "project_zedu",
+        "projectSlug": "zedu",
+        "platform": "desktop",
+        "platformCategoryId": "cmvb8fwlg0000m95pswcaedug",
+        "projectName": "Zedu Desktop"
+      },
+      "stack": "Flutter 3.41.5 (Windows/macOS/Linux)",
+      "repo": {
+        "url": "git@github.com:zedu-vulcan/zedu-desktop.git",
+        "upstream": "https://github.com/zeduchat/zedu-desktop.git",
+        "base": "staging",
+        "githubRepo": "zeduchat/zedu-desktop",
+        "forkOwner": "zedu-vulcan",
+        "defaultBranch": "main",
+        "teamLead": "@abrahambishopcodes",
+        "baselineFile": "lib/main.dart",
+        "protectedFiles": [
+          ".github/**",
+          "AGENTS.md",
+          "CONTRIBUTING.md",
+          "analysis_options.yaml",
+          "scripts/**",
+          ".env",
+          ".env.*",
+          "*.p12",
+          "*.pfx",
+          "*.pem",
+          "*.p8",
+          "*.jks",
+          "*.keystore"
+        ]
+      },
+      "agents": {
+        "workers": ["ZIKI_KEY2", "ZIKI_KEY4"],
+        "managers": ["ZIKI_KEY1", "ZIKI_KEY3"]
+      },
+      "toolchain": {
+        "flutter": "~/sdks/flutter/bin/flutter",
+        "dart": "~/sdks/flutter/bin/dart",
+        "git": "git",
+        "gh": "gh"
+      },
+      "checks": [
+        {
+          "name": "deps",
+          "command": "flutter",
+          "args": ["pub", "get"],
+          "timeoutMs": 600000
+        },
+        {
+          "name": "format",
+          "command": "dart",
+          "args": ["format", "--output=none", "--set-exit-if-changed"],
+          "filesOnly": true,
+          "include": [".dart"]
+        },
+        {
+          "name": "analyze",
+          "command": "flutter",
+          "args": ["analyze", "--fatal-infos", "--fatal-warnings"]
+        },
+        {
+          "name": "test",
+          "command": "flutter",
+          "args": ["test", "--reporter", "json"],
+          "reporter": "json",
+          "baseline": true,
+          "timeoutMs": 1800000
+        }
+      ],
+      "platformMatch": {
+        "keywords": ["desktop", "flutter", "linux", "windows", "macos"]
+      },
+      "prompts": {
+        "dir": "prompts/zedu-desktop"
+      },
+      "pr": {
+        "templateFile": "prompts/zedu-desktop/pr.md",
+        "teamLead": "@abrahambishopcodes"
+      },
+      "discovery": {
+        "enabled": true,
+        "parityFile": "DESKTOP-PARITY.md",
+        "maxIdeasPerRun": 3,
+        "maxCyclesBeforeRun": 6
+      }
+    }
+  }
+}

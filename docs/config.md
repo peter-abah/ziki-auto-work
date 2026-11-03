@@ -1,0 +1,166 @@
+# Configuration reference
+
+The config is a **workspace** with one or more **jobs**.
+
+```json
+{
+  "version": 2,
+  "activeJob": "web",
+  "defaults": {
+    "executor": { "provider": "opencode", "model": null },
+    "limits": { "maxActiveClaims": 2 },
+    "pollSeconds": 120
+  },
+  "jobs": {
+    "web": {
+      "ziki": {
+        "baseUrl": "https://ziki.dev",
+        "projectId": "project_...",
+        "projectSlug": "my-project",
+        "platform": "web",
+        "projectName": "My Web App"
+      },
+      "stack": "Next.js + TypeScript",
+      "repo": {
+        "url": "git@github.com:my-fork/web.git",
+        "upstream": "https://github.com/owner/web.git",
+        "base": "staging",
+        "githubRepo": "owner/web",
+        "forkOwner": "my-fork",
+        "defaultBranch": "main",
+        "teamLead": "@lead",
+        "protectedFiles": [".github/**", "AGENTS.md", ".env", ".env.*"],
+        "baselineFile": "src/main.ts"
+      },
+      "agents": {
+        "workers": ["ZIKI_KEY1"],
+        "managers": ["ZIKI_KEY2"]
+      },
+      "executor": {
+        "provider": "opencode",
+        "model": null,
+        "models": { "triage": "cheap-model", "review": "cheap-model" },
+        "timeoutMs": 2700000,
+        "permissionMode": "auto",
+        "extraArgs": [],
+        "env": {}
+      },
+      "toolchain": {
+        "git": "git",
+        "gh": "gh",
+        "node": "node"
+      },
+      "checks": [
+        { "name": "deps", "command": "npm", "args": ["ci"], "timeoutMs": 600000 },
+        { "name": "lint", "command": "npm", "args": ["run", "lint"], "required": false },
+        { "name": "test", "command": "npm", "args": ["test"], "timeoutMs": 1800000 }
+      ],
+      "platformMatch": { "keywords": ["web", "next", "browser"] },
+      "prompts": { "dir": "prompts/web" },
+      "pr": { "templateFile": "prompts/web/pr.md", "teamLead": "@lead" },
+      "discovery": { "enabled": true, "parityFile": "PARITY.md", "maxIdeasPerRun": 3 },
+      "limits": {
+        "maxDeliveriesPerDay": 10,
+        "maxReviewsPerDay": 20,
+        "maxDiscoveriesPerDay": 5,
+        "maxAuxPerCycle": 4,
+        "maxActiveClaims": 2,
+        "maxAttemptsPerTask": 3,
+        "maxCyclesBeforeDiscovery": 6,
+        "maxOpenEscalations": 5
+      },
+      "pollSeconds": 120,
+      "memoryRefreshMinutes": 30,
+      "hitl": { "enabled": true, "defaultType": "question", "notifyCommand": null }
+    }
+  }
+}
+```
+
+## defaults
+
+`defaults` is deep-merged into every job (arrays replace). Use it for executor,
+limits, poll interval and HITL so jobs stay short.
+
+## ziki
+
+- `baseUrl`: Ziki site.
+- `projectId`, `projectSlug`: the project the agent keys belong to.
+- `platform`: the platform slug used to filter issues and ideas.
+- `projectName`: human name used in prompts.
+- `platformCategoryId`: optional platform id, for discovery.
+
+## repo
+
+- `url`: your fork clone (push target).
+- `upstream`: canonical repo (fetch/base).
+- `base`: branch PRs target.
+- `githubRepo`: `owner/name` for `gh`.
+- `forkOwner`: fork org/user for `gh pr create --head`.
+- `defaultBranch`: used to check whether a merge is in the default branch.
+- `teamLead`: PR template handle.
+- `protectedFiles`: glob patterns; matched against changed paths and basenames.
+- `baselineFile`: file passed to a `filesOnly` baseline check (optional).
+
+## agents
+
+Env var names, not keys. Example: `workers: ["ZIKI_KEY1"]`. The env file lives
+next to the config and is mode 600.
+
+## executor
+
+- `provider`: `opencode`, `claude`, `codex`, `gemini`, `custom`.
+- `model`: default model, or `null` for provider default.
+- `models`: per-role overrides (`worker`, `review`, `triage`, `confirm`,
+  `discovery`, `owner`).
+- `timeoutMs`: per-agent timeout.
+- `permissionMode`: `auto` (bypass flags) or `safe` (least-privilege; may block).
+- `extraArgs`: provider-specific flags.
+- `env`: extra environment variables.
+- `command`, `args`, `promptMode`: custom provider only.
+
+## checks
+
+Each check:
+
+- `name`: label.
+- `command`: executable or a key from `toolchain`.
+- `args`: arguments.
+- `filesOnly`: append changed files.
+- `include`: extensions for `filesOnly` (e.g. `[".dart"]`).
+- `reporter`: `json` (Flutter-style test events) or `text`.
+- `baseline`: compare failures to the base-branch baseline.
+- `timeoutMs`.
+- `required`: default true; optional checks do not fail the run.
+- `env`: extra environment variables.
+
+## prompts and pr
+
+`prompts.dir` is the per-job prompt folder. `pr.templateFile` is the PR body
+template. Both are relative to the package root or absolute. The engine fills
+placeholders such as `{{projectName}}`, `{{stack}}`, `{{checks}}`,
+`{{issueUrl}}`, `{{worktree}}`, `{{memory}}`, `{{previousError}}`,
+`{{issueContext}}`, `{{ticket}}`, `{{teamLead}}`.
+
+## platformMatch
+
+Keywords or a regex. Used to decide whether a work item belongs to this job.
+Issues already tagged with the platform are included regardless.
+
+## discovery
+
+`enabled`, optional `parityFile`, `maxIdeasPerRun`, `maxCyclesBeforeRun`.
+
+## limits
+
+Daily caps, active claims, retry attempts, discovery cadence and open
+escalation cap.
+
+## State locations
+
+- Linux: `~/.local/state/auto-work/jobs/<job>/`
+- macOS: `~/Library/Application Support/auto-work/jobs/<job>/`
+- Windows: `%LOCALAPPDATA%\auto-work\jobs\<job>\`
+
+Each job has `state.json`, `status.json`, `logs/`, `worktrees/`, `repos/`,
+`results/`, `NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.

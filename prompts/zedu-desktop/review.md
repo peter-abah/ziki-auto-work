@@ -1,0 +1,55 @@
+# Review task — judge a delivered Zedu Desktop fix
+
+> **Headless run.** Do not wait for focus or ask for confirmation. Execute the task now.
+
+## The ticket
+
+- Issue: **#{{issueNumber}} — {{issueTitle}}**
+- URL: {{issueUrl}}
+
+### Description
+
+{{issueDescription}}
+
+## The delivery
+
+- Pull request: {{prUrl}}
+- Delivered head: {{headSha}}
+- Worktree at the PR head: `{{worktree}}`
+- Repo: `{{repoUrl}}`
+
+## Checks configured for this project
+
+{{checks}}
+
+## Durable context from Ziki
+
+{{memory}}
+
+## What to do
+
+1. Read `AGENTS.md` and `CONTRIBUTING.md`.
+2. Read the diff against the base branch. Check it is the right PR, in
+   `{{repoUrl}}`, targets the expected base, and contains nothing unrelated.
+3. Run the configured checks.
+4. Try the fix against the ticket's reproduction steps where you can. Look for
+   regressions, missing tests, hardcoded values, protected-file changes and
+   secrets.
+5. Be honest. If it is not good to merge, say exactly what the author must fix.
+
+## What to write
+
+Write **valid JSON** to `{{resultPath}}`:
+
+```json
+{
+  "ok": true,
+  "goodToMerge": true,
+  "summary": "One or two sentences (max 300 chars).",
+  "description": "What you tested, how, and what you found.",
+  "files": [{ "path": "lib/features/...", "lines": "40-58" }],
+  "checks": ["dart format: pass", "flutter analyze: pass", "flutter test: pass"],
+  "headSha": "{{headSha}}",
+  "risks": []
+}
+```
