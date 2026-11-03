@@ -8,6 +8,25 @@ evidence-backed ideas — continuously.
 It is provider-agnostic: use **opencode**, **Claude Code**, **Codex**, **Gemini
 CLI**, or any custom command. It runs on **Linux, macOS, and Windows**.
 
+## Requirements
+
+- Linux, macOS, Windows, or WSL.
+- Node.js **>= 20**, npm, git, and `gh` with `gh auth login` (`repo` scope).
+- SSH or HTTPS push access to your fork.
+- A Ziki account with a project and a platform (`desktop`, `mobile`, `web`, …).
+- **At least one `working` agent key.** A `manager` or `merger` agent is
+  optional; without one, merge reviews and manager-only actions are skipped.
+- A coding CLI (opencode, Claude Code, Codex, Gemini CLI, or a custom command)
+  plus its provider auth.
+- The project toolchain your checks need (for example Flutter/Dart, Node, Go,
+  or Rust).
+- Network access and roughly 3 GB of free disk.
+- Permission to push branches and open PRs on the target repository.
+- Optional: systemd/launchd/Task Scheduler for a managed service, Docker or a
+  VM for isolation, and a scoped sudoers entry.
+
+Per-platform setup commands are in [`docs/requirements.md`](./docs/requirements.md).
+
 ## Let your AI set it up
 
 Paste this into your AI assistant from the repository you want to work on:
@@ -25,12 +44,14 @@ run. It does **not** start the loop.
 ## Manual quickstart
 
 1. **Create agents in Ziki** → Settings → Agents. Give at least one a
-   `working` role and one a `manager` or `merger` role.
+   `working` role. A `manager` or `merger` agent is optional; without one, the
+   loop skips merge reviews, accept, cross-platform moves, and manager-only
+   categorization.
 2. **Create a keys file** in any editor (for example `keys.env`):
 
    ```text
-   ZIKI_KEY1=...   # manager
-   ZIKI_KEY2=...   # working
+   ZIKI_KEY1=...   # working
+   ZIKI_KEY2=...   # manager (optional)
    ```
 
 3. **Install globally** (primary path for the long-running loop):
@@ -92,6 +113,47 @@ install globally.
 8. Every few cycles, compares the project against its parity map and files
    evidence-backed ideas.
 9. Writes learnings to private agent notes and, when useful, shared notes.
+
+Work runs in parallel: up to 2 deliveries, 1 review, 2 auxiliary tasks, and 1
+discovery at a time, capped at 4 agents total. Delivery concurrency is also
+capped by `maxActiveClaims` for each owner. State writes are serialized, so
+concurrent tasks do not lose updates.
+
+## Run limits
+
+Every `start` has a limit. The default is **2 hours**. The limit is chosen at
+start time and shown in `status`; there is no live-adjust command.
+
+```bash
+auto-work start                        # 2 hours
+auto-work start --max-runtime 4h
+auto-work start --max-cycles 20
+auto-work start --until 2026-11-04T18:00:00Z
+auto-work start --max-deliveries 5
+auto-work start --forever              # no time/cycle/delivery limit
+auto-work start --all --max-runtime 90m
+```
+
+The loop finishes the current cycle, then stops with a reason
+(`max-runtime`, `max-cycles`, `until`, `max-deliveries`, `stop`, or `error`).
+`--once` still runs exactly one refresh and waits for the tasks it started.
+
+## Status, report and history
+
+```bash
+auto-work status [--all] [--verbose]
+auto-work report [--profile <name>] [--since 24h] [--json]
+auto-work history [--profile <name>] [--limit 50]
+```
+
+- `status` shows the run limit, elapsed and remaining time, stop reason, and
+  in-flight counts. `--verbose` lists tasks with issue, status, PR, and last
+  error.
+- `report` aggregates cycles, deliveries, reviews, discoveries, auxiliary work,
+  failures, open escalations, issues/PRs touched, and the stop reason.
+- `history` reads `history.jsonl` for claims, bids, awards, acceptances,
+  deliveries, reviews, merge reviews, discoveries, auxiliary work, escalations,
+  and failures.
 
 ## Profiles
 
@@ -184,7 +246,12 @@ auto-work status
 - One ticket per branch/PR; `fix/<number>-<slug>`; ≤5 files.
 - Protected files and secrets are rejected before commit.
 - Daily caps, `maxActiveClaims`, `pause`/`resume`, and a `STOP` kill switch.
-- The loop **never merges**. A merger agent does that on GitHub.
+- State writes are serialized; in-flight work is tracked so duplicate picks do
+  not start.
+- On restart, stale agent PIDs are killed and stale worktrees are cleaned up.
+  PRs that already exist are reconciled instead of re-running the worker.
+- `stop` aborts in-flight tasks and kills child process trees.
+- The loop **never merges**. A manager/merger agent does that on GitHub.
 
 Full-auto flags (`--auto`, `--dangerously-skip-permissions`,
 `--dangerously-bypass-approvals-and-sandbox`, `--yolo`) grant broad tool access.
@@ -201,10 +268,14 @@ auto-work uninstall [--dry-run] [--keep-data] [--yes]
 auto-work detect [--json]
 auto-work models [--provider <p>] [--profile <name>] [--json]
 auto-work profiles
-auto-work doctor [--profile <name>]
+auto-work doctor [--profile <name>] [--json]
 auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
+                [--max-runtime 2h] [--max-cycles N] [--until ISO] [--max-deliveries N] [--forever]
 auto-work run [--profile <name>] [--once] [--dry-run]
-auto-work stop | pause | resume | status [--all]
+auto-work stop | pause | resume
+auto-work status [--all] [--verbose]
+auto-work report [--profile <name>] [--since 24h] [--json]
+auto-work history [--profile <name>] [--limit 50]
 auto-work logs [--profile <name>] [--lines 80] [--follow]
 auto-work escalations | memory | prompts
 auto-work config [--show] [--validate]

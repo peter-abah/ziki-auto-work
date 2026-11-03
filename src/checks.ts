@@ -125,8 +125,6 @@ const DEFAULT_PROTECTED = [
   ".github/**",
   "AGENTS.md",
   "CONTRIBUTING.md",
-  "analysis_options.yaml",
-  "scripts/**",
   ".env",
   ".env.*",
   "*.p12",

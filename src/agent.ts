@@ -1,3 +1,4 @@
+import { spawn as nodeSpawn } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -12,19 +13,48 @@ import type { Logger } from "./log.js";
 
 const activeChildren = new Set<ReturnType<typeof spawnCommand>>();
 
-export function killActiveAgents(): void {
-  for (const child of activeChildren) {
+export function killProcessTree(pid: number | null | undefined): void {
+  if (!pid) return;
+  if (process.platform === "win32") {
     try {
-      if (process.platform === "win32") child.kill("SIGTERM");
-      else if (child.pid) process.kill(-child.pid, "SIGTERM");
+      const child = nodeSpawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", detached: true });
+      child.unref();
+    } catch {
+      // already gone
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+  const timer = setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
     } catch {
       try {
-        child.kill("SIGTERM");
+        process.kill(pid, "SIGKILL");
       } catch {
         // already gone
       }
     }
+  }, 3000);
+  timer.unref?.();
+}
+
+export function killActiveAgents(): void {
+  for (const child of activeChildren) {
+    killProcessTree(child.pid);
   }
+}
+
+export function activeAgentPids(): number[] {
+  return [...activeChildren].map((child) => child.pid).filter((pid): pid is number => Boolean(pid));
 }
 
 export function render(template: string, vars: Record<string, unknown>): string {
@@ -64,6 +94,8 @@ export async function runAgent(options: {
   logger?: Logger;
   timeoutMs?: number;
   extraEnv?: Record<string, string>;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, role, prompt, cwd, resultPath, logPath, logger } = options;
   const model = resolveModel(profile, role);
@@ -94,6 +126,7 @@ export async function runAgent(options: {
     }
   });
   activeChildren.add(child);
+  if (child.pid) options.onSpawn?.(child.pid);
 
   if (command.stdin !== undefined) {
     child.stdin?.write(command.stdin);
@@ -111,12 +144,7 @@ export async function runAgent(options: {
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    try {
-      if (process.platform === "win32") child.kill("SIGTERM");
-      else if (child.pid) process.kill(-child.pid, "SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
-    }
+    killProcessTree(child.pid);
   }, limit);
 
   const exit = await new Promise<{ code: number; signal?: string; error?: Error }>((resolve) => {
@@ -124,6 +152,7 @@ export async function runAgent(options: {
     child.on("close", (code, signal) => resolve({ code: code ?? -1, signal: signal ?? undefined }));
   });
   activeChildren.delete(child);
+  if (child.pid) options.onExit?.(child.pid);
   clearTimeout(timer);
   stream.end();
 
@@ -186,6 +215,8 @@ export async function runWorker(options: {
   previousError?: string;
   issueContext?: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, issue, memoryText, worktree, branch, base, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "worker", issue.number);
@@ -213,7 +244,7 @@ export async function runWorker(options: {
     resultPath,
     logPath
   });
-  return runAgent({ profile, profilePaths, role: "worker", prompt, cwd: worktree, resultPath, logPath, logger });
+  return runAgent({ profile, profilePaths, role: "worker", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
 export async function runDiscovery(options: {
@@ -225,6 +256,8 @@ export async function runDiscovery(options: {
   existingIssues: string;
   maxIdeas: number;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, memoryText, repoDir, parity, existingIssues, maxIdeas, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "discovery", "parity");
@@ -252,7 +285,9 @@ export async function runDiscovery(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: 45 * 60 * 1000
+    timeoutMs: 45 * 60 * 1000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
   });
 }
 
@@ -265,6 +300,8 @@ export async function runReview(options: {
   prUrl: string;
   headSha: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, issue, memoryText, worktree, prUrl, headSha, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "review", issue.number);
@@ -287,7 +324,7 @@ export async function runReview(options: {
     resultPath,
     logPath
   });
-  return runAgent({ profile, profilePaths, role: "review", prompt, cwd: worktree, resultPath, logPath, logger });
+  return runAgent({ profile, profilePaths, role: "review", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
 export async function runConfirm(options: {
@@ -297,6 +334,8 @@ export async function runConfirm(options: {
   memoryText: string;
   repoDir: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, issue, memoryText, repoDir, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "confirm", issue.number);
@@ -317,7 +356,7 @@ export async function runConfirm(options: {
     resultPath,
     logPath
   });
-  return runAgent({ profile, profilePaths, role: "confirm", prompt, cwd: repoDir, resultPath, logPath, logger });
+  return runAgent({ profile, profilePaths, role: "confirm", prompt, cwd: repoDir, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
 export async function runTriage(options: {
@@ -327,6 +366,8 @@ export async function runTriage(options: {
   memoryText: string;
   repoDir: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, idea, memoryText, repoDir, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "triage", idea.number);
@@ -356,7 +397,9 @@ export async function runTriage(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: 20 * 60 * 1000
+    timeoutMs: 20 * 60 * 1000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
   });
 }
 
@@ -367,6 +410,8 @@ export async function runOwner(options: {
   memoryText: string;
   repoDir: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, request, memoryText, repoDir, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "owner", request.id || "request");
@@ -391,6 +436,8 @@ export async function runOwner(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: 30 * 60 * 1000
+    timeoutMs: 30 * 60 * 1000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
   });
 }

@@ -90,6 +90,45 @@ export interface LimitsConfig {
   maxAttemptsPerTask: number;
   maxCyclesBeforeDiscovery: number;
   maxOpenEscalations: number;
+  /** Default run limit in minutes; null means no time limit. */
+  maxRuntimeMinutes?: number | null;
+  /** Stop after this many cycles; null means no cycle limit. */
+  maxCycles?: number | null;
+  /** Stop at this ISO timestamp; null means no deadline. */
+  stopAt?: string | null;
+  /** Stop after this many deliveries in the current run; null means no limit. */
+  maxDeliveriesTotal?: number | null;
+  maxConcurrentDeliveries?: number;
+  maxConcurrentReviews?: number;
+  maxConcurrentAux?: number;
+  maxConcurrentDiscovery?: number;
+  maxConcurrentAgents?: number;
+}
+
+export interface RunLimitConfig {
+  maxRuntimeMinutes: number | null;
+  maxCycles: number | null;
+  stopAt: string | null;
+  maxDeliveriesTotal: number | null;
+}
+
+export type StopReason = "max-runtime" | "max-cycles" | "until" | "max-deliveries" | "stop" | "error" | null;
+
+export interface RunState {
+  startedAt: string | null;
+  limits: RunLimitConfig | null;
+  stopReason: StopReason;
+  deliveries: number;
+}
+
+export interface LastCycleSummary {
+  at: string;
+  ms: number;
+  queue: Record<string, number> | null;
+  deliveries: number;
+  reviews: number;
+  aux: number;
+  errors: number;
 }
 
 export interface HitlConfig {
@@ -116,11 +155,16 @@ export interface ProfileConfig {
   hitl: HitlConfig;
 }
 
+export interface DoctorConfig {
+  minFreeGb?: number;
+}
+
 export interface Config {
   version: 3;
   activeProfile: string;
   defaults?: Partial<ProfileConfig>;
   profiles: Record<string, ProfileConfig>;
+  doctor?: DoctorConfig;
 }
 
 export interface Paths {
@@ -160,6 +204,8 @@ export interface ProfilePaths {
   ownerRequestsFile: string;
   memoryFile: string;
   desktopCacheFile: string;
+  runLimitsFile: string;
+  historyFile: string;
 }
 
 export interface AgentKey {
@@ -418,6 +464,30 @@ export interface State {
   baselineSha: string | null;
   baselineAt: string | null;
   lastError: unknown;
+  run: RunState;
+  lastCycle: LastCycleSummary | null;
+  activePids: number[];
+}
+
+export interface HistoryEntry {
+  at: string;
+  type:
+    | "claim"
+    | "bid"
+    | "award"
+    | "accept"
+    | "delivery"
+    | "review"
+    | "merge_review"
+    | "discovery"
+    | "aux"
+    | "escalation"
+    | "failure"
+    | "stop";
+  issue?: number | string | null;
+  idea?: number | string | null;
+  detail?: string;
+  data?: Record<string, unknown>;
 }
 
 export interface AgentResult {

@@ -219,7 +219,7 @@ export class GitHub {
       "--repo",
       this.profile.repo.githubRepo,
       "--head",
-      branch,
+      `${this.profile.repo.forkOwner}:${branch}`,
       "--state",
       "open",
       "--json",

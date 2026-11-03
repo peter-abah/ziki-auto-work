@@ -43,11 +43,18 @@ block waiting for approval, which is not suitable for unattended runs.
 ## Caps and stop switches
 
 - Daily caps for deliveries, reviews, discoveries and auxiliary work.
-- `maxActiveClaims` limits concurrent claims.
+- Per-run limits: `--max-runtime` (default 2h), `--max-cycles`, `--until`,
+  `--max-deliveries`, `--forever`. The loop finishes the current cycle, then
+  stops and records the reason.
+- Concurrency caps: 2 deliveries, 1 review, 2 auxiliary tasks, 1 discovery, and
+  4 agents total (`maxConcurrent*`). `maxActiveClaims` caps deliveries per owner.
 - `auto-work pause` stops work without killing the process.
-- `auto-work stop` sends SIGTERM and kills active agents.
+- `auto-work stop` sends SIGTERM, aborts in-flight tasks, and kills child
+  process trees. systemd units use `KillMode=control-group` and a stop timeout.
+- On startup, stale agent PIDs are killed and stale worktrees are removed.
 - `STOP` in the profile state directory is a file-based kill switch.
-- `auto-work status` shows the open escalations and counters.
+- `auto-work status [--verbose]` shows open escalations, counters, run limits,
+  in-flight tasks and the last error.
 
 ## Human escalation
 

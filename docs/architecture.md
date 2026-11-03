@@ -6,7 +6,9 @@ src/
   config.ts          config v3, defaults, validation, env
   keys.ts            key import, validation and role assignment
   types.ts           shared types
-  orchestrator.ts    the loop and state machine
+  orchestrator.ts    the loop, dispatch and state machine
+  scheduler.ts       TaskPool with per-kind and total concurrency limits
+  mutex.ts           serialized state/history writes
   ziki.ts            typed Ziki API client
   queue.ts           work-feed prioritisation and platform matching
   memory.ts          instructions, project notes, private notes, mistakes
@@ -34,13 +36,41 @@ src/
 6. `heartbeat` — keep active claims alive.
 7. `baseline` — once per base SHA, record pre-existing check failures.
 8. `owner` — handle one owner request.
-9. `delivery` — confirm/bid/award/accept, implement, check, push, PR, deliver.
-10. `review` — test verdicts and manager merge reviews.
-11. `aux` — PR reports, bid votes, awards, comment upvotes, categorisation,
+9. `dispatch` — start work in parallel: deliveries, reviews, auxiliary tasks
+   and discovery, subject to per-kind limits and `maxConcurrentAgents`.
+   `inFlightKeys` prevents duplicate picks.
+10. `delivery` — confirm/bid/award/accept, implement, check, push, PR, deliver.
+11. `review` — test verdicts and manager merge reviews.
+12. `aux` — PR reports, bid votes, awards, comment upvotes, categorisation,
     idea triage, confirmations.
-12. `discovery` — every N cycles, file evidence-backed ideas.
-13. `cleanup` — remove old worktrees.
-14. save state and sleep.
+13. `discovery` — every N cycles, file evidence-backed ideas.
+14. `cleanup` — remove old worktrees.
+15. save state, then sleep or wait for an in-flight task.
+
+## Roles
+
+A profile needs at least one working agent. Managers/mergers are optional; when
+absent, merge reviews and manager-only actions are skipped, awards fall back to a
+worker (self-award), and confirmations/idea verdicts run at weight 1. If no
+worker exists, manager keys perform working tasks.
+
+## Run limits and concurrency
+
+`maxRuntimeMinutes` (default 120), `maxCycles`, `stopAt`,
+`maxDeliveriesTotal`, or an explicit stop ends the loop after the current
+cycle. Limits are chosen at `start` and recorded in `status.json` with elapsed
+and remaining time and a stop reason. Concurrency defaults to 2 deliveries,
+1 review, 2 auxiliary tasks, 1 discovery, and 4 agents total; delivery
+concurrency is also capped by `maxActiveClaims`.
+
+## State and history
+
+All `state.json` and `status.json` writes go through a mutex, so concurrent
+tasks do not lose updates. `history.jsonl` records claim/bid/award/accept,
+delivery, review, merge review, discovery, auxiliary work, escalation, failure
+and stop entries for `auto-work report` and `auto-work history`. Agent PIDs are
+recorded so a restart can kill stale children; existing PRs are reconciled
+instead of re-running the worker.
 
 ## Result contract
 
@@ -71,3 +101,10 @@ again until it is answered.
 Checks are data. The runner resolves commands through `toolchain`, optionally
 appends changed files, parses JSON test events, and compares failures to the
 base-branch baseline. A check can be optional.
+
+## Ziki drift
+
+Ziki changes. Work-feed kinds, statuses, platforms, routes, payloads, auth, rate
+limits and UI paths are assumptions in `ziki.ts`, `types.ts`, `queue.ts`,
+`orchestrator.ts`, prompts and fixtures. Re-check them against the live Ziki
+API/UI periodically, then update code, docs, tests and examples together.

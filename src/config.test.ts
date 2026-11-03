@@ -291,3 +291,29 @@ test("providers build the right commands", () => {
   assert.equal(stdin.stdin, "PROMPT");
   assert.equal(stdin.args.includes("PROMPT"), false);
 });
+
+test("run limits and concurrency have working defaults", () => {
+  assert.equal(DEFAULT_LIMITS.maxRuntimeMinutes, 120);
+  assert.equal(DEFAULT_LIMITS.maxCycles, null);
+  assert.equal(DEFAULT_LIMITS.maxConcurrentDeliveries, 2);
+  assert.equal(DEFAULT_LIMITS.maxConcurrentReviews, 1);
+  assert.equal(DEFAULT_LIMITS.maxConcurrentAux, 2);
+  assert.equal(DEFAULT_LIMITS.maxConcurrentAgents, 4);
+  assert.equal(defaultConfig().doctor?.minFreeGb, 3);
+});
+
+test("validateConfig allows working-only profiles and warns", () => {
+  const profile = fixtureProfile({ agents: { workers: ["ZIKI_KEY1"], managers: [] } });
+  const config = { version: 3 as const, activeProfile: "demo", profiles: { demo: profile } };
+  const result = validateConfig(config);
+  assert.equal(result.ok, true);
+  assert.ok(result.warnings.some((warning) => warning.includes("manager")));
+});
+
+test("deepMerge keeps limit defaults when a profile overrides one field", () => {
+  const merged = deepMerge({ limits: { ...DEFAULT_LIMITS } }, { limits: { maxDeliveriesPerDay: 3 } }) as {
+    limits: typeof DEFAULT_LIMITS;
+  };
+  assert.equal(merged.limits.maxDeliveriesPerDay, 3);
+  assert.equal(merged.limits.maxRuntimeMinutes, 120);
+});

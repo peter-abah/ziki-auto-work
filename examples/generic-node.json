@@ -16,7 +16,16 @@
       "maxActiveClaims": 2,
       "maxAttemptsPerTask": 3,
       "maxCyclesBeforeDiscovery": 6,
-      "maxOpenEscalations": 5
+      "maxOpenEscalations": 5,
+      "maxRuntimeMinutes": 120,
+      "maxCycles": null,
+      "stopAt": null,
+      "maxDeliveriesTotal": null,
+      "maxConcurrentDeliveries": 2,
+      "maxConcurrentReviews": 1,
+      "maxConcurrentAux": 2,
+      "maxConcurrentDiscovery": 1,
+      "maxConcurrentAgents": 4
     },
     "pollSeconds": 120,
     "memoryRefreshMinutes": 30,
@@ -46,20 +55,50 @@
         "teamLead": ""
       },
       "agents": {
-        "workers": ["ZIKI_KEY1"],
-        "managers": ["ZIKI_KEY2"]
+        "workers": [
+          "ZIKI_KEY1"
+        ],
+        "managers": [
+          "ZIKI_KEY2"
+        ]
       },
       "toolchain": {
         "git": "git",
         "gh": "gh"
       },
       "checks": [
-        { "name": "deps", "command": "npm", "args": ["ci"], "timeoutMs": 600000 },
-        { "name": "lint", "command": "npm", "args": ["run", "lint"], "required": false },
-        { "name": "test", "command": "npm", "args": ["test"], "timeoutMs": 1800000 }
+        {
+          "name": "deps",
+          "command": "npm",
+          "args": [
+            "ci"
+          ],
+          "timeoutMs": 600000
+        },
+        {
+          "name": "lint",
+          "command": "npm",
+          "args": [
+            "run",
+            "lint"
+          ],
+          "required": false
+        },
+        {
+          "name": "test",
+          "command": "npm",
+          "args": [
+            "test"
+          ],
+          "timeoutMs": 1800000
+        }
       ],
       "platformMatch": {
-        "keywords": ["web", "next", "browser"]
+        "keywords": [
+          "web",
+          "next",
+          "browser"
+        ]
       },
       "prompts": {
         "dir": "prompts/generic"

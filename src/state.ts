@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import type { ProfilePaths, State, TaskState } from "./types.js";
+import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import type { HistoryEntry, ProfilePaths, State, TaskState } from "./types.js";
+import { mutexFor } from "./mutex.js";
 
 export function emptyState(): State {
   return {
@@ -21,7 +22,10 @@ export function emptyState(): State {
     baselineFailures: {},
     baselineSha: null,
     baselineAt: null,
-    lastError: null
+    lastError: null,
+    run: { startedAt: null, limits: null, stopReason: null, deliveries: 0 },
+    lastCycle: null,
+    activePids: []
   };
 }
 
@@ -40,10 +44,45 @@ export async function loadState(profilePaths: ProfilePaths): Promise<State> {
 }
 
 export async function saveState(profilePaths: ProfilePaths, state: State): Promise<void> {
-  await mkdir(profilePaths.stateDir, { recursive: true });
-  const tmp = `${profilePaths.stateFile}.${process.pid}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await rename(tmp, profilePaths.stateFile);
+  const lock = mutexFor(`state:${profilePaths.stateFile}`);
+  await lock.run(async () => {
+    await mkdir(profilePaths.stateDir, { recursive: true });
+    const tmp = `${profilePaths.stateFile}.${process.pid}.tmp`;
+    await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    await rename(tmp, profilePaths.stateFile);
+  });
+}
+
+const HISTORY_CAP_BYTES = 5 * 1024 * 1024;
+
+export async function appendHistory(profilePaths: ProfilePaths, entry: HistoryEntry): Promise<void> {
+  const lock = mutexFor(`history:${profilePaths.historyFile}`);
+  await lock.run(async () => {
+    await mkdir(profilePaths.stateDir, { recursive: true });
+    await appendFile(profilePaths.historyFile, `${JSON.stringify(entry)}\n`, "utf8");
+    const info = await stat(profilePaths.historyFile).catch(() => null);
+    if (info && info.size > HISTORY_CAP_BYTES) {
+      const text = await readFile(profilePaths.historyFile, "utf8");
+      const lines = text.trimEnd().split("\n");
+      const keep = lines.slice(Math.floor(lines.length / 2));
+      await writeFile(profilePaths.historyFile, `${keep.join("\n")}\n`, "utf8");
+    }
+  });
+}
+
+export async function readHistory(profilePaths: ProfilePaths, limit = 50): Promise<HistoryEntry[]> {
+  if (!existsSync(profilePaths.historyFile)) return [];
+  const text = await readFile(profilePaths.historyFile, "utf8");
+  const lines = text.split("\n").filter(Boolean);
+  const entries: HistoryEntry[] = [];
+  for (const line of lines.slice(-Math.max(limit, 1))) {
+    try {
+      entries.push(JSON.parse(line) as HistoryEntry);
+    } catch {
+      // skip malformed line
+    }
+  }
+  return entries;
 }
 
 export function counterFor(state: State, date = new Date()): State["counters"][string] {

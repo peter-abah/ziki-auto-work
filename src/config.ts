@@ -10,7 +10,8 @@ import type {
   LimitsConfig,
   LoadedProfile,
   ProviderName,
-  Role
+  Role,
+  RunLimitConfig
 } from "./types.js";
 import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
 
@@ -24,7 +25,23 @@ export const DEFAULT_LIMITS: LimitsConfig = {
   maxActiveClaims: 2,
   maxAttemptsPerTask: 3,
   maxCyclesBeforeDiscovery: 6,
-  maxOpenEscalations: 5
+  maxOpenEscalations: 5,
+  maxRuntimeMinutes: 120,
+  maxCycles: null,
+  stopAt: null,
+  maxDeliveriesTotal: null,
+  maxConcurrentDeliveries: 2,
+  maxConcurrentReviews: 1,
+  maxConcurrentAux: 2,
+  maxConcurrentDiscovery: 1,
+  maxConcurrentAgents: 4
+};
+
+export const DEFAULT_RUN_LIMITS = {
+  maxRuntimeMinutes: 120,
+  maxCycles: null,
+  stopAt: null,
+  maxDeliveriesTotal: null
 };
 
 export function defaultConfig(): Config {
@@ -48,7 +65,8 @@ export function defaultConfig(): Config {
       prompts: { dir: "prompts/generic" },
       pr: { templateFile: "prompts/generic/pr.md" }
     },
-    profiles: {}
+    profiles: {},
+    doctor: { minFreeGb: 3 }
   };
 }
 
@@ -184,6 +202,12 @@ export function validateConfig(config: Config): ValidationResult {
     if (Array.isArray(workers) && Array.isArray(managers) && !workers.length && !managers.length) {
       errors.push(`${prefix}.agents needs at least one worker or manager env key name`);
     }
+    if (Array.isArray(managers) && managers.length === 0) {
+      warnings.push(`${prefix}.agents.managers is empty; manager-only actions (merge review, accept, cross-platform moves) will be skipped`);
+    }
+    if (Array.isArray(workers) && workers.length === 0 && Array.isArray(managers) && managers.length > 0) {
+      warnings.push(`${prefix}.agents.workers is empty; manager keys will also do working tasks`);
+    }
     if (!PROVIDERS.includes(profile?.executor?.provider)) {
       errors.push(`${prefix}.executor.provider must be one of ${PROVIDERS.join(", ")}`);
     }
@@ -206,6 +230,22 @@ export function validateConfig(config: Config): ValidationResult {
   }
 
   return { ok: errors.length === 0, errors, warnings };
+}
+
+export function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig {
+  const base: RunLimitConfig = {
+    maxRuntimeMinutes: profile.limits.maxRuntimeMinutes ?? null,
+    maxCycles: profile.limits.maxCycles ?? null,
+    stopAt: profile.limits.stopAt ?? null,
+    maxDeliveriesTotal: profile.limits.maxDeliveriesTotal ?? null
+  };
+  if (!override) return base;
+  return {
+    maxRuntimeMinutes: override.maxRuntimeMinutes !== undefined ? override.maxRuntimeMinutes : base.maxRuntimeMinutes,
+    maxCycles: override.maxCycles !== undefined ? override.maxCycles : base.maxCycles,
+    stopAt: override.stopAt !== undefined ? override.stopAt : base.stopAt,
+    maxDeliveriesTotal: override.maxDeliveriesTotal !== undefined ? override.maxDeliveriesTotal : base.maxDeliveriesTotal
+  };
 }
 
 export function resolveModel(profile: ProfileConfig, role: Role): string | null {
@@ -249,6 +289,8 @@ export async function loadProfile(profileName?: string): Promise<LoadedProfile> 
     );
   }
   const profile = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
+  profile.limits = { ...DEFAULT_LIMITS, ...(profile.limits ?? {}) };
+  profile.executor = { ...profile.executor, timeoutMs: profile.executor?.timeoutMs ?? 2_700_000, permissionMode: profile.executor?.permissionMode ?? "auto" };
   const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });
   if (!validation.ok) {
     throw new Error(`Invalid profile "${name}":\n${validation.errors.join("\n")}`);

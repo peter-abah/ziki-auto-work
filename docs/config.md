@@ -67,13 +67,23 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "maxActiveClaims": 2,
         "maxAttemptsPerTask": 3,
         "maxCyclesBeforeDiscovery": 6,
-        "maxOpenEscalations": 5
+        "maxOpenEscalations": 5,
+        "maxRuntimeMinutes": 120,
+        "maxCycles": null,
+        "stopAt": null,
+        "maxDeliveriesTotal": null,
+        "maxConcurrentDeliveries": 2,
+        "maxConcurrentReviews": 1,
+        "maxConcurrentAux": 2,
+        "maxConcurrentDiscovery": 1,
+        "maxConcurrentAgents": 4
       },
       "pollSeconds": 120,
       "memoryRefreshMinutes": 30,
       "hitl": { "enabled": true, "defaultType": "question", "notifyCommand": null }
     }
-  }
+  },
+  "doctor": { "minFreeGb": 3 }
 }
 ```
 
@@ -115,6 +125,11 @@ Env var names, not keys. Example: `workers: ["ZIKI_KEY2"]`,
 `managers: ["ZIKI_KEY1"]`. `init` assigns `working` keys to workers and
 `manager`/`merger` keys to managers. The env file lives next to the config and is
 mode 600.
+
+`managers` may be empty. Without a manager/merger, the loop skips merge
+reviews, accept, cross-platform moves, and manager-only categorization.
+Working keys still bid, award (self-award), confirm at weight 1, triage ideas,
+and deliver. If `workers` is empty, manager keys are used for working tasks.
 
 ## executor
 
@@ -165,11 +180,34 @@ Issues already tagged with the platform are included regardless.
 Daily caps, active claims, retry attempts, discovery cadence and open
 escalation cap.
 
+Run limits:
+
+- `maxRuntimeMinutes`: default 120; `null` disables the time limit.
+- `maxCycles`: stop after N cycles; `null` disables.
+- `stopAt`: ISO timestamp deadline; `null` disables.
+- `maxDeliveriesTotal`: stop after N deliveries in this run; `null` disables.
+
+These can be overridden per start with `--max-runtime`, `--max-cycles`,
+`--until`, `--max-deliveries`, or `--forever`.
+
+Concurrency:
+
+- `maxConcurrentDeliveries` (default 2), capped by `maxActiveClaims`.
+- `maxConcurrentReviews` (default 1).
+- `maxConcurrentAux` (default 2).
+- `maxConcurrentDiscovery` (default 1).
+- `maxConcurrentAgents` (default 4) caps all in-flight tasks.
+
+## doctor
+
+`doctor.minFreeGb` sets the disk-space warning threshold (default 3).
+
 ## State locations
 
 - Linux: `~/.local/state/auto-work/profiles/<profile>/`
 - macOS: `~/Library/Application Support/auto-work/profiles/<profile>/`
 - Windows: `%LOCALAPPDATA%\auto-work\profiles\<profile>\`
 
-Each profile has `state.json`, `status.json`, `logs/`, `worktrees/`, `repos/`,
-`results/`, `NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.
+Each profile has `state.json`, `status.json`, `history.jsonl`,
+`run-limits.json`, `logs/`, `worktrees/`, `repos/`, `results/`,
+`NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.

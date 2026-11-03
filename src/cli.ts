@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
-import type { CheckSpec, Config, ProfileConfig, ProviderName } from "./types.js";
+import type { CheckSpec, Config, ProfileConfig, ProviderName, RunLimitConfig } from "./types.js";
 import {
   DEFAULT_LIMITS,
   PROVIDERS,
@@ -13,6 +13,7 @@ import {
   loadProfile,
   parseEnvFile,
   resolveModel,
+  resolveRunLimits,
   sampleConfigPath,
   saveConfig,
   saveEnv,
@@ -29,8 +30,9 @@ import {
   statusService,
   stopService
 } from "./service.js";
-import { loadState } from "./state.js";
+import { loadState, readHistory } from "./state.js";
 import { clientForAgent } from "./ziki.js";
+import { escalationUrl } from "./urls.js";
 import { getProvider } from "./providers/index.js";
 import {
   assignRoles,
@@ -48,25 +50,28 @@ const HELP = `auto-work — autonomous Ziki work loop
 
 Usage:
   auto-work install [--keys-file <path>] [--service] [--profile <name>]
-  auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes]
+  auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes] [--advanced]
   auto-work keys import <file>
   auto-work keys check
   auto-work uninstall [--dry-run] [--keep-data] [--yes]
   auto-work detect [--json]
   auto-work models [--provider <p>] [--profile <name>] [--json]
   auto-work profiles
-  auto-work doctor [--profile <name>]
   auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
+                  [--max-runtime 2h] [--max-cycles N] [--until ISO] [--max-deliveries N] [--forever]
   auto-work run [--profile <name>] [--once] [--dry-run]
   auto-work stop [--profile <name>] [--all]
   auto-work pause [--profile <name>]
   auto-work resume [--profile <name>]
-  auto-work status [--profile <name>] [--all]
+  auto-work status [--profile <name>] [--all] [--verbose]
+  auto-work report [--profile <name>] [--since 24h] [--json]
+  auto-work history [--profile <name>] [--limit 50]
   auto-work logs [--profile <name>] [--lines 80] [--follow]
   auto-work escalations [--profile <name>]
   auto-work memory [--profile <name>]
   auto-work config [--show] [--validate]
   auto-work prompts [--profile <name>]
+  auto-work doctor [--profile <name>] [--json]
 
 Environment overrides:
   AUTO_WORK_HOME, AUTO_WORK_CONFIG_DIR, AUTO_WORK_STATE_DIR, AUTO_WORK_CACHE_DIR
@@ -103,6 +108,64 @@ function str(flags: Flags, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function parseDurationMinutes(value: string): number | null {
+  const text = value.trim().toLowerCase();
+  if (["forever", "none", "off", "0"].includes(text)) return null;
+  const match = text.match(/^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|seconds)?$/);
+  if (!match) throw new Error(`Invalid duration "${value}". Use e.g. 2h, 90m, or 120.`);
+  const amount = Number(match[1]);
+  const unit = match[2] ?? "m";
+  if (unit.startsWith("h")) return Math.round(amount * 60);
+  if (unit.startsWith("s")) return Math.max(1, Math.round(amount / 60));
+  return Math.round(amount);
+}
+
+function parseRunLimits(flags: Flags): Partial<RunLimitConfig> | null {
+  const hasAny = ["forever", "max-runtime", "max-cycles", "until", "max-deliveries"].some((key) => flags[key] !== undefined);
+  if (!hasAny) return null;
+  if (flags.forever) {
+    return { maxRuntimeMinutes: null, maxCycles: null, stopAt: null, maxDeliveriesTotal: null };
+  }
+  const limits: Partial<RunLimitConfig> = {};
+  const runtime = str(flags, "max-runtime");
+  if (runtime !== undefined) limits.maxRuntimeMinutes = parseDurationMinutes(runtime);
+  const cycles = str(flags, "max-cycles");
+  if (cycles !== undefined) {
+    const value = Number(cycles);
+    if (!Number.isFinite(value) || value < 1) throw new Error(`Invalid --max-cycles "${cycles}"`);
+    limits.maxCycles = Math.floor(value);
+  }
+  const until = str(flags, "until");
+  if (until !== undefined) {
+    const at = new Date(until);
+    if (!Number.isFinite(at.getTime())) throw new Error(`Invalid --until "${until}" (use ISO 8601)`);
+    limits.stopAt = at.toISOString();
+  }
+  const deliveries = str(flags, "max-deliveries");
+  if (deliveries !== undefined) {
+    const value = Number(deliveries);
+    if (!Number.isFinite(value) || value < 1) throw new Error(`Invalid --max-deliveries "${deliveries}"`);
+    limits.maxDeliveriesTotal = Math.floor(value);
+  }
+  return limits;
+}
+
+function formatDuration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return "none";
+  if (ms <= 0) return "0s";
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+async function writeRunLimits(profileName: string, limits: RunLimitConfig): Promise<void> {
+  const jp = profilePaths(profileName);
+  await mkdir(jp.stateDir, { recursive: true });
+  await writeFile(jp.runLimitsFile, `${JSON.stringify(limits, null, 2)}\n`, "utf8");
+}
+
 async function resolveProfileName(flags: Flags): Promise<string> {
   const config = await loadConfig();
   return str(flags, "profile") || config.activeProfile || Object.keys(config.profiles)[0] || "";
@@ -124,8 +187,8 @@ function printKeyInstructions(): void {
   console.log("");
   console.log("Create agents in Ziki → Settings → Agents, then put their keys in a file:");
   console.log("");
-  console.log("  ZIKI_KEY1=...   # manager");
-  console.log("  ZIKI_KEY2=...   # working");
+  console.log("  ZIKI_KEY1=...   # working (required)");
+  console.log("  ZIKI_KEY2=...   # manager/merger (optional)");
   console.log("");
   console.log("Import and validate them:");
   console.log("  auto-work keys import keys.env");
@@ -221,6 +284,18 @@ function checkPreset(name: string): CheckSpec[] {
       { name: "deps", command: "python", args: ["-m", "pip", "install", "-e", "."], timeoutMs: 600_000 },
       { name: "lint", command: "ruff", args: ["check", "."], required: false },
       { name: "test", command: "pytest", args: ["-q"], timeoutMs: 1_800_000 }
+    ];
+  }
+  if (name === "go") {
+    return [
+      { name: "build", command: "go", args: ["build", "./..."], timeoutMs: 900_000 },
+      { name: "test", command: "go", args: ["test", "./..."], baseline: true, timeoutMs: 1_800_000 }
+    ];
+  }
+  if (name === "rust") {
+    return [
+      { name: "build", command: "cargo", args: ["build"], timeoutMs: 1_800_000 },
+      { name: "test", command: "cargo", args: ["test"], baseline: true, timeoutMs: 1_800_000 }
     ];
   }
   return [];
@@ -366,10 +441,10 @@ async function initWizard(flags: Flags): Promise<Config | null> {
 
   const roles = assignRoles(inspections);
   if (!roles.managers.length) {
-    console.warn("warning: no manager/merger key. Awards, confirmations and merge reviews will not run.");
+    console.warn("warning: no manager/merger key. Merge reviews and manager-only actions will be skipped.");
   }
   if (!roles.workers.length) {
-    console.warn("warning: no working key. Deliveries will not run.");
+    console.warn("warning: no working key; manager keys will also do working tasks.");
   }
   const workers = roles.workers;
   const managers = roles.managers;
@@ -444,8 +519,11 @@ async function initWizard(flags: Flags): Promise<Config | null> {
   if (modelCandidates.note) console.log(modelCandidates.note);
   const model = str(flags, "model") || (yes ? "" : await ask("Model (blank = provider default)", ""));
 
-  const checksName = str(flags, "checks") || (yes ? stack : await ask("Checks preset (flutter/node/python/none)", stack));
-  const parity = str(flags, "parity") || (yes ? "" : await ask("Parity/context file (optional)", ""));
+  const checksName =
+    str(flags, "checks") || (yes ? stack : await ask("Checks preset (flutter/node/python/go/rust/none)", stack));
+  const parity =
+    str(flags, "parity") ||
+    (yes || !flags.advanced ? "" : await ask("Advanced: parity/context file (optional, blank to skip)", ""));
 
   const promptsDir = await copyPromptSet(profileName);
   const profile = baseProfile({
@@ -611,30 +689,47 @@ async function profiles(): Promise<void> {
 
 async function start(flags: Flags): Promise<void> {
   const config = await loadConfig();
+  const overrides = parseRunLimits(flags);
   if (flags.all) {
     const results = [];
     for (const name of Object.keys(config.profiles)) {
-      results.push({ name, ...(await startService(name)) });
+      const loaded = await loadProfile(name);
+      const limits = resolveRunLimits(loaded.profile, overrides);
+      await writeRunLimits(name, limits);
+      results.push({ name, limits, ...(await startService(name)) });
     }
-    for (const result of results) console.log(`${result.name}: ${result.mode}${result.pid ? ` (pid ${result.pid})` : ""}`);
+    for (const result of results) {
+      console.log(
+        `${result.name}: ${result.mode}${result.pid ? ` (pid ${result.pid})` : ""} · limit ${formatDuration(
+          (result.limits.maxRuntimeMinutes ?? 0) * 60 * 1000 || null
+        )}`
+      );
+    }
     return;
   }
   const profileName = await resolveProfileName(flags);
   if (!profileName) throw new Error("No profile configured. Run `auto-work init`.");
+  const loaded = await loadProfile(profileName);
+  const limits = resolveRunLimits(loaded.profile, overrides);
   const once = Boolean(flags.once);
   const dryRun = Boolean(flags["dry-run"]);
   if (flags.foreground || once || dryRun) {
     const { runLoop } = await import("./orchestrator.js");
-    const code = await runLoop({ profileName, foreground: true, once, dryRun });
+    const code = await runLoop({ profileName, foreground: true, once, dryRun, limits });
     process.exitCode = code;
     return;
   }
+  await writeRunLimits(profileName, limits);
   const result = await startService(profileName);
   if (result.mode === "already-running") {
     console.log(`Already running (pid ${result.pid}).`);
     return;
   }
-  console.log(`Started (${result.mode})${result.pid ? ` pid ${result.pid}` : ""}.`);
+  console.log(
+    `Started (${result.mode})${result.pid ? ` pid ${result.pid}` : ""} · max runtime ${formatDuration(
+      (limits.maxRuntimeMinutes ?? 0) * 60 * 1000 || null
+    )}${limits.stopAt ? ` · until ${limits.stopAt}` : ""}`
+  );
 }
 
 async function stop(flags: Flags): Promise<void> {
@@ -665,16 +760,142 @@ async function status(flags: Flags): Promise<void> {
       `\n${name}: ${result.running ? `running (pid ${result.pid})` : "not running"}${result.paused ? " [paused]" : ""}`
     );
     if (result.status) {
-      console.log(`  cycles: ${result.status.cycles ?? 0}  last: ${result.status.lastCycleAt ?? "never"}`);
-      console.log(`  counters: ${JSON.stringify(result.status.counters ?? {})}`);
-      const escalations = (result.status.escalations as Array<Record<string, unknown>> | undefined) ?? [];
+      const status = result.status as Record<string, any>;
+      console.log(`  cycles: ${status.cycles ?? 0}  last: ${status.lastCycleAt ?? "never"}`);
+      if (status.run) {
+        console.log(
+          `  run: ${formatDuration(status.run.elapsedMs)} elapsed · ${formatDuration(status.run.remainingMs)} remaining` +
+            ` · limit ${status.run.limits?.maxRuntimeMinutes != null ? `${status.run.limits.maxRuntimeMinutes}m` : "none"}` +
+            ` · stop ${status.run.stopReason ?? "-"}`
+        );
+        if (status.run.remainingCycles !== null || status.run.remainingDeliveries !== null) {
+          console.log(
+            `  remaining: cycles ${status.run.remainingCycles ?? "∞"} · deliveries ${status.run.remainingDeliveries ?? "∞"}`
+          );
+        }
+      }
+      console.log(`  counters: ${JSON.stringify(status.counters ?? {})}`);
+      if (status.inFlight) {
+        console.log(
+          `  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`
+        );
+      }
+      if (status.lastCycle) {
+        console.log(
+          `  last cycle: ${status.lastCycle.ms}ms · deliveries ${status.lastCycle.deliveries} · reviews ${status.lastCycle.reviews} · aux ${status.lastCycle.aux}`
+        );
+      }
+      const escalations = (status.escalations as Array<Record<string, unknown>> | undefined) ?? [];
       if (escalations.length) {
         console.log("  needs you:");
         for (const escalation of escalations) {
           console.log(`    - ${escalation.type} #${escalation.issue}: ${escalation.body}`);
         }
       }
+      if (flags.verbose) {
+        const taskList = (status.taskList as Array<Record<string, unknown>> | undefined) ?? [];
+        console.log(`  tasks (${taskList.length}):`);
+        for (const task of taskList) {
+          console.log(
+            `    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`
+          );
+        }
+        const inFlight = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined) ?? [];
+        for (const task of inFlight) {
+          console.log(`    ~ ${task.kind} ${task.key} (${Math.round(Number(task.ageMs ?? 0) / 1000)}s)`);
+        }
+      }
     }
+  }
+}
+
+function parseSince(value: string | undefined): number | null {
+  if (!value) return null;
+  const minutes = parseDurationMinutes(value);
+  return minutes === null ? null : Date.now() - minutes * 60 * 1000;
+}
+
+async function report(flags: Flags): Promise<void> {
+  const profileName = await resolveProfileName(flags);
+  const jp = profilePaths(profileName);
+  const state = await loadState(jp);
+  const since = parseSince(str(flags, "since"));
+  const entries = await readHistory(jp, 50_000);
+  const filtered = since ? entries.filter((entry) => new Date(entry.at).getTime() >= since) : entries;
+  const counts: Record<string, number> = {};
+  const issues = new Set<number | string>();
+  const prs = new Set<string>();
+  for (const entry of filtered) {
+    counts[entry.type] = (counts[entry.type] ?? 0) + 1;
+    if (entry.issue !== undefined && entry.issue !== null) issues.add(entry.issue);
+    const pr = entry.data?.pr;
+    if (typeof pr === "string") prs.add(pr);
+  }
+  const openEscalations = Object.values(state.escalations).filter((escalation) => escalation.status === "open");
+  let status: Record<string, any> | null = null;
+  if (existsSync(jp.statusFile)) {
+    try {
+      status = JSON.parse(await readFile(jp.statusFile, "utf8")) as Record<string, any>;
+    } catch {
+      status = null;
+    }
+  }
+  const data = {
+    profile: profileName,
+    since: since ? new Date(since).toISOString() : null,
+    cycles: state.cycles,
+    counters: state.counters,
+    history: counts,
+    deliveries: state.run.deliveries,
+    openEscalations: openEscalations.length,
+    issuesTouched: [...issues],
+    prsTouched: [...prs],
+    stopReason: status?.run?.stopReason ?? state.run.stopReason ?? null,
+    limits: status?.run?.limits ?? state.run.limits ?? null,
+    lastCycle: status?.lastCycle ?? state.lastCycle ?? null
+  };
+  if (flags.json) {
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+  console.log(`Report for ${profileName}${since ? ` since ${data.since}` : ""}`);
+  console.log(`  cycles: ${data.cycles}`);
+  console.log(`  deliveries this run: ${data.deliveries}`);
+  console.log(`  stop reason: ${data.stopReason ?? "-"}`);
+  if (data.limits) {
+    console.log(
+      `  limit: ${data.limits.maxRuntimeMinutes != null ? `${data.limits.maxRuntimeMinutes}m` : "none"}` +
+        `${data.limits.maxCycles != null ? ` · ${data.limits.maxCycles} cycles` : ""}` +
+        `${data.limits.maxDeliveriesTotal != null ? ` · ${data.limits.maxDeliveriesTotal} deliveries` : ""}`
+    );
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const daily = state.counters[today] ?? { deliveries: 0, reviews: 0, discoveries: 0, aux: 0, errors: 0 };
+  console.log(
+    `  today: ${daily.deliveries} deliveries · ${daily.reviews} reviews · ${daily.discoveries} discoveries · ${daily.aux} aux · ${daily.errors} errors`
+  );
+  console.log(`  history: ${JSON.stringify(counts)}`);
+  console.log(`  failures: ${counts.failure ?? 0}`);
+  console.log(`  open escalations: ${data.openEscalations}`);
+  console.log(`  issues touched: ${data.issuesTouched.length}  PRs touched: ${data.prsTouched.length}`);
+  if (data.lastCycle) {
+    console.log(
+      `  last cycle: ${data.lastCycle.ms}ms · deliveries ${data.lastCycle.deliveries} · reviews ${data.lastCycle.reviews} · aux ${data.lastCycle.aux}`
+    );
+  }
+}
+
+async function historyCommand(flags: Flags): Promise<void> {
+  const profileName = await resolveProfileName(flags);
+  const limit = Number(str(flags, "limit") ?? 50);
+  const entries = await readHistory(profilePaths(profileName), Number.isFinite(limit) ? limit : 50);
+  if (!entries.length) {
+    console.log("No history yet.");
+    return;
+  }
+  for (const entry of entries) {
+    const target = entry.issue ? `#${entry.issue}` : entry.idea ? `idea #${entry.idea}` : "";
+    console.log(`${entry.at}  ${entry.type.padEnd(12)} ${target} ${entry.detail ?? ""}`.trimEnd());
   }
 }
 
@@ -739,10 +960,17 @@ async function escalations(flags: Flags): Promise<void> {
     console.log("Nothing is waiting on you.");
     return;
   }
+  let loaded: Awaited<ReturnType<typeof loadProfile>> | null = null;
+  try {
+    loaded = await loadProfile(profileName);
+  } catch {
+    loaded = null;
+  }
   for (const escalation of open) {
     console.log(`${escalation.type} · #${escalation.issueNumber ?? "?"} ${escalation.issueTitle ?? ""}`);
     console.log(`  ${escalation.body}`);
     console.log(`  id: ${escalation.id}`);
+    if (loaded) console.log(`  link: ${escalationUrl(loaded.profile, escalation.issueNumber)}`);
     console.log("");
   }
 }
@@ -784,7 +1012,9 @@ async function keysCommand(flags: Flags, positionals: string[]): Promise<void> {
   console.log(formatKeyTable(inspections));
   const roles = assignRoles(inspections);
   console.log(`Workers: ${roles.workers.join(", ") || "(none)"}   Managers: ${roles.managers.join(", ") || "(none)"}`);
-  if (!roles.managers.length) console.warn("warning: no manager/merger key.");
+  if (!roles.managers.length) {
+    console.warn("warning: no manager/merger key (optional; merge reviews and manager-only actions will be skipped).");
+  }
   if (inspections.some((item) => !item.ok)) process.exitCode = 1;
 }
 
@@ -821,7 +1051,7 @@ async function prompts(flags: Flags): Promise<void> {
 
 async function doctor(flags: Flags): Promise<void> {
   const result = await runDoctor({ profileName: str(flags, "profile") });
-  console.log(formatDoctor(result));
+  console.log(flags.json ? JSON.stringify(result, null, 2) : formatDoctor(result));
   process.exitCode = result.ok ? 0 : 1;
 }
 
@@ -877,6 +1107,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break;
     case "status":
       await status(flags);
+      break;
+    case "report":
+      await report(flags);
+      break;
+    case "history":
+      await historyCommand(flags);
       break;
     case "logs":
       await logs(flags);

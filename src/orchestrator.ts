@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   AgentKey,
   CheckRunResult,
   Config,
+  HistoryEntry,
   Idea,
   Issue,
   ProfileConfig,
@@ -12,12 +13,14 @@ import type {
   LoadedProfile,
   Queue,
   QueueEntry,
+  RunLimitConfig,
   State,
+  StopReason,
   TaskState,
   WorkFeed,
   WorkItem
 } from "./types.js";
-import { loadProfile, resolveParityFile } from "./config.js";
+import { loadProfile, resolveParityFile, resolveRunLimits } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
 import type { Logger } from "./log.js";
 import {
@@ -32,8 +35,13 @@ import {
   counterFor,
   setTask,
   taskKey,
-  pruneState
+  pruneState,
+  appendHistory,
+  isAlive
 } from "./state.js";
+import { Mutex } from "./mutex.js";
+import { TaskPool } from "./scheduler.js";
+import type { TaskKind } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
 import type { ZikiClient } from "./ziki.js";
 import { GitHub, branchName, buildPrBody, slugify } from "./github.js";
@@ -45,7 +53,9 @@ import {
   runConfirm,
   runTriage,
   runOwner,
-  killActiveAgents
+  killActiveAgents,
+  activeAgentPids,
+  killProcessTree
 } from "./agent.js";
 import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memory.js";
 import type { MemoryContext } from "./memory.js";
@@ -83,6 +93,12 @@ interface Context {
   queue: Queue | null;
   platform: { issues: Issue[]; ideas: Idea[]; fetchedAt: string | null };
   dryRun: boolean;
+  pool: TaskPool;
+  mutex: Mutex;
+  runLimits: RunLimitConfig;
+  auxThisCycle: number;
+  reservedAgents: Set<string>;
+  cycleStats: { deliveries: number; reviews: number; aux: number; errors: number };
 }
 
 function isOurAgent(ctx: Context, name: string | null | undefined): boolean {
@@ -101,12 +117,44 @@ function activeClaims(ctx: Context): TaskState[] {
 
 function pickWorker(ctx: Context, exclude: string[] = []): AgentClient | null {
   const excluded = new Set(exclude.filter(Boolean));
-  return ctx.clients.workers.find((agent) => !excluded.has(agent.name)) ?? null;
+  return (
+    ctx.clients.workers.find((agent) => !excluded.has(agent.name)) ??
+    ctx.clients.managers.find((agent) => !excluded.has(agent.name)) ??
+    null
+  );
 }
 
 function pickManager(ctx: Context, exclude: string[] = []): AgentClient | null {
   const excluded = new Set(exclude.filter(Boolean));
   return ctx.clients.managers.find((agent) => !excluded.has(agent.name)) ?? null;
+}
+
+function pickManagerOrWorker(ctx: Context, exclude: string[] = []): AgentClient | null {
+  return pickManager(ctx, exclude) ?? pickWorker(ctx, exclude);
+}
+
+function pickAvailableWorker(ctx: Context): AgentClient | null {
+  const busy = new Set(
+    Object.values(ctx.state.tasks)
+      .filter((task) => ["claimed", "working"].includes(task.status))
+      .map((task) => task.agentName)
+      .filter((name): name is string => Boolean(name))
+  );
+  const pool = ctx.clients.workers.length ? ctx.clients.workers : ctx.clients.managers;
+  return pool.find((agent) => !busy.has(agent.name) && !ctx.reservedAgents.has(agent.name)) ?? null;
+}
+
+function agentHooks(ctx: Context): { onSpawn: (pid: number) => void; onExit: (pid: number) => void } {
+  return {
+    onSpawn: (pid: number) => {
+      ctx.state.activePids = [...new Set([...ctx.state.activePids, pid])];
+      void save(ctx).catch(() => {});
+    },
+    onExit: (pid: number) => {
+      ctx.state.activePids = ctx.state.activePids.filter((value) => value !== pid);
+      void save(ctx).catch(() => {});
+    }
+  };
 }
 
 function counter(ctx: Context) {
@@ -115,6 +163,10 @@ function counter(ctx: Context) {
 
 function markRecent(ctx: Context, key: string): void {
   ctx.state.recentFeedKeys[key] = Date.now();
+}
+
+function history(ctx: Context, entry: Omit<HistoryEntry, "at">): void {
+  void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => {});
 }
 
 function fileEvidence(files: Array<string | { path: string; lines?: string }> | undefined): Array<{ path: string; lines?: string }> {
@@ -129,10 +181,26 @@ function normalizeCommitMessage(message: string | undefined, issue: Issue): stri
   return text.length > 72 ? text.slice(0, 72) : text;
 }
 
-async function writeStatus(ctx: Context, extra: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+function remainingMs(ctx: Context): number | null {
+  const limits = ctx.runLimits;
+  const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
+  const deadlines: number[] = [];
+  if (limits.maxRuntimeMinutes !== null) {
+    deadlines.push(started + limits.maxRuntimeMinutes * 60 * 1000 - Date.now());
+  }
+  if (limits.stopAt) {
+    const at = new Date(limits.stopAt).getTime();
+    if (Number.isFinite(at)) deadlines.push(at - Date.now());
+  }
+  if (!deadlines.length) return null;
+  return Math.max(0, Math.min(...deadlines));
+}
+
+async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const tasks = Object.values(ctx.state.tasks);
   const open = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open");
-  const status = {
+  const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : null;
+  return {
     profile: ctx.profileName,
     pid: process.pid,
     running: extra.running ?? true,
@@ -154,6 +222,15 @@ async function writeStatus(ctx: Context, extra: Record<string, unknown> = {}): P
       done: tasks.filter((task) => task.status === "done").length,
       failed: tasks.filter((task) => task.status === "failed").length
     },
+    taskList: tasks.slice(-200).map((task) => ({
+      issue: task.number,
+      title: task.title,
+      status: task.status,
+      pr: task.prUrl ?? null,
+      agent: task.agentName ?? null,
+      lastError: task.lastError ?? null,
+      updatedAt: task.updatedAt
+    })),
     counters: counter(ctx),
     escalations: open.map((escalation) => ({
       id: escalation.id,
@@ -162,19 +239,60 @@ async function writeStatus(ctx: Context, extra: Record<string, unknown> = {}): P
       body: truncate(escalation.body, 300),
       createdAt: escalation.createdAt
     })),
+    run: {
+      limits: ctx.runLimits,
+      startedAt: ctx.state.run.startedAt,
+      elapsedMs: started ? Date.now() - started : null,
+      remainingMs: remainingMs(ctx),
+      remainingCycles:
+        ctx.runLimits.maxCycles === null ? null : Math.max(0, ctx.runLimits.maxCycles - ctx.state.cycles),
+      remainingDeliveries:
+        ctx.runLimits.maxDeliveriesTotal === null
+          ? null
+          : Math.max(0, ctx.runLimits.maxDeliveriesTotal - ctx.state.run.deliveries),
+      deliveries: ctx.state.run.deliveries,
+      stopReason: ctx.state.run.stopReason
+    },
+    inFlight: {
+      total: ctx.pool.total(),
+      deliveries: ctx.pool.count("delivery"),
+      reviews: ctx.pool.count("review"),
+      aux: ctx.pool.count("aux"),
+      discovery: ctx.pool.count("discovery"),
+      owner: ctx.pool.count("owner"),
+      tasks: ctx.pool.list()
+    },
+    lastCycle: ctx.state.lastCycle,
     memoryLoadedAt: ctx.memory?.loadedAt ?? null,
     repoReady: ctx.repoReady,
     lastError: ctx.state.lastError,
     ...extra
   };
-  await mkdir(ctx.profilePaths.stateDir, { recursive: true });
-  await writeFile(ctx.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
-  return status;
+}
+
+async function writeStatus(ctx: Context, extra: Record<string, unknown> = {}): Promise<void> {
+  const status = await buildStatus(ctx, extra);
+  await ctx.mutex.run(async () => {
+    await mkdir(ctx.profilePaths.stateDir, { recursive: true });
+    await writeFile(ctx.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  });
 }
 
 async function save(ctx: Context): Promise<void> {
-  await saveState(ctx.profilePaths, ctx.state);
-  await writeStatus(ctx);
+  if (ctx.state.lastCycleAt) {
+    ctx.state.lastCycle = {
+      at: ctx.state.lastCycleAt,
+      ms: ctx.state.lastCycleMs ?? 0,
+      queue: ctx.queue?.counts ?? ctx.state.lastCycle?.queue ?? null,
+      ...ctx.cycleStats
+    };
+  }
+  await ctx.mutex.run(async () => {
+    await saveState(ctx.profilePaths, ctx.state);
+    const status = await buildStatus(ctx);
+    await mkdir(ctx.profilePaths.stateDir, { recursive: true });
+    await writeFile(ctx.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  });
 }
 
 async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
@@ -286,9 +404,7 @@ async function withScratch<T>(ctx: Context, label: string, fn: (dir: string) => 
   }
 }
 
-async function ownerPass(ctx: Context): Promise<void> {
-  const item = ctx.queue?.owner[0];
-  if (!item) return;
+async function processOwnerItem(ctx: Context, item: QueueEntry): Promise<void> {
   const requestId = String(item.key).split(":")[1] ?? "";
   const agent = clientByName(ctx, item.item._feedAgent) ?? ctx.primary;
   const request = { id: requestId, body: item.detail };
@@ -301,7 +417,8 @@ async function ownerPass(ctx: Context): Promise<void> {
       request,
       memoryText: ctx.memoryText,
       repoDir: dir,
-      logger: ctx.logger
+      logger: ctx.logger,
+      ...agentHooks(ctx)
     })
   );
 
@@ -340,31 +457,51 @@ async function writeOwnerResult(ctx: Context, requestId: string, request: string
   await writeFile(ctx.profilePaths.ownerRequestsFile, `${existing}${block}\n`, "utf8");
 }
 
-async function deliveryPass(ctx: Context): Promise<void> {
-  const limits = ctx.profile.limits;
-  if (counter(ctx).deliveries >= limits.maxDeliveriesPerDay) return;
-  if (activeClaims(ctx).length >= limits.maxActiveClaims) return;
-  const item = ctx.queue?.work.find((entry) => {
-    if (!entry.issueId) return false;
-    const task = ctx.state.tasks[entry.issueId];
-    return !task || !["waiting_human", "delivered", "done", "failed", "skipped"].includes(task.status);
-  });
-  if (!item) return;
-  try {
-    await processWorkItem(ctx, item);
-  } catch (error) {
-    ctx.logger.error(`Delivery for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
-    markRecent(ctx, item.key);
-    await save(ctx).catch(() => {});
-  }
-}
-
-async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
+async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?: AgentClient): Promise<void> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue) return;
 
-  if (TERMINAL.has(issue.status)) {
+  const existingTask = ctx.state.tasks[taskKey(issue)] ?? null;
+  const terminalStatus =
+    TERMINAL.has(issue.status) || ["done", "merge", "accepted"].includes(issue.status) || ["done", "merge"].includes(issue.substatus);
+
+  if (issue.pullRequestUrl) {
+    if (issue.holder && issue.holder.status === "active" && !isOurAgent(ctx, issue.holder.agentName)) {
+      markRecent(ctx, item.key);
+      return;
+    }
+    const ours = Boolean(existingTask?.prUrl) || isOurAgent(ctx, issue.holder?.agentName);
+    if (terminalStatus) {
+      if (ours) {
+        setTask(ctx.state, issue, {
+          status: "delivered",
+          prUrl: issue.pullRequestUrl,
+          reason: `issue is ${issue.status}/${issue.substatus}`
+        });
+      } else {
+        setTask(ctx.state, issue, { status: "skipped", reason: `issue is ${issue.status}` });
+      }
+      markRecent(ctx, item.key);
+      await save(ctx);
+      return;
+    }
+    if (existingTask && ["delivered", "done"].includes(existingTask.status)) {
+      markRecent(ctx, item.key);
+      return;
+    }
+    if (ours) {
+      const recovered = await recoverDelivery(ctx, issue);
+      markRecent(ctx, item.key);
+      if (recovered) await save(ctx);
+      return;
+    }
+    ctx.logger.debug(`#${issue.number} already has PR ${issue.pullRequestUrl}; skipping`);
+    markRecent(ctx, item.key);
+    return;
+  }
+
+  if (terminalStatus) {
     setTask(ctx.state, issue, { status: "skipped", reason: `issue is ${issue.status}` });
     markRecent(ctx, item.key);
     return;
@@ -378,11 +515,6 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
     markRecent(ctx, item.key);
     return;
   }
-  if (issue.pullRequestUrl && !(issue.holder && isOurAgent(ctx, issue.holder.agentName))) {
-    ctx.logger.debug(`#${issue.number} already has PR ${issue.pullRequestUrl}; skipping`);
-    markRecent(ctx, item.key);
-    return;
-  }
   if (!WORKABLE.has(issue.substatus) && !WORKABLE.has(issue.status)) {
     markRecent(ctx, item.key);
     return;
@@ -392,7 +524,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
     markRecent(ctx, item.key);
     return;
   }
-  const claim = await ensureClaim(ctx, issue);
+  const claim = await ensureClaim(ctx, issue, preferredWorker);
   if (!claim) {
     markRecent(ctx, item.key);
     return;
@@ -436,7 +568,8 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
       base: ctx.profile.repo.base,
       previousError: ctx.state.tasks[taskKey(issue)]?.lastError ?? "",
       issueContext,
-      logger: ctx.logger
+      logger: ctx.logger,
+      ...agentHooks(ctx)
     });
   } finally {
     clearInterval(heartbeat);
@@ -522,10 +655,56 @@ async function processWorkItem(ctx: Context, item: QueueEntry): Promise<void> {
     lastError: null
   } as Partial<TaskState>);
   counter(ctx).deliveries += 1;
+  ctx.state.run.deliveries += 1;
+  ctx.cycleStats.deliveries += 1;
+  history(ctx, { type: "delivery", issue: issue.number, detail: worker.name, data: { pr: pr.url, branch, files: changed.length } });
   markRecent(ctx, item.key);
   await recordTaskNote(worker.client, ctx.state.tasks[taskKey(issue)]!, "delivered", result.summary, result.description, ctx.state, worker.name);
   ctx.logger.info(`Delivered #${issue.number}`, { pr: pr.url, branch, files: changed.length });
   await save(ctx);
+}
+
+async function recoverDelivery(ctx: Context, issue: Issue): Promise<boolean> {
+  if (!issue.pullRequestUrl) return false;
+  const agent = (issue.holder?.agentName ? clientByName(ctx, issue.holder.agentName) : null) ?? pickWorker(ctx);
+  if (!agent) return false;
+  let status: Awaited<ReturnType<GitHub["prStatus"]>> | null = null;
+  try {
+    status = await ctx.github.prStatus(issue.pullRequestUrl);
+  } catch (error) {
+    ctx.logger.warn(`Could not verify PR for #${issue.number}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  if (status && (status.checks === "failing" || status.mergeable === false)) {
+    ctx.logger.warn(`PR for #${issue.number} is not deliverable yet (checks=${status.checks}, mergeable=${String(status.mergeable)})`);
+    return false;
+  }
+  try {
+    await agent.client.deliver(issue.id, {
+      pullRequestUrl: issue.pullRequestUrl,
+      summary: `Fix #${issue.number}: ${issue.title}`,
+      description: "Recovered delivery after a restart: the PR already exists.",
+      testResults: status ? `PR checks: ${status.checks}` : undefined,
+      headSha: status?.headSha ?? issue.pullRequestHeadSha ?? undefined
+    });
+  } catch (error) {
+    ctx.logger.warn(`Recovered delivery failed for #${issue.number}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  setTask(ctx.state, issue, {
+    status: "delivered",
+    agentName: agent.name,
+    prUrl: issue.pullRequestUrl,
+    headSha: status?.headSha ?? issue.pullRequestHeadSha ?? undefined,
+    deliveredAt: new Date().toISOString(),
+    lastError: null
+  });
+  counter(ctx).deliveries += 1;
+  ctx.state.run.deliveries += 1;
+  ctx.cycleStats.deliveries += 1;
+  history(ctx, { type: "delivery", issue: issue.number, detail: "recovered existing PR", data: { pr: issue.pullRequestUrl } });
+  ctx.logger.info(`Recovered delivery for #${issue.number}`, { pr: issue.pullRequestUrl });
+  return true;
 }
 
 async function handleWorkFailure(
@@ -542,6 +721,7 @@ async function handleWorkFailure(
   const error = result.error ?? result.blocker ?? "unknown failure";
   ctx.logger.warn(`#${issue.number} attempt ${attempts} failed: ${truncate(error, 300)}`);
   ctx.state.lastError = { at: new Date().toISOString(), issue: issue.number, error: truncate(error, 500) };
+  history(ctx, { type: "failure", issue: issue.number, detail: truncate(error, 300), data: { attempts } });
 
   await cleanupWorktree(ctx.github, dir);
 
@@ -555,6 +735,7 @@ async function handleWorkFailure(
       notifyCommand: ctx.profile.hitl.notifyCommand,
       maxOpen: ctx.profile.limits.maxOpenEscalations
     });
+    if (escalation.ok) history(ctx, { type: "escalation", issue: issue.number, detail: "blocker", data: { id: escalation.escalation?.id } });
     if (!escalation.ok && !escalation.skipped) {
       setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined });
     }
@@ -571,8 +752,8 @@ async function handleWorkFailure(
 
 async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
   if (issue.substatus === "requires_confirmation") {
-    const manager = pickManager(ctx);
-    if (!manager) return false;
+    const confirmer = pickManagerOrWorker(ctx);
+    if (!confirmer) return false;
     const result = await withScratch(ctx, `confirm-${issue.number}`, (dir) =>
       runConfirm({
         profile: ctx.profile,
@@ -580,20 +761,22 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
         issue,
         memoryText: ctx.memoryText,
         repoDir: dir,
-        logger: ctx.logger
+        logger: ctx.logger,
+        ...agentHooks(ctx)
       })
     );
     if (!result.ok) {
       if (result.blocked) {
-        await escalate(manager.client, ctx.profile, ctx.profilePaths, ctx.state, {
+        const escalation = await escalate(confirmer.client, ctx.profile, ctx.profilePaths, ctx.state, {
           issue,
           type: "blocker",
           body: `Cannot confirm #${issue.number}: ${result.blocker ?? result.summary ?? result.error ?? "unknown"}`,
-          agentName: manager.name,
+          agentName: confirmer.name,
           logger: ctx.logger,
           notifyCommand: ctx.profile.hitl.notifyCommand,
           maxOpen: ctx.profile.limits.maxOpenEscalations
         });
+        if (escalation.ok) history(ctx, { type: "escalation", issue: issue.number, detail: "confirmation blocker" });
       }
       return false;
     }
@@ -602,25 +785,34 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
       await save(ctx);
       return false;
     }
-    const confirmation = await manager.client.confirmIssue(issue.id, {
+    const confirmation = await confirmer.client.confirmIssue(issue.id, {
       verdict: "confirm",
       summary: result.summary ?? `Confirmed #${issue.number}`,
       description: result.description ?? "",
       files: fileEvidence(result.files),
       duplicateOfId: result.duplicateOfId ?? undefined
     });
-    if (confirmation?.confirmed) await manager.client.openIssue(issue.id).catch(() => {});
-    return true;
+    if (confirmation?.confirmed) {
+      await confirmer.client.openIssue(issue.id).catch(() => {});
+      return true;
+    }
+    ctx.logger.info(`Confirmation for #${issue.number} still needs weight; not spinning this cycle`);
+    markRecent(ctx, `confirm:${issue.id}`);
+    return false;
   }
 
   if (issue.status === "open" || issue.substatus === "open") return true;
   return issue.status === "in_progress" || issue.substatus === "in_progress";
 }
 
-async function ensureBidAndAward(ctx: Context, issue: Issue): Promise<{ agent: AgentClient; claimId: string } | null> {
-  const worker = pickWorker(ctx);
-  const manager = pickManager(ctx);
-  if (!worker || !manager) return null;
+async function ensureBidAndAward(
+  ctx: Context,
+  issue: Issue,
+  preferred?: AgentClient
+): Promise<{ agent: AgentClient; claimId: string } | null> {
+  const worker = preferred ?? pickWorker(ctx);
+  if (!worker) return null;
+  const awarder = pickManager(ctx) ?? worker;
 
   let bids: any[] = [];
   try {
@@ -643,12 +835,19 @@ async function ensureBidAndAward(ctx: Context, issue: Issue): Promise<{ agent: A
       .join("\n");
     const created = await worker.client.bid(issue.id, { summary, description });
     bidId = created.bid_id ?? created.id ?? created.bidId ?? null;
+    if (bidId) history(ctx, { type: "bid", issue: issue.number, detail: worker.name, data: { bidId } });
   }
   if (!bidId) return null;
 
   let award;
   try {
-    award = await manager.client.awardBid(bidId);
+    award = await awarder.client.awardBid(bidId);
+    history(ctx, {
+      type: "award",
+      issue: issue.number,
+      detail: `${awarder.name}${awarder.name === worker.name ? " (self)" : ""}`,
+      data: { bidId }
+    });
   } catch (error) {
     ctx.logger.warn(`Award failed for #${issue.number}: ${error instanceof Error ? error.message : String(error)}`);
     return null;
@@ -658,6 +857,7 @@ async function ensureBidAndAward(ctx: Context, issue: Issue): Promise<{ agent: A
 
   try {
     await worker.client.acceptOffer(claimId);
+    history(ctx, { type: "accept", issue: issue.number, detail: worker.name, data: { claimId } });
   } catch (error) {
     ctx.logger.warn(`Offer accept failed for #${issue.number}: ${error instanceof Error ? error.message : String(error)}`);
     return null;
@@ -668,23 +868,30 @@ async function ensureBidAndAward(ctx: Context, issue: Issue): Promise<{ agent: A
     claimId,
     lastHeartbeatAt: new Date().toISOString()
   });
+  history(ctx, { type: "claim", issue: issue.number, detail: worker.name, data: { claimId } });
   await save(ctx);
   return { agent: worker, claimId };
 }
 
-async function ensureClaim(ctx: Context, issue: Issue): Promise<{ agent: AgentClient; claimId: string } | null> {
+async function ensureClaim(
+  ctx: Context,
+  issue: Issue,
+  preferred?: AgentClient
+): Promise<{ agent: AgentClient; claimId: string } | null> {
   const holder = issue.holder;
   if (holder) {
     const agent = clientByName(ctx, holder.agentName);
     if (!agent) return null;
     if (holder.status === "active") {
       setTask(ctx.state, issue, { status: "claimed", agentName: agent.name, claimId: holder.id, lastHeartbeatAt: new Date().toISOString() });
+      history(ctx, { type: "claim", issue: issue.number, detail: `${agent.name} (existing)`, data: { claimId: holder.id } });
       return { agent, claimId: holder.id };
     }
     if (holder.status === "offered") {
       try {
         await agent.client.acceptOffer(holder.id);
         setTask(ctx.state, issue, { status: "claimed", agentName: agent.name, claimId: holder.id, lastHeartbeatAt: new Date().toISOString() });
+        history(ctx, { type: "accept", issue: issue.number, detail: agent.name, data: { claimId: holder.id } });
         return { agent, claimId: holder.id };
       } catch (error) {
         ctx.logger.warn(`Could not accept existing offer for #${issue.number}: ${error instanceof Error ? error.message : String(error)}`);
@@ -692,21 +899,7 @@ async function ensureClaim(ctx: Context, issue: Issue): Promise<{ agent: AgentCl
       }
     }
   }
-  return ensureBidAndAward(ctx, issue);
-}
-
-async function reviewPass(ctx: Context): Promise<void> {
-  if (counter(ctx).reviews >= ctx.profile.limits.maxReviewsPerDay) return;
-  const item = ctx.queue?.review[0];
-  if (!item) return;
-  try {
-    if (item.kind === "test_fix") await processTestFix(ctx, item);
-    else if (item.kind === "accept_fix") await processAccept(ctx, item);
-  } catch (error) {
-    ctx.logger.error(`Review for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
-    markRecent(ctx, item.key);
-    await save(ctx).catch(() => {});
-  }
+  return ensureBidAndAward(ctx, issue, preferred);
 }
 
 async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
@@ -740,7 +933,8 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
       worktree: dir,
       prUrl: issue.pullRequestUrl,
       headSha: issue.pullRequestHeadSha ?? "",
-      logger: ctx.logger
+      logger: ctx.logger,
+      ...agentHooks(ctx)
     });
   } finally {
     await cleanupWorktree(ctx.github, dir);
@@ -760,6 +954,13 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
     headSha: result.headSha ?? issue.pullRequestHeadSha ?? undefined
   });
   counter(ctx).reviews += 1;
+  ctx.cycleStats.reviews += 1;
+  history(ctx, {
+    type: "review",
+    issue: issue.number,
+    detail: reviewer.name,
+    data: { goodToMerge: result.goodToMerge === true }
+  });
   markRecent(ctx, item.key);
   await recordTaskNote(reviewer.client, issue, "reviewed", result.summary, result.description, ctx.state, reviewer.name);
   ctx.logger.info(`Reviewed #${issue.number}`, { goodToMerge: result.goodToMerge, reviewer: reviewer.name });
@@ -776,6 +977,7 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
   const holder = issue.holder?.agentName ?? null;
   const manager = pickManager(ctx, [holder ?? ""]);
   if (!manager) {
+    ctx.logger.debug(`Skipping merge review for #${issue.number}: no manager/merger agent configured`);
     markRecent(ctx, item.key);
     return;
   }
@@ -812,54 +1014,60 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
     description: `Reviewed #${issue.number}. Test verdicts are good to merge; PR ${issue.pullRequestUrl} reports checks ${prStatus.checks} and mergeable ${String(prStatus.mergeable)}.`
   });
   counter(ctx).reviews += 1;
+  ctx.cycleStats.reviews += 1;
+  history(ctx, { type: "merge_review", issue: issue.number, detail: manager.name, data: { verdict: "accept" } });
   markRecent(ctx, item.key);
   ctx.logger.info(`Accepted #${issue.number}`, { manager: manager.name });
   await save(ctx);
 }
 
-async function auxPass(ctx: Context): Promise<void> {
-  const limit = ctx.profile.limits.maxAuxPerCycle;
-  let handled = 0;
-  for (const item of ctx.queue?.aux ?? []) {
-    if (handled >= limit) break;
-    if (item.item.canAct === false) continue;
-    try {
-      let did = false;
-      switch (item.kind) {
-        case "report_pr_status":
-          did = await processPrReport(ctx, item);
-          break;
-        case "review_bid":
-          did = await processBidVote(ctx, item);
-          break;
-        case "award_bid":
-          did = await processAward(ctx, item);
-          break;
-        case "review_comment":
-          did = await processCommentUpvote(ctx, item);
-          break;
-        case "categorize":
-          did = await processCategorize(ctx, item);
-          break;
-        case "idea":
-          did = await processIdeaVerdict(ctx, item);
-          break;
-        case "confirm_issue":
-          did = await processConfirm(ctx, item);
-          break;
-        default:
-          did = false;
-      }
-      if (did) {
-        counter(ctx).aux += 1;
-        handled += 1;
-      }
-    } catch (error) {
-      ctx.logger.warn(`Aux ${item.kind} failed: ${error instanceof Error ? error.message : String(error)}`);
-      markRecent(ctx, item.key);
-    }
+async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> {
+  if (item.item.canAct === false) {
+    markRecent(ctx, item.key);
+    return false;
   }
-  if (handled) await save(ctx);
+  try {
+    let did = false;
+    switch (item.kind) {
+      case "report_pr_status":
+        did = await processPrReport(ctx, item);
+        break;
+      case "review_bid":
+        did = await processBidVote(ctx, item);
+        break;
+      case "award_bid":
+        did = await processAward(ctx, item);
+        break;
+      case "review_comment":
+        did = await processCommentUpvote(ctx, item);
+        break;
+      case "categorize":
+        did = await processCategorize(ctx, item);
+        break;
+      case "idea":
+        did = await processIdeaVerdict(ctx, item);
+        break;
+      case "confirm_issue":
+        did = await processConfirm(ctx, item);
+        break;
+      default:
+        ctx.logger.debug(`Unhandled aux kind "${item.kind}"; marking recent`);
+        markRecent(ctx, item.key);
+        did = false;
+    }
+    if (did) {
+      counter(ctx).aux += 1;
+      ctx.cycleStats.aux += 1;
+      history(ctx, { type: "aux", issue: item.issueNumber, idea: item.ideaNumber, detail: item.kind });
+    }
+    return did;
+  } catch (error) {
+    ctx.logger.warn(`Aux ${item.kind} failed: ${error instanceof Error ? error.message : String(error)}`);
+    counter(ctx).errors += 1;
+    ctx.cycleStats.errors += 1;
+    markRecent(ctx, item.key);
+    return false;
+  }
 }
 
 async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean> {
@@ -981,25 +1189,25 @@ async function processCommentUpvote(ctx: Context, item: QueueEntry): Promise<boo
 }
 
 async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolean> {
-  const manager = pickManager(ctx);
-  if (!manager) return false;
+  const actor = pickWorker(ctx) ?? pickManager(ctx);
+  if (!actor) return false;
   let did = 0;
   try {
-    const issues = await manager.client.listAllIssues({ platform: "none", max: 100 });
+    const issues = await actor.client.listAllIssues({ platform: "none", max: 100 });
     for (const issue of issues) {
       if (did >= 5) break;
       if (!textMatchesPlatform(ctx.profile, `${issue.title} ${issue.summary ?? ""}`)) continue;
-      await manager.client.categorizeIssue(issue.id, {
+      await actor.client.categorizeIssue(issue.id, {
         platform: ctx.profile.ziki.platform,
         reason: "Title/summary matches this profile's platform."
       });
       did += 1;
     }
-    const ideas = await manager.client.listAllIdeas({ platform: "none", max: 100 });
+    const ideas = await actor.client.listAllIdeas({ platform: "none", max: 100 });
     for (const idea of ideas) {
       if (did >= 5) break;
       if (!textMatchesPlatform(ctx.profile, `${idea.title} ${idea.summary ?? ""}`)) continue;
-      await manager.client.categorizeIdea(idea.id, {
+      await actor.client.categorizeIdea(idea.id, {
         platform: ctx.profile.ziki.platform,
         reason: "Title/summary matches this profile's platform."
       });
@@ -1009,7 +1217,7 @@ async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolea
     ctx.logger.warn(`Categorize failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   markRecent(ctx, item.key);
-  if (did) ctx.logger.info(`Categorized ${did} items`);
+  if (did) history(ctx, { type: "aux", detail: "categorize", data: { count: did, by: actor.name } });
   return did > 0;
 }
 
@@ -1021,7 +1229,8 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boole
     return false;
   }
   const manager = pickManager(ctx);
-  if (!manager) {
+  const voter = manager ?? pickWorker(ctx);
+  if (!voter) {
     markRecent(ctx, item.key);
     return false;
   }
@@ -1032,7 +1241,8 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boole
       idea,
       memoryText: ctx.memoryText,
       repoDir: dir,
-      logger: ctx.logger
+      logger: ctx.logger,
+      ...agentHooks(ctx)
     })
   );
   if (!result.ok) {
@@ -1040,17 +1250,28 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boole
     return false;
   }
   const opinion = result.opinion && ["good", "bad", "neutral"].includes(result.opinion) ? result.opinion : "neutral";
-  await manager.client.giveIdeaVerdict(idea.id, {
+  const requestedVotes = opinion === "good" ? (manager ? 3 : 1) : 1;
+  const verdictPayload = {
     opinion,
-    votes: opinion === "good" ? 3 : 1,
+    votes: requestedVotes,
     summary: result.summary ?? `Triage: ${opinion}`,
     description: result.description ?? ""
-  });
+  };
+  try {
+    await voter.client.giveIdeaVerdict(idea.id, verdictPayload);
+  } catch (error) {
+    if ((error as { status?: number }).status === 422 && requestedVotes > 1) {
+      await voter.client.giveIdeaVerdict(idea.id, { ...verdictPayload, votes: 1 });
+    } else {
+      throw error;
+    }
+  }
+  history(ctx, { type: "aux", idea: idea.number, detail: `idea verdict: ${opinion}`, data: { votes: requestedVotes } });
   if (opinion === "good") {
     try {
-      const verdicts = await manager.client.ideaVerdicts(idea.id);
+      const verdicts = await voter.client.ideaVerdicts(idea.id);
       if (verdicts?.convertible) {
-        await manager.client.convertIdea(idea.id);
+        await voter.client.convertIdea(idea.id);
         ctx.logger.info(`Converted idea #${idea.number} after triage`);
       }
     } catch {
@@ -1068,8 +1289,8 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx);
-  if (!manager) return false;
+  const confirmer = pickManagerOrWorker(ctx);
+  if (!confirmer) return false;
   const result = await withScratch(ctx, `confirm-aux-${issue.number}`, (dir) =>
     runConfirm({
       profile: ctx.profile,
@@ -1077,7 +1298,8 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
       issue,
       memoryText: ctx.memoryText,
       repoDir: dir,
-      logger: ctx.logger
+      logger: ctx.logger,
+      ...agentHooks(ctx)
     })
   );
   if (!result.ok) {
@@ -1085,14 +1307,15 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
     return false;
   }
   const verdict = result.verdict && ["confirm", "reject", "neutral"].includes(result.verdict) ? result.verdict : "neutral";
-  const response = await manager.client.confirmIssue(issue.id, {
+  const response = await confirmer.client.confirmIssue(issue.id, {
     verdict,
     summary: result.summary ?? `Confirmation: ${verdict}`,
     description: result.description ?? "",
     files: fileEvidence(result.files),
     duplicateOfId: result.duplicateOfId ?? undefined
   });
-  if (response?.confirmed) await manager.client.openIssue(issue.id).catch(() => {});
+  if (response?.confirmed) await confirmer.client.openIssue(issue.id).catch(() => {});
+  history(ctx, { type: "aux", issue: issue.number, detail: `confirmation: ${verdict}`, data: { by: confirmer.name } });
   markRecent(ctx, item.key);
   return true;
 }
@@ -1121,7 +1344,8 @@ async function discoveryPass(ctx: Context): Promise<void> {
       parity,
       existingIssues: existing,
       maxIdeas: ctx.profile.discovery.maxIdeasPerRun ?? 3,
-      logger: ctx.logger
+      logger: ctx.logger,
+      ...agentHooks(ctx)
     })
   );
 
@@ -1156,6 +1380,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
     }
   }
   if (ideas.length) {
+    history(ctx, { type: "discovery", detail: `filed ${ideas.length} idea(s)`, data: { ideas: ideas.map((idea) => idea.title) } });
     await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${ideas.length} idea(s)`, ideas.map((idea) => `- ${idea.title}`).join("\n"), ctx.state, ctx.primary.name);
   }
   await save(ctx);
@@ -1202,6 +1427,9 @@ async function cleanupOldWorktrees(ctx: Context): Promise<void> {
 async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean; paused?: boolean; stopped?: boolean; noFeed?: boolean }> {
   const started = Date.now();
   ctx.state.cycles += 1;
+  ctx.cycleStats = { deliveries: 0, reviews: 0, aux: 0, errors: 0 };
+  ctx.state.lastCycleAt = new Date().toISOString();
+  ctx.state.lastCycleMs = null;
 
   if (await isStopped(ctx.profilePaths)) return { stopped: true };
   if (await isPaused(ctx.profilePaths)) {
@@ -1264,28 +1492,122 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
 
   await heartbeatPass(ctx);
   if (ctx.repoReady) await ensureBaseline(ctx).catch((error) => ctx.logger.warn(`Baseline failed: ${error instanceof Error ? error.message : String(error)}`));
-  await ownerPass(ctx);
-  await deliveryPass(ctx);
-  await reviewPass(ctx);
-  await auxPass(ctx);
-  await discoveryPass(ctx);
+  dispatch(ctx);
   await cleanupOldWorktrees(ctx);
 
   pruneState(ctx.state);
-  ctx.state.lastCycleAt = new Date().toISOString();
   ctx.state.lastCycleMs = Date.now() - started;
   await save(ctx);
   ctx.logger.info("Cycle complete", {
     cycles: ctx.state.cycles,
     ms: ctx.state.lastCycleMs,
     queue: ctx.queue.counts,
+    inFlight: ctx.pool.total(),
     deliveries: counter(ctx).deliveries,
     reviews: counter(ctx).reviews
   });
   return { ok: true };
 }
 
-async function createContext(loaded: LoadedProfile, state: State, logger: Logger, options: { dryRun: boolean }): Promise<Context> {
+function discoveryDue(ctx: Context): boolean {
+  if (!ctx.profile.discovery.enabled) return false;
+  if (counter(ctx).discoveries >= ctx.profile.limits.maxDiscoveriesPerDay) return false;
+  const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
+  return ctx.state.cycles > 0 && ctx.state.cycles % every === 0;
+}
+
+function nextItem(ctx: Context, bucket: QueueEntry[] | undefined): QueueEntry | null {
+  return (bucket ?? []).find((entry) => !ctx.pool.has(entry.key) && entry.item.canAct !== false) ?? null;
+}
+
+async function processWorkSafe(ctx: Context, item: QueueEntry, worker?: AgentClient): Promise<void> {
+  try {
+    await processWorkItem(ctx, item, worker);
+  } catch (error) {
+    ctx.logger.error(`Delivery for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
+    counter(ctx).errors += 1;
+    ctx.cycleStats.errors += 1;
+    history(ctx, { type: "failure", issue: item.issueNumber, detail: error instanceof Error ? error.message : String(error) });
+    markRecent(ctx, item.key);
+    await save(ctx).catch(() => {});
+  }
+}
+
+async function processReviewSafe(ctx: Context, item: QueueEntry): Promise<void> {
+  try {
+    if (item.kind === "test_fix") await processTestFix(ctx, item);
+    else if (item.kind === "accept_fix") await processAccept(ctx, item);
+  } catch (error) {
+    ctx.logger.error(`Review for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
+    counter(ctx).errors += 1;
+    ctx.cycleStats.errors += 1;
+    history(ctx, { type: "failure", issue: item.issueNumber, detail: error instanceof Error ? error.message : String(error) });
+    markRecent(ctx, item.key);
+    await save(ctx).catch(() => {});
+  }
+}
+
+function dispatch(ctx: Context): void {
+  const limits = ctx.profile.limits;
+  const pool = ctx.pool;
+  ctx.auxThisCycle = 0;
+
+  if (pool.canStart("owner")) {
+    const owner = nextItem(ctx, ctx.queue?.owner);
+    if (owner) pool.reserve(owner.key, "owner", () => processOwnerItem(ctx, owner));
+  }
+
+  const maxDeliveries = Math.max(0, Math.min(limits.maxConcurrentDeliveries ?? 2, limits.maxActiveClaims));
+  while (pool.canStart("delivery") && pool.count("delivery") < maxDeliveries) {
+    if (activeClaims(ctx).length + pool.count("delivery") >= limits.maxActiveClaims) break;
+    if (counter(ctx).deliveries >= limits.maxDeliveriesPerDay) break;
+    if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal) break;
+    const item = (ctx.queue?.work ?? []).find((entry) => {
+      if (!entry.issueId || pool.has(entry.key)) return false;
+      const task = ctx.state.tasks[entry.issueId];
+      return !task || !["waiting_human", "delivered", "done", "failed", "skipped"].includes(task.status);
+    });
+    if (!item) break;
+    const worker = pickAvailableWorker(ctx);
+    if (!worker) break;
+    ctx.reservedAgents.add(worker.name);
+    pool.reserve(item.key, "delivery", async () => {
+      try {
+        await processWorkSafe(ctx, item, worker);
+      } finally {
+        ctx.reservedAgents.delete(worker.name);
+      }
+    });
+  }
+
+  while (pool.canStart("review")) {
+    if (counter(ctx).reviews >= limits.maxReviewsPerDay) break;
+    const item = nextItem(ctx, ctx.queue?.review);
+    if (!item) break;
+    pool.reserve(item.key, "review", () => processReviewSafe(ctx, item));
+  }
+
+  while (pool.canStart("aux") && ctx.auxThisCycle < limits.maxAuxPerCycle) {
+    const item = nextItem(ctx, ctx.queue?.aux);
+    if (!item) break;
+    ctx.auxThisCycle += 1;
+    pool.reserve(item.key, "aux", async () => {
+      await processAuxItem(ctx, item);
+      await save(ctx).catch(() => {});
+    });
+  }
+
+  if (pool.canStart("discovery") && discoveryDue(ctx) && !pool.has("discovery")) {
+    pool.reserve("discovery", "discovery", () => discoveryPass(ctx));
+  }
+}
+
+async function createContext(
+  loaded: LoadedProfile,
+  state: State,
+  logger: Logger,
+  options: { dryRun: boolean; runLimits: RunLimitConfig }
+): Promise<Context> {
   const { profile, profileName, keys } = loaded;
   const toClients = (agents: AgentKey[]): AgentClient[] =>
     agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile) }));
@@ -1327,8 +1649,85 @@ async function createContext(loaded: LoadedProfile, state: State, logger: Logger
     feed: null,
     queue: null,
     platform: { issues: [], ideas: [], fetchedAt: null },
-    dryRun: options.dryRun
+    dryRun: options.dryRun,
+    pool: new TaskPool({
+      delivery: profile.limits.maxConcurrentDeliveries ?? 2,
+      review: profile.limits.maxConcurrentReviews ?? 1,
+      aux: profile.limits.maxConcurrentAux ?? 2,
+      discovery: profile.limits.maxConcurrentDiscovery ?? 1,
+      owner: 1,
+      agents: profile.limits.maxConcurrentAgents ?? 4
+    }),
+    mutex: new Mutex(),
+    runLimits: options.runLimits,
+    auxThisCycle: 0,
+    reservedAgents: new Set(),
+    cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 }
   };
+}
+
+async function readRunLimitsFile(profilePaths: ProfilePaths): Promise<Partial<RunLimitConfig> | null> {
+  if (!existsSync(profilePaths.runLimitsFile)) return null;
+  try {
+    return JSON.parse(await readFile(profilePaths.runLimitsFile, "utf8")) as Partial<RunLimitConfig>;
+  } catch {
+    return null;
+  }
+}
+
+function killStalePids(state: State, logger: Logger): number[] {
+  const alive: number[] = [];
+  for (const pid of state.activePids ?? []) {
+    if (!isAlive(pid)) continue;
+    alive.push(pid);
+    logger.warn(`Killing stale agent process from a previous run (pid ${pid})`);
+    killProcessTree(pid);
+  }
+  state.activePids = [];
+  return alive;
+}
+
+async function reconcileWorktreesOnStartup(ctx: Context, blockedPids: number[] = []): Promise<void> {
+  if ([...(ctx.state.activePids ?? []), ...blockedPids].some((pid) => isAlive(pid))) {
+    ctx.logger.warn("Skipping worktree cleanup: recorded agent processes are still alive");
+    return;
+  }
+  for (const task of Object.values(ctx.state.tasks)) {
+    if (!task.worktree) continue;
+    if (!["done", "failed", "skipped"].includes(task.status)) continue;
+    await cleanupWorktree(ctx.github, task.worktree);
+    task.worktree = undefined;
+  }
+  const live = new Set(
+    Object.values(ctx.state.tasks)
+      .map((task) => task.worktree)
+      .filter((value): value is string => Boolean(value))
+  );
+  const entries = await readdir(ctx.profilePaths.worktreesDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const full = path.join(ctx.profilePaths.worktreesDir, entry.name);
+    if (live.has(full)) continue;
+    const info = await stat(full).catch(() => null);
+    if (!info || Date.now() - info.mtimeMs < 24 * 60 * 60 * 1000) continue;
+    await cleanupWorktree(ctx.github, full);
+    ctx.logger.info(`Removed stale worktree ${entry.name}`);
+  }
+}
+
+function limitReached(ctx: Context): "max-cycles" | "max-deliveries" | "until" | "max-runtime" | null {
+  const limits = ctx.runLimits;
+  if (limits.maxCycles !== null && ctx.state.cycles >= limits.maxCycles) return "max-cycles";
+  if (limits.maxDeliveriesTotal !== null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal) return "max-deliveries";
+  if (limits.stopAt) {
+    const at = new Date(limits.stopAt).getTime();
+    if (Number.isFinite(at) && Date.now() >= at) return "until";
+  }
+  if (limits.maxRuntimeMinutes !== null) {
+    const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
+    if (Date.now() - started >= limits.maxRuntimeMinutes * 60 * 1000) return "max-runtime";
+  }
+  return null;
 }
 
 export async function runLoop(options: {
@@ -1336,6 +1735,7 @@ export async function runLoop(options: {
   foreground?: boolean;
   once?: boolean;
   dryRun?: boolean;
+  limits?: Partial<RunLimitConfig> | null;
 } = {}): Promise<number> {
   const loaded = await loadProfile(options.profileName);
   const logger = createLogger({
@@ -1353,30 +1753,43 @@ export async function runLoop(options: {
   state.profile = loaded.profileName;
   state.startedAt ??= new Date().toISOString();
   state.stoppedAt = null;
+  const stalePids = killStalePids(state, logger);
   for (const task of Object.values(state.tasks)) {
     if (task.status === "working") task.status = "queued";
   }
+  const storedLimits = await readRunLimitsFile(loaded.profilePaths);
+  const runLimits = resolveRunLimits(loaded.profile, options.limits ?? storedLimits ?? null);
+  state.run = {
+    startedAt: new Date().toISOString(),
+    limits: runLimits,
+    stopReason: null,
+    deliveries: 0
+  };
+  state.lastCycle = null;
   await saveState(loaded.profilePaths, state);
   await writePid(loaded.profilePaths, process.pid);
 
   let ctx: Context;
   try {
-    ctx = await createContext(loaded, state, logger, { dryRun: Boolean(options.dryRun) });
+    ctx = await createContext(loaded, state, logger, { dryRun: Boolean(options.dryRun), runLimits });
   } catch (error) {
     logger.error(`Startup failed: ${error instanceof Error ? error.message : String(error)}`);
     await releaseLock(loaded.profilePaths);
     await clearPid(loaded.profilePaths);
     return 1;
   }
+  await reconcileWorktreesOnStartup(ctx, stalePids).catch(() => {});
 
   const controller = new AbortController();
-  const shutdown = async (signal: string): Promise<void> => {
+  const shutdown = (signal: string): void => {
     logger.info(`Stopping on ${signal}`);
-    killActiveAgents();
     controller.abort();
+    killActiveAgents();
   };
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  const onSigint = (): void => shutdown("SIGINT");
+  const onSigterm = (): void => shutdown("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
 
   logger.info("Auto-work loop started", {
     profile: ctx.profileName,
@@ -1384,13 +1797,22 @@ export async function runLoop(options: {
     workers: ctx.clients.workers.map((agent) => agent.name),
     managers: ctx.clients.managers.map((agent) => agent.name),
     pollSeconds: ctx.profile.pollSeconds,
-    repoReady: ctx.repoReady
+    repoReady: ctx.repoReady,
+    runLimits
   });
   await writeStatus(ctx, { running: true });
 
+  let stopReason: StopReason = null;
   try {
     do {
-      if (controller.signal.aborted || (await isStopped(ctx.profilePaths))) break;
+      if (controller.signal.aborted) {
+        stopReason ??= "stop";
+        break;
+      }
+      if (await isStopped(ctx.profilePaths)) {
+        stopReason = "stop";
+        break;
+      }
       if (await isPaused(ctx.profilePaths)) {
         await sleep(30_000, controller.signal);
         continue;
@@ -1405,17 +1827,54 @@ export async function runLoop(options: {
         };
         logger.error(`Cycle failed: ${error instanceof Error ? error.message : String(error)}`);
         await save(ctx).catch(() => {});
+        if (options.once) {
+          stopReason = "error";
+          break;
+        }
       }
-      if (options.once) break;
-      await sleep(ctx.profile.pollSeconds * 1000, controller.signal);
+      if (options.once) {
+        await ctx.pool.drain(120_000);
+        break;
+      }
+      const reason = limitReached(ctx);
+      if (reason) {
+        stopReason = reason;
+        logger.info(`Run limit reached: ${reason}`, { cycles: ctx.state.cycles, deliveries: ctx.state.run.deliveries });
+        await ctx.pool.drain(120_000);
+        break;
+      }
+      await Promise.race([ctx.pool.waitForAny(), sleep(ctx.profile.pollSeconds * 1000, controller.signal)]);
     } while (!controller.signal.aborted);
+  } catch (error) {
+    stopReason = "error";
+    ctx.state.lastError = {
+      at: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error),
+      stack: truncate(error instanceof Error ? error.stack : "", 1500)
+    };
+    logger.error(`Loop failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    state.stoppedAt = new Date().toISOString();
-    await saveState(loaded.profilePaths, state).catch(() => {});
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+    if (!stopReason && controller.signal.aborted) stopReason = "stop";
+    ctx.state.run.stopReason = stopReason;
+    ctx.state.stoppedAt = new Date().toISOString();
+    const hardStop = stopReason === "stop" || stopReason === "error" || controller.signal.aborted;
+    if (hardStop) {
+      controller.abort();
+      killActiveAgents();
+    }
+    await ctx.pool.drain(30_000);
+    if (ctx.pool.total()) {
+      killActiveAgents();
+      await ctx.pool.drain(5_000);
+    }
+    ctx.state.activePids = [];
+    await save(ctx).catch(() => {});
     await writeStatus(ctx, { running: false }).catch(() => {});
     await releaseLock(loaded.profilePaths);
     await clearPid(loaded.profilePaths);
-    logger.info("Auto-work loop stopped");
+    logger.info("Auto-work loop stopped", { stopReason });
   }
   return 0;
 }

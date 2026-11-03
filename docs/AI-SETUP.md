@@ -2,6 +2,23 @@
 
 You are setting up **auto-work** for a user. Follow this checklist exactly.
 
+## Requirements checklist
+
+Confirm these before installing. Missing items are reported by `auto-work doctor`.
+
+- Linux, macOS, Windows, or WSL.
+- Node.js >= 20, npm, git, and `gh` with `gh auth login` (`repo` scope).
+- SSH or HTTPS push access to the fork.
+- A Ziki account with a project and platform.
+- **At least one `working` agent key.** `manager`/`merger` is optional.
+- A coding CLI (opencode, Claude Code, Codex, Gemini CLI, or custom) and its
+  provider auth.
+- The project toolchain used by checks.
+- Network access, ~3 GB free disk, and push/PR permission.
+- Optional: systemd/launchd/Task Scheduler, Docker/VM, sudoers.
+
+Per-platform commands are in [`requirements.md`](./requirements.md).
+
 ## Hard rules
 
 - **Do not start the loop.** Finish with `auto-work run --once --dry-run`, not
@@ -29,8 +46,10 @@ config path and the active profile.
 ## 2. Get the keys
 
 Tell the user to create agents in **Ziki → Settings → Agents**. They need at
-least one `working` agent. A `manager` or `merger` agent is strongly recommended
-(awards, confirmations and merge reviews use it).
+least one `working` agent. A `manager` or `merger` agent is optional: without
+one, merge reviews, accept, cross-platform moves, and manager-only
+categorization are skipped. Awards, confirmations, and idea verdicts still work
+at weight 1.
 
 Ask them to save the keys in a file:
 
@@ -48,7 +67,8 @@ auto-work keys import keys.env
 `keys import` writes the keys to the env file (mode 600) and checks each one
 with `GET /api/v1/agents/me`. It prints a table of env name, agent, level and
 project, and assigns `working` → workers and `manager`/`merger` → managers.
-Warn if there is no manager key.
+Warn if there is no manager key; leave `managers` empty instead of inventing
+one.
 
 If the user prefers to do it in one command:
 
@@ -79,7 +99,8 @@ Detect the stack separately from the platform:
 - `pubspec.yaml` → Flutter → checks preset `flutter`
 - `package.json` → Node → checks preset `node`
 - `pyproject.toml` → Python → checks preset `python`
-- `go.mod` / `Cargo.toml` → Go / Rust (no preset; ask for commands)
+- `go.mod` → Go → checks preset `go` (`go build ./...`, `go test ./...`)
+- `Cargo.toml` → Rust → checks preset `rust` (`cargo build`, `cargo test`)
 
 Ask for:
 
@@ -157,12 +178,15 @@ Then edit `prompts/<profile>/worker.md`, `review.md`, `confirm.md`, `triage.md`,
 ```bash
 auto-work config --validate
 auto-work doctor
+auto-work doctor --json
 auto-work run --once --dry-run
 ```
 
-`doctor` prints the key table, checks the selected provider, `gh` auth, the repo
-clone, the base branch, fork access, and disk space. The dry run builds the
-queue and performs **no Ziki or GitHub writes**.
+`doctor` prints the key table, checks the selected provider, `gh`
+auth/scopes, repository push permission, the Ziki project/platform, the repo
+clone, the base branch, fork access, disk space, and stale lock/PID/worktree
+state. `--json` is available for automation. The dry run builds the queue and
+performs **no Ziki or GitHub writes**.
 
 ## 8. Report back
 
@@ -173,6 +197,8 @@ Tell the user:
 - the provider and resolved models,
 - the checks that will run,
 - the number of items in the dry-run queue,
+- the run limit (default 2 hours) and flags: `--max-runtime`, `--max-cycles`,
+  `--until`, `--max-deliveries`, `--forever`,
 - that the loop is **not running**,
 - the command to start it: `auto-work start`.
 

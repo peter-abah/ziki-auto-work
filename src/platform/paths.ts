@@ -107,7 +107,9 @@ export function profilePaths(profileName: string): ProfilePaths {
     needsHumanFile: path.join(base, "NEEDS-HUMAN.md"),
     ownerRequestsFile: path.join(base, "OWNER-REQUESTS.md"),
     memoryFile: path.join(base, "memory-context.json"),
-    desktopCacheFile: path.join(base, "platform-cache.json")
+    desktopCacheFile: path.join(base, "platform-cache.json"),
+    runLimitsFile: path.join(base, "run-limits.json"),
+    historyFile: path.join(base, "history.jsonl")
   };
 }
 

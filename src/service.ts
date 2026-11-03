@@ -31,6 +31,8 @@ WorkingDirectory=${paths().home}
 ExecStart=${process.execPath} ${binPath()} start --foreground --profile ${profileName}
 Restart=on-failure
 RestartSec=15
+KillMode=control-group
+TimeoutStopSec=60
 Environment=PATH=${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}
 
 [Install]
@@ -79,6 +81,7 @@ export async function installService(profileName: string): Promise<{ ok: boolean
   }
   if (process.platform === "darwin") {
     await mkdir(p.launchdDir, { recursive: true });
+    await mkdir(profilePaths(profileName).logsDir, { recursive: true });
     const file = path.join(p.launchdDir, `io.autowork.${safeName(profileName)}.plist`);
     await writeFile(file, launchdPlistText(profileName), "utf8");
     const load = await runCommand("launchctl", ["load", "-w", file]);

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0
+## Unreleased
 
 - Renamed **jobs** to **profiles** everywhere (config v3: `profiles` and
   `activeProfile`). There is no automatic migration from v1/v2; run
@@ -19,17 +19,25 @@
   path and `npx` is the one-off alternative.
 - Commands and flags use `--profile` / `auto-work profiles`; `--job` and
   `auto-work jobs` are gone.
-
-## 0.1.0
-
-- Initial public release.
-- TypeScript, config-driven engine with multiple jobs.
-- Providers: opencode, Claude Code, Codex, Gemini CLI, custom.
-- Per-job checks, prompts, PR templates, platform matching, protected files.
-- Non-blocking human-in-the-loop via Ziki escalations and inbox.
-- Durable memory via Ziki agent notes, shared notes, instructions, history and
-  mistakes.
-- Per-ticket and review worktrees; baseline of pre-existing test failures.
-- Linux, macOS and Windows paths, spawning, logging and service setup.
-- `init`, `detect`, `models`, `jobs`, `doctor`, `start --all`, `pause`,
-  `resume`, `status`, `logs`, `escalations`, `memory`, `config`.
+- Working-only agents are supported. Manager/merger keys are optional; without
+  them merge reviews and manager-only actions are skipped, awards fall back to
+  self-award, and confirmations/idea verdicts run at weight 1.
+- Run limits: `maxRuntimeMinutes` (default 120), `maxCycles`, `stopAt`,
+  `maxDeliveriesTotal`; `--max-runtime`, `--max-cycles`, `--until`,
+  `--max-deliveries`, `--forever`. `status` shows limit, elapsed, remaining and
+  stop reason.
+- Observability: `auto-work report [--since] [--json]`,
+  `auto-work history [--limit]`, `status --verbose`, and `history.jsonl`.
+- Parallel execution: `src/scheduler.ts` TaskPool (2 deliveries, 1 review,
+  2 auxiliary, 1 discovery, 4 agents) with a state mutex and in-flight status.
+- Kill hardening: stale agent PIDs and worktrees are cleaned on start, existing
+  PRs are reconciled instead of re-running the worker, `stop` aborts in-flight
+  tasks, and systemd uses `KillMode=control-group`.
+- Audit fixes: unhandled auxiliary kinds are marked recent, idea verdicts retry
+  at weight 1 on 422, Go/Rust presets, generic protected files, fork-aware PR
+  lookup, launchd log directory, escalation links, and a sudoers placeholder.
+- Requirements docs (`docs/requirements.md`), expanded `doctor` (project,
+  platform, gh scopes, push permission, service manager, stale state), and
+  `doctor --json`.
+- No versioned releases: `package.json` is `0.0.0` and the changelog is
+  unreleased.
