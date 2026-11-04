@@ -1,6 +1,7 @@
-export type TaskKind = "delivery" | "review" | "aux" | "discovery" | "owner";
+export type TaskKind = "delivery" | "followup" | "review" | "aux" | "discovery" | "owner";
 export interface TaskPoolLimits {
     delivery: number;
+    followup: number;
     review: number;
     aux: number;
     discovery: number;

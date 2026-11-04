@@ -37,13 +37,26 @@ npm i -g @openai/codex
 npm i -g @google/gemini-cli
 ```
 
-If `auto-work` is not found after install, add the npm global bin (or the local
-shim directory) to `PATH`:
+The package’s `postinstall` creates `~/.local/bin/auto-work` when it is a global
+install. If scripts are disabled (`--ignore-scripts`), run:
 
 ```bash
+node "$(npm root -g)/ziki-auto-work/bin/auto-work.mjs" install
+```
+
+If `auto-work` is still not found, check that the shell is using the npm you
+expect and add the right bin directory:
+
+```bash
+command -v npm
+npm prefix -g
 export PATH="$(npm prefix -g)/bin:$PATH"
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+A pnpm-managed Node (`~/.local/share/pnpm/npm`) installs into the pnpm Node
+prefix, which is often not on `PATH`. Use the npm from your intended Node
+install, or add the shim directory.
 
 Optional service:
 
@@ -69,12 +82,9 @@ Optional launchd service: `auto-work install --service` writes
 explicit `PATH` (Homebrew + system dirs) so `gh`, `git` and provider CLIs are
 found.
 
-If `auto-work` is not found after install:
-
-```bash
-export PATH="$(npm prefix -g)/bin:$PATH"
-export PATH="$HOME/.local/bin:$PATH"
-```
+The package’s `postinstall` creates `~/.local/bin/auto-work` for global installs.
+If `auto-work` is still not found, check `command -v npm`, `npm prefix -g`, and
+add the relevant bin directory or `$HOME/.local/bin` to `PATH`.
 
 ## Windows (PowerShell)
 

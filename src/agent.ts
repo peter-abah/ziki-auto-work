@@ -235,6 +235,7 @@ export async function runWorker(options: {
   base: string;
   previousError?: string;
   issueContext?: string;
+  attempt?: number;
   logger?: Logger;
   onSpawn?: (pid: number) => void;
   onExit?: (pid: number) => void;
@@ -243,12 +244,12 @@ export async function runWorker(options: {
   const { resultPath, logPath } = resultPaths(profilePaths, "worker", issue.number);
   const template = await loadPrompt(profile, "worker");
   const workflowRules = formatWorkflowRules(profile, { branch });
-  const prTemplate = await loadPrTemplateText(profile);
+  const prTemplate = await loadPrTemplateText(profile, worktree);
   const resultInstruction =
     (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
       ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
       : `Write valid JSON to \`${resultPath}\`.`;
-  const prompt = render(template, {
+  const rendered = render(template, {
     projectName: projectName(profile),
     stack: profile.stack || profile.ziki.platform,
     repoUrl: profile.repo.githubRepo,
@@ -267,6 +268,7 @@ export async function runWorker(options: {
     issueStatus: issue.status,
     issueSubstatus: issue.substatus,
     issueContext: options.issueContext || "(none)",
+    attempt: options.attempt ?? 1,
     previousError: options.previousError || "(none)",
     memory: memoryText,
     checks: checksText(profile),
@@ -284,6 +286,16 @@ export async function runWorker(options: {
     resultPath,
     logPath
   });
+  const prompt = `${rendered}
+
+## Final PR body
+
+Write the complete Markdown PR body into the \`prBody\` field of the result JSON.
+Ignore any earlier wording that says the orchestrator fills the template.
+Follow the repository PR template above and fill it for this ticket. Include the
+ticket link, what changed, test evidence, screenshots (or N/A), risks and notes.
+Do not leave \`{{...}}\` placeholders. The orchestrator will use \`prBody\` as-is.
+`;
   return runAgent({ profile, profilePaths, role: "worker", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
@@ -294,6 +306,7 @@ export async function runDiscovery(options: {
   repoDir: string;
   parity: string;
   existingIssues: string;
+  existingIdeas?: string;
   maxIdeas: number;
   logger?: Logger;
   onSpawn?: (pid: number) => void;
@@ -310,6 +323,7 @@ export async function runDiscovery(options: {
     platform: profile.ziki.platform,
     parity,
     existingIssues,
+    existingIdeas: options.existingIdeas || "(none)",
     maxIdeas,
     memory: memoryText,
     checks: checksText(profile),
@@ -342,6 +356,8 @@ export async function runReview(options: {
   worktree: string;
   prUrl: string;
   headSha: string;
+  prContext?: string;
+  issueContext?: string;
   logger?: Logger;
   onSpawn?: (pid: number) => void;
   onExit?: (pid: number) => void;
@@ -366,6 +382,8 @@ export async function runReview(options: {
     worktree,
     prUrl,
     headSha,
+    prContext: options.prContext || "(not loaded)",
+    issueContext: options.issueContext || "(none)",
     resultPath,
     logPath,
     resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
@@ -373,6 +391,67 @@ export async function runReview(options: {
       : `Write valid JSON to \`${resultPath}\`.`
   });
   return runAgent({ profile, profilePaths, role: "review", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
+}
+
+export async function runFollowUp(options: {
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
+  issue: Issue;
+  memoryText: string;
+  worktree: string;
+  branch: string;
+  base: string;
+  prUrl: string;
+  prContext: string;
+  attempt: number;
+  maxAttempts: number;
+  previousError?: string;
+  logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
+}): Promise<AgentResult> {
+  const { profile, profilePaths, issue, memoryText, worktree, branch, base, prUrl, prContext, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "followup", issue.number);
+  const template = await loadPrompt(profile, "followup");
+  const prompt = render(template, {
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
+    base,
+    platform: profile.ziki.platform,
+    issueNumber: issue.number,
+    issueTitle: issue.title,
+    issueUrl: issueUrl(profile, issue),
+    issueDescription: issue.description || "",
+    memory: memoryText,
+    checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile, { branch }),
+    protectedFiles: formatProtectedFiles(profile),
+    worktree,
+    branch,
+    prUrl,
+    prContext,
+    attempt: options.attempt,
+    maxAttempts: options.maxAttempts,
+    previousError: options.previousError || "(none)",
+    resultPath,
+    logPath,
+    resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`
+  });
+  return runAgent({
+    profile,
+    profilePaths,
+    role: "followup",
+    prompt,
+    cwd: worktree,
+    resultPath,
+    logPath,
+    logger,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
+  });
 }
 
 export async function runConfirm(options: {

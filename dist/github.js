@@ -175,8 +175,8 @@ export class GitHub {
         }));
         return [...new Set([...tracked.stdout.split("\n"), ...untracked.stdout.split("\n")].filter(Boolean))];
     }
-    async diffStats(worktree) {
-        const out = await this.git(["diff", "--cached", "--numstat", `upstream/${this.profile.repo.base}`], { cwd: worktree });
+    async diffStats(worktree, ref = `upstream/${this.profile.repo.base}`) {
+        const out = await this.git(["diff", "--cached", "--numstat", ref], { cwd: worktree });
         let insertions = 0;
         let deletions = 0;
         let files = 0;
@@ -196,8 +196,8 @@ export class GitHub {
         }
         return { files, insertions, deletions, total: insertions + deletions };
     }
-    async stagedChangedFiles(worktree) {
-        const out = await this.git(["diff", "--cached", "--name-only", `upstream/${this.profile.repo.base}`], {
+    async stagedChangedFiles(worktree, ref = `upstream/${this.profile.repo.base}`) {
+        const out = await this.git(["diff", "--cached", "--name-only", ref], {
             cwd: worktree
         });
         return out.stdout.split("\n").filter(Boolean);
@@ -222,8 +222,9 @@ export class GitHub {
             throw new Error(result.stderr || result.stdout || "git commit failed");
         return { committed: true, sha: await this.headSha(worktree) };
     }
-    async pushBranch(worktree, branch) {
-        const result = await this.git(["push", "-u", "origin", branch], {
+    async pushBranch(worktree, branch, options = {}) {
+        const args = ["push", "-u", "origin", branch, ...(options.force ? ["--force-with-lease"] : [])];
+        const result = await this.git(args, {
             cwd: worktree,
             timeoutMs: 300_000,
             retry: true
@@ -278,23 +279,102 @@ export class GitHub {
             "view",
             url,
             "--json",
-            "number,url,state,mergedAt,mergeCommit,headRefOid,baseRefName,mergeable,isDraft,statusCheckRollup"
+            "number,url,state,mergedAt,mergeCommit,headRefOid,headRefName,baseRefName,mergeable,isDraft,statusCheckRollup,comments,reviews,reviewDecision"
         ], { retry: true });
         if (!result.ok)
             throw new Error(result.stderr || result.stdout || "gh pr view failed");
         const data = JSON.parse(result.stdout);
+        const comments = (Array.isArray(data.comments) ? data.comments : []).map((comment) => ({
+            id: String(comment.id ?? comment.url ?? ""),
+            author: String(comment.author?.login ?? comment.author?.name ?? "unknown"),
+            body: String(comment.body ?? ""),
+            url: typeof comment.url === "string" ? comment.url : undefined,
+            createdAt: typeof comment.createdAt === "string" ? comment.createdAt : undefined,
+            kind: "conversation"
+        }));
+        const reviews = (Array.isArray(data.reviews) ? data.reviews : []).map((review) => ({
+            author: String(review.author?.login ?? review.author?.name ?? "unknown"),
+            state: String(review.state ?? ""),
+            body: String(review.body ?? ""),
+            submittedAt: typeof review.submittedAt === "string" ? review.submittedAt : undefined
+        }));
+        const checkRuns = (Array.isArray(data.statusCheckRollup) ? data.statusCheckRollup : []).map((check) => ({
+            name: String(check.name ?? check.context ?? "check"),
+            status: String(check.status ?? check.state ?? ""),
+            conclusion: check.conclusion ? String(check.conclusion) : null,
+            url: typeof check.detailsUrl === "string" ? check.detailsUrl : typeof check.targetUrl === "string" ? check.targetUrl : undefined
+        }));
         return {
             number: data.number,
             url: data.url,
             state: data.state,
-            merged: data.state === "MERGED",
+            merged: data.state === "MERGED" || Boolean(data.mergedAt),
             mergedInto: data.baseRefName ?? null,
             mergeCommitSha: data.mergeCommit?.oid ?? null,
             headSha: data.headRefOid ?? null,
+            headRefName: data.headRefName ?? null,
+            baseRefName: data.baseRefName ?? null,
             checks: summarizeChecks(data.statusCheckRollup ?? []),
             mergeable: data.mergeable === "MERGEABLE" ? true : data.mergeable === "CONFLICTING" ? false : null,
+            reviewDecision: data.reviewDecision ?? null,
+            comments,
+            reviews,
+            checkRuns,
             isDraft: data.isDraft
         };
+    }
+    prNumber(url) {
+        const match = url.match(/\/pull\/(\d+)/);
+        return match ? Number(match[1]) : null;
+    }
+    async prReviewComments(url) {
+        const number = this.prNumber(url);
+        if (!number)
+            return [];
+        const result = await this.gh([
+            "api",
+            `repos/${this.profile.repo.githubRepo}/pulls/${number}/comments`,
+            "--paginate"
+        ], { timeoutMs: 120_000, retry: true });
+        if (!result.ok)
+            return [];
+        try {
+            const data = JSON.parse(result.stdout);
+            return data.map((comment) => ({
+                id: String(comment.id ?? ""),
+                author: String(comment.user?.login ?? "unknown"),
+                body: String(comment.body ?? ""),
+                path: typeof comment.path === "string" ? comment.path : undefined,
+                line: typeof comment.line === "number" ? comment.line : typeof comment.original_line === "number" ? comment.original_line : null,
+                url: typeof comment.html_url === "string" ? comment.html_url : undefined,
+                createdAt: typeof comment.created_at === "string" ? comment.created_at : undefined
+            }));
+        }
+        catch {
+            return [];
+        }
+    }
+    async failedCheckLogs(status, maxRuns = 3) {
+        const failed = status.checkRuns
+            .filter((check) => ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"].includes((check.conclusion ?? "").toUpperCase()))
+            .slice(0, maxRuns);
+        const logs = [];
+        for (const check of failed) {
+            const runId = check.url?.match(/\/actions\/runs\/(\d+)/)?.[1];
+            if (!runId)
+                continue;
+            const result = await this.gh(["run", "view", runId, "--repo", this.profile.repo.githubRepo, "--log-failed"], { timeoutMs: 120_000 }).catch(() => null);
+            if (!result?.ok || !result.stdout.trim())
+                continue;
+            const lines = result.stdout.split("\n");
+            logs.push({ name: check.name, log: lines.slice(-80).join("\n").slice(-8000) });
+        }
+        return logs;
+    }
+    async updatePrBody(url, body) {
+        const result = await this.gh(["pr", "edit", url, "--body", body], { timeoutMs: 120_000 });
+        if (!result.ok)
+            throw new Error(result.stderr || result.stdout || "gh pr edit failed");
     }
     async closePr(url, comment) {
         const args = ["pr", "close", url];

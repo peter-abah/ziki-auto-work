@@ -24,6 +24,7 @@
       "stopAt": null,
       "maxDeliveriesTotal": null,
       "maxConcurrentDeliveries": 2,
+      "maxConcurrentFollowUps": 1,
       "maxConcurrentReviews": 1,
       "maxConcurrentAux": 2,
       "maxConcurrentDiscovery": 1,
@@ -74,6 +75,7 @@
         "base": "staging",
         "githubRepo": "zeduchat/zedu-desktop",
         "forkOwner": "zedu-vulcan",
+        "pushMode": "team-fork",
         "defaultBranch": "main",
         "teamLead": "@abrahambishopcodes",
         "baselineFile": "lib/main.dart",
@@ -174,6 +176,13 @@
       "pr": {
         "templateFile": "prompts/zedu-desktop/pr.md",
         "teamLead": "@abrahambishopcodes"
+      },
+      "prTracking": {
+        "enabled": true,
+        "pollMinutes": 10,
+        "maxFollowUps": 10,
+        "fixFailingChecks": true,
+        "fixReviewComments": true
       },
       "discovery": {
         "enabled": true,

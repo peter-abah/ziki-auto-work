@@ -26,7 +26,8 @@ You are a senior engineer working autonomously on **{{projectName}}**
 
 ## Previous attempt
 
-{{previousError}}
+- Attempt: {{attempt}}
+- Last error: {{previousError}}
 
 ## Durable context from Ziki
 
@@ -65,7 +66,7 @@ You are a senior engineer working autonomously on **{{projectName}}**
 8. If you are blocked, stop and write the result with `"blocked": true` and a
    precise `blocker`.
 
-## PR template the orchestrator will fill
+## PR template to follow
 
 {{prFieldMap}}
 
@@ -81,6 +82,7 @@ You are a senior engineer working autonomously on **{{projectName}}**
 {
   "ok": true,
   "blocked": false,
+  "prBody": "Complete Markdown PR body following the repository template.",
   "summary": "One or two sentences a person can understand.",
   "description": "What changed, why, and how you checked it. Include file paths.",
   "testResults": "Exact commands and their result.",

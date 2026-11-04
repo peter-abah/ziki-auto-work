@@ -65,6 +65,8 @@ config, and finishes with a dry run. It does **not** start the loop.
 
    ```bash
    npm i -g github:peter-abah/ziki-auto-work --install-links
+   # The package creates a ~/.local/bin/auto-work shim when needed.
+   # If you use --ignore-scripts, run: node <package>/bin/auto-work.mjs install
    ```
 
    `--install-links` avoids an npm 10 global-Git-install bug where npm can
@@ -91,9 +93,11 @@ config, and finishes with a dry run. It does **not** start the loop.
    ```
 
    `init` validates every key, resolves the project and platform from Ziki,
-   searches GitHub for the repository, uses or creates your fork (with one
-   confirmation), detects the base branch, clones the repo, and detects the
-   stack. If the repo is ambiguous it asks once.
+   searches GitHub for the repository, detects the base branch, clones the
+   repo, and detects the stack. It asks for the push target rather than silently
+   choosing a personal fork. Use `--fork-owner <team>` + `--repo-url <team-fork>`
+   for a team fork, `--no-fork` for direct upstream pushes, or
+   `--personal-fork` to make a personal fork explicit.
 
 5. **Check and run**:
 
@@ -209,7 +213,11 @@ prompts/<profile>/worker.md  confirm.md  triage.md  review.md  discovery.md  own
 `auto-work init` copies the generic templates into your config directory and
 points the profile at them. Edit them freely. The engine passes project context
 (`{{projectName}}`, `{{stack}}`, `{{checks}}`, `{{issueUrl}}`, `{{worktree}}`,
-`{{memory}}`, …), so a prompt is data, not code.
+`{{memory}}`, `{{prContext}}`, …), so a prompt is data, not code.
+
+The worker writes the final PR body in `prBody`, following the target repo’s
+`.github/PULL_REQUEST_TEMPLATE.md` when present. The orchestrator validates it
+minimally and falls back to a generated body if it is missing or unsafe.
 
 ## Models
 
@@ -317,6 +325,22 @@ stops with `provider-limit`; rate limits back off and retry.
 - Project env comes from `.env`/`.env.local` copied into each worktree, plus
   `executor.env`. `doctor` validates `repo.requiredEnv`.
 
+## PR tracking and follow-up
+
+After delivery, auto-work can track its own PRs through
+`profile.prTracking`:
+
+- poll delivered PRs for state, checks, mergeability, reviews and comments;
+- read GitHub review comments and failed check logs;
+- run a bounded follow-up worker on the same branch for actionable feedback;
+- push to the same PR, update its body, and report status back to Ziki;
+- mark the task `done` when merged or `skipped` when closed;
+- escalate only when attempts are exhausted, a product decision is needed, or
+  access/policy blocks progress.
+
+It still does not merge. Ziki’s peer/manager gate and GitHub’s branch protection
+are separate and external.
+
 Full-auto flags (`--auto`, `--dangerously-skip-permissions`,
 `--dangerously-bypass-approvals-and-sandbox`, `--yolo`) grant broad tool access.
 Read [`docs/safety.md`](./docs/safety.md) before running unattended.
@@ -327,7 +351,8 @@ Read [`docs/safety.md`](./docs/safety.md) before running unattended.
 auto-work install [--keys-file <path>] [--service] [--profile <name>]
 auto-work                         # set up if needed, then run in the foreground
 auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes]
-               [--discover] [--fork] [--dry-run] [--env-file <path>]
+               [--discover] [--fork] [--fork-owner <owner>] [--repo-url <url>]
+               [--personal-fork] [--no-fork] [--dry-run] [--env-file <path>]
 auto-work keys import <file>
 auto-work keys check
 auto-work uninstall [--dry-run] [--keep-data] [--yes]
@@ -336,9 +361,9 @@ auto-work models [--provider <p>] [--profile <name>] [--json]
 auto-work providers [--check]
 auto-work profiles
 auto-work doctor [--profile <name>] [--json]
-auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
+auto-work start [--profile <name>] [--foreground] [--verbose] [--once] [--dry-run] [--all]
                 [--max-runtime 2h] [--max-cycles N] [--until ISO] [--max-deliveries N] [--forever]
-auto-work run [--profile <name>] [--once] [--dry-run]
+auto-work run [--profile <name>] [--verbose] [--once] [--dry-run]
 auto-work stop | pause | resume
 auto-work status [--all] [--verbose] [--line] [--watch]
 auto-work report [--profile <name>] [--all] [--since 24h] [--json]

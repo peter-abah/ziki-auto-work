@@ -30,6 +30,7 @@ export declare function runWorker(options: {
     base: string;
     previousError?: string;
     issueContext?: string;
+    attempt?: number;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;
@@ -41,6 +42,7 @@ export declare function runDiscovery(options: {
     repoDir: string;
     parity: string;
     existingIssues: string;
+    existingIdeas?: string;
     maxIdeas: number;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
@@ -54,6 +56,25 @@ export declare function runReview(options: {
     worktree: string;
     prUrl: string;
     headSha: string;
+    prContext?: string;
+    issueContext?: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runFollowUp(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    worktree: string;
+    branch: string;
+    base: string;
+    prUrl: string;
+    prContext: string;
+    attempt: number;
+    maxAttempts: number;
+    previousError?: string;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;

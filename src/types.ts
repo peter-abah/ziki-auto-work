@@ -1,5 +1,5 @@
 export type ProviderName = string;
-export type Role = "worker" | "review" | "triage" | "confirm" | "discovery" | "owner";
+export type Role = "worker" | "review" | "followup" | "triage" | "confirm" | "discovery" | "owner";
 export type EscalationType =
   | "question"
   | "work_authorization"
@@ -21,12 +21,15 @@ export interface ZikiConfig {
   projectName?: string;
 }
 
+export type PushMode = "personal-fork" | "team-fork" | "upstream";
+
 export interface RepoConfig {
   url: string;
   upstream: string;
   base: string;
   githubRepo: string;
   forkOwner: string;
+  pushMode?: PushMode;
   defaultBranch: string;
   teamLead?: string;
   protectedFiles?: string[];
@@ -112,6 +115,14 @@ export interface PrConfig {
   teamLead?: string;
 }
 
+export interface PrTrackingConfig {
+  enabled: boolean;
+  pollMinutes: number;
+  maxFollowUps: number;
+  fixFailingChecks: boolean;
+  fixReviewComments: boolean;
+}
+
 export interface DiscoveryConfig {
   enabled: boolean;
   parityFile?: string;
@@ -139,6 +150,7 @@ export interface LimitsConfig {
   /** Stop after this many deliveries in the current run; null means no limit. */
   maxDeliveriesTotal?: number | null;
   maxConcurrentDeliveries?: number;
+  maxConcurrentFollowUps?: number;
   maxConcurrentReviews?: number;
   maxConcurrentAux?: number;
   maxConcurrentDiscovery?: number;
@@ -244,6 +256,7 @@ export interface ProfileConfig {
   platformMatch: PlatformMatchConfig;
   prompts: PromptsConfig;
   pr: PrConfig;
+  prTracking?: PrTrackingConfig;
   providers?: Record<string, ProviderSpec>;
   discovery: DiscoveryConfig;
   workflow: WorkflowConfig;
@@ -516,6 +529,17 @@ export interface TaskState {
   deliveredAt?: string;
   lastHeartbeatAt?: string;
   lastError?: string | null;
+  prNumber?: number;
+  prState?: string;
+  prChecks?: "passing" | "failing" | "pending" | "none";
+  prMergeable?: boolean | null;
+  prReviewDecision?: string | null;
+  prLastCheckedAt?: string;
+  prLastHandledHeadSha?: string | null;
+  prLastHandledCommentAt?: string | null;
+  prLastHandledReviewDecision?: string | null;
+  followUpAttempts?: number;
+  lastFollowUpAt?: string | null;
   tokens?: TokenUsage;
   escalationId?: string | null;
   escalationAnswer?: string | null;
@@ -595,6 +619,7 @@ export interface AgentResult {
   blocked?: boolean;
   summary?: string;
   description?: string;
+  prBody?: string;
   testResults?: string;
   testedAgainst?: string;
   howToTest?: string[];

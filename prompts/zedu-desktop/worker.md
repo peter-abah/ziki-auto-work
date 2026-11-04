@@ -26,7 +26,8 @@ You are a senior Flutter engineer working autonomously on **Zedu Desktop**
 
 ## Previous attempt
 
-{{previousError}}
+- Attempt: {{attempt}}
+- Last error: {{previousError}}
 
 ## Durable context from Ziki
 
@@ -73,7 +74,7 @@ Do not hardcode a local Flutter path.
 8. If you are blocked, stop and write the result with `"blocked": true` and a
    precise `blocker`.
 
-## PR template the orchestrator will fill
+## PR template to follow
 
 {{prFieldMap}}
 
@@ -89,6 +90,7 @@ Do not hardcode a local Flutter path.
 {
   "ok": true,
   "blocked": false,
+  "prBody": "Complete Markdown PR body following the repository template.",
   "summary": "One or two sentences a person can understand.",
   "description": "What changed, why, and how you checked it. Include file paths.",
   "testResults": "Exact commands and their result.",

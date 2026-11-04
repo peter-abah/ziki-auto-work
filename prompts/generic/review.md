@@ -11,12 +11,20 @@
 
 {{issueDescription}}
 
+### Issue history
+
+{{issueContext}}
+
 ## The delivery
 
 - Pull request: {{prUrl}}
 - Delivered head: {{headSha}}
 - Worktree at the PR head: `{{worktree}}`
 - Repo: `{{repoUrl}}`
+
+## PR state and feedback
+
+{{prContext}}
 
 ## Repository rules
 
