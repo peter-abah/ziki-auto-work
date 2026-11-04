@@ -5,6 +5,28 @@ export function resolveNotifyMode(profile) {
         return mode;
     return "auto";
 }
+function psQuote(value) {
+    return `'${String(value).replace(/'/g, "''")}'`;
+}
+function windowsToastScript(title, body) {
+    return [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        `$title = ${psQuote(title)}`,
+        `$body = ${psQuote(body)}`,
+        "if (Get-Command New-BurntToastNotification -ErrorAction SilentlyContinue) {",
+        "  New-BurntToastNotification -Text $title, $body",
+        "  exit 0",
+        "}",
+        "Add-Type -AssemblyName System.Windows.Forms",
+        "Add-Type -AssemblyName System.Drawing",
+        "$n = New-Object System.Windows.Forms.NotifyIcon",
+        "$n.Icon = [System.Drawing.SystemIcons]::Information",
+        "$n.Visible = $true",
+        "$n.ShowBalloonTip(10000, $title, $body, [System.Windows.Forms.ToolTipIcon]::Info)",
+        "Start-Sleep -Milliseconds 1200",
+        "$n.Dispose()"
+    ].join("\n");
+}
 export function desktopNotifier(platform = process.platform) {
     if (platform === "linux") {
         return { command: "notify-send", args: (title, body) => ["-a", "auto-work", title, body] };
@@ -13,6 +35,12 @@ export function desktopNotifier(platform = process.platform) {
         return {
             command: "osascript",
             args: (title, body) => ["-e", `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`]
+        };
+    }
+    if (platform === "win32") {
+        return {
+            command: "powershell",
+            args: (title, body) => ["-NoProfile", "-NonInteractive", "-Command", windowsToastScript(title, body)]
         };
     }
     return null;

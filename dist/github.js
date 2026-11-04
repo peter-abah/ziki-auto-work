@@ -88,6 +88,9 @@ export class GitHub {
         const baseCheck = await this.git(["rev-parse", "--verify", `upstream/${base}`]);
         if (!baseCheck.ok)
             throw new Error(`Base branch upstream/${base} not found. Check ${upstream}.`);
+        if (process.platform === "win32") {
+            await this.git(["config", "core.longpaths", "true"]).catch(() => { });
+        }
         const envFile = path.join(this.repoDir, ".env");
         const envExample = path.join(this.repoDir, ".env.example");
         if (!existsSync(envFile) && existsSync(envExample)) {

@@ -171,13 +171,27 @@ function printKeyInstructions() {
     console.log("");
     console.log(`Keys are stored in ${p.envFile} (mode 600), never in config or git.`);
 }
+function pathOnPath(dir) {
+    const wanted = process.platform === "win32" ? dir.toLowerCase() : dir;
+    return (process.env.PATH || "")
+        .split(path.delimiter)
+        .filter(Boolean)
+        .some((entry) => (process.platform === "win32" ? entry.toLowerCase() : entry) === wanted);
+}
+function pathHint(dir) {
+    return process.platform === "win32"
+        ? `Add it to your user PATH and open a new terminal: ${dir}`
+        : `Add it to PATH, e.g. export PATH="${dir}:$PATH"`;
+}
 async function installBinShim() {
     const p = paths();
     const target = path.join(p.packageRoot, "bin/auto-work.mjs");
     if (process.platform === "win32") {
-        await mkdir(path.dirname(p.bin), { recursive: true });
-        await writeFile(p.bin, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`, "utf8");
-        return p.bin;
+        const npmDir = process.env.APPDATA ? path.join(process.env.APPDATA, "npm") : null;
+        const bin = npmDir && existsSync(npmDir) ? path.join(npmDir, "auto-work.cmd") : p.bin;
+        await mkdir(path.dirname(bin), { recursive: true });
+        await writeFile(bin, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`, "utf8");
+        return bin;
     }
     await mkdir(path.dirname(p.bin), { recursive: true });
     await unlink(p.bin).catch(() => { });
@@ -199,6 +213,10 @@ async function install(flags) {
         console.log(`Imported ${count} ZIKI key(s) into ${p.envFile}`);
     }
     const bin = await installBinShim();
+    const binDir = path.dirname(bin);
+    if (!pathOnPath(binDir)) {
+        console.log(`warning: ${binDir} is not on PATH. ${pathHint(binDir)}`);
+    }
     const profileName = await resolveProfileName(flags);
     if ((flags.service || flags.systemd) && profileName) {
         const result = await installService(profileName);

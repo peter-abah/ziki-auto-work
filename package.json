@@ -19,7 +19,9 @@
     "AGENTS.md",
     "SECURITY.md",
     "CONTRIBUTING.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "install.ps1",
+    "install.sh"
   ],
   "engines": {
     "node": ">=20"
@@ -27,10 +29,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/config.test.js dist/scheduler.test.js dist/state.test.js dist/rules.test.js dist/env.test.js dist/discover.test.js dist/notify.test.js dist/run-report.test.js",
+    "test": "node --test dist/config.test.js dist/scheduler.test.js dist/state.test.js dist/rules.test.js dist/env.test.js dist/discover.test.js dist/notify.test.js dist/run-report.test.js dist/service.test.js",
     "prepublishOnly": "npm run check && npm test",
     "prepack": "npm run build",
-    "pretest": "npm run build",
+    "pretest": "node bin/pretest.mjs",
     "verify": "npm run build && git diff --exit-code -- dist"
   },
   "dependencies": {

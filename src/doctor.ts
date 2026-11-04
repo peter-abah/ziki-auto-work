@@ -11,6 +11,15 @@ import { isAlive as isAlivePid, readPid } from "./state.js";
 import { expandHome, paths } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
 
+function pathHas(dir: string | null | undefined, pathValue = process.env.PATH || ""): boolean {
+  if (!dir) return false;
+  const wanted = process.platform === "win32" ? dir.toLowerCase() : dir;
+  return pathValue
+    .split(path.delimiter)
+    .filter(Boolean)
+    .some((entry) => (process.platform === "win32" ? entry.toLowerCase() : entry) === wanted);
+}
+
 export interface DoctorCheck {
   name: string;
   ok: boolean;
@@ -29,6 +38,28 @@ export async function runDoctor(options: { profileName?: string } = {}): Promise
 
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   add("node", nodeMajor >= 20, `v${process.versions.node}`);
+
+  const cmdCheck =
+    process.platform === "win32"
+      ? await runCommand("where", ["auto-work"], { timeoutMs: 10_000 })
+      : await runCommand("/bin/sh", ["-c", "command -v auto-work"], { timeoutMs: 10_000 });
+  add("auto-work on PATH", cmdCheck.ok, cmdCheck.ok ? cmdCheck.stdout.trim() : "not on PATH", false);
+
+  const prefix = await runCommand("npm", ["prefix", "-g"], { timeoutMs: 20_000 });
+  const globalBin = prefix.ok ? (process.platform === "win32" ? prefix.stdout.trim() : path.join(prefix.stdout.trim(), "bin")) : null;
+  add(
+    "npm global bin",
+    pathHas(globalBin),
+    globalBin ? `${globalBin}${pathHas(globalBin) ? " (on PATH)" : " (not on PATH)"}` : "could not read npm prefix",
+    false
+  );
+  const shimDir = path.dirname(paths().bin);
+  add(
+    "auto-work shim",
+    pathHas(shimDir),
+    `${shimDir}${pathHas(shimDir) ? " (on PATH)" : " (not on PATH)"}`,
+    false
+  );
 
   let config;
   try {
@@ -169,6 +200,13 @@ export async function runDoctor(options: { profileName?: string } = {}): Promise
     add("repo clone", true, repoDir);
     const base = await github.git(["rev-parse", "--verify", `upstream/${profile.repo.base}`]);
     add(`base upstream/${profile.repo.base}`, base.ok, base.stdout.slice(0, 12) || base.stderr);
+    if (process.platform === "win32") {
+      const longpaths = await github.git(["config", "--get", "core.longpaths"]);
+      add("git longpaths", longpaths.stdout.trim() === "true", longpaths.stdout.trim() || "not set", false);
+      if (jp.worktreesDir.length > 200) {
+        add("worktree path", false, `${jp.worktreesDir.length} chars (Windows MAX_PATH risk)`, false);
+      }
+    }
   } catch (error) {
     add("repo", false, error instanceof Error ? error.message : String(error));
   }

@@ -61,6 +61,10 @@
 - Branch policy: `dev` is the development/push branch; `main` is release-only
   and the repository default. Do not commit to `main`; promote tested work with
   a `dev` → `main` squash PR.
+- Audit fixes: host-aware `gh` git protocol, packaged `install.ps1`/`install.sh`,
+  PATH diagnostics, macOS launchd `PATH`, Windows toast notifications,
+  `taskkill /T /F` process-tree shutdown, Windows `core.longpaths`, and a
+  `pretest` that skips the build in an installed package.
 - Packaging: `dist/` is committed and `prepare` is removed, so
   `npm i -g github:peter-abah/ziki-auto-work --install-links` no longer needs devDependencies.
   `prepack` still builds for publishing, and CI checks that `dist/` is current.

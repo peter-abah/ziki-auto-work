@@ -36,7 +36,7 @@ function profile(overrides = {}) {
 test("desktopNotifier selects per platform", () => {
     assert.equal(desktopNotifier("linux")?.command, "notify-send");
     assert.equal(desktopNotifier("darwin")?.command, "osascript");
-    assert.equal(desktopNotifier("win32"), null);
+    assert.equal(desktopNotifier("win32")?.command, "powershell");
 });
 test("resolveNotifyMode defaults to auto", () => {
     assert.equal(resolveNotifyMode(profile()), "auto");

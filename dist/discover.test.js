@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { detectedStackAt, inferPlatform, parseRepoRef, pickCloneUrl, rankCandidates, repoName } from "./discover.js";
+import { detectedStackAt, gitProtocol, inferPlatform, parseRepoRef, pickCloneUrl, rankCandidates, repoName } from "./discover.js";
 test("parseRepoRef accepts owner/name, HTTPS and SSH", () => {
     assert.deepEqual(parseRepoRef("owner/name"), { owner: "owner", name: "name" });
     assert.deepEqual(parseRepoRef("https://github.com/owner/name.git"), { owner: "owner", name: "name" });
@@ -49,5 +49,24 @@ test("detectedStackAt detects common project files", async () => {
     finally {
         await rm(dir, { recursive: true, force: true });
     }
+});
+test("gitProtocol reads the github.com host setting before the global value", async () => {
+    const calls = [];
+    const runner = async (_cmd, args) => {
+        calls.push(args);
+        if (args.includes("-h"))
+            return { ok: true, code: 0, stdout: "ssh\n", stderr: "", command: "" };
+        return { ok: true, code: 0, stdout: "https\n", stderr: "", command: "" };
+    };
+    assert.equal(await gitProtocol("gh", runner), "ssh");
+    assert.ok(calls[0].includes("github.com"));
+});
+test("gitProtocol falls back to the global value", async () => {
+    const runner = async (_cmd, args) => {
+        if (args.includes("-h"))
+            return { ok: false, code: 1, stdout: "", stderr: "no host", command: "" };
+        return { ok: true, code: 0, stdout: "ssh\n", stderr: "", command: "" };
+    };
+    assert.equal(await gitProtocol("gh", runner), "ssh");
 });
 //# sourceMappingURL=discover.test.js.map

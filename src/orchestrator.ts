@@ -54,9 +54,9 @@ import {
   runTriage,
   runOwner,
   killActiveAgents,
-  activeAgentPids,
-  killProcessTree
+  activeAgentPids
 } from "./agent.js";
+import { killProcessTree } from "./platform/process.js";
 import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memory.js";
 import type { MemoryContext } from "./memory.js";
 import { escalate, poll, writeNeedsHuman } from "./hitl.js";

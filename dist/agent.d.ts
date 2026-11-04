@@ -1,6 +1,5 @@
 import type { AgentResult, Idea, Issue, ProfileConfig, ProfilePaths, Role } from "./types.js";
 import type { Logger } from "./log.js";
-export declare function killProcessTree(pid: number | null | undefined): void;
 export declare function killActiveAgents(): void;
 export declare function activeAgentPids(): number[];
 export declare function render(template: string, vars: Record<string, unknown>): string;

@@ -3,12 +3,26 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { profilePaths, paths, safeName } from "./platform/paths.js";
 import { runCommand, spawnDetached } from "./platform/spawn.js";
-import { clearPid, isPaused, isStopped, readPid, setPaused, setStopped } from "./state.js";
+import { killProcessTree } from "./platform/process.js";
+import { clearPid, isAlive, isPaused, isStopped, readPid, setPaused, setStopped } from "./state.js";
 function binPath() {
     return path.join(paths().packageRoot, "bin/auto-work.mjs");
 }
 function unitName(profileName) {
     return `auto-work-${safeName(profileName)}`;
+}
+function xmlEscape(value) {
+    return value
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+}
+function servicePath() {
+    const standard = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+    const current = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+    return [...new Set([...current, ...standard])].join(path.delimiter);
 }
 export function systemdUnitText(profileName) {
     return `[Unit]
@@ -46,6 +60,12 @@ export function launchdPlistText(profileName) {
     <string>${profileName}</string>
   </array>
   <key>WorkingDirectory</key><string>${paths().home}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${xmlEscape(servicePath())}</string>
+    <key>HOME</key><string>${xmlEscape(paths().home)}</string>
+    ${process.env.LANG ? `<key>LANG</key><string>${xmlEscape(process.env.LANG)}</string>` : ""}
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${path.join(jp.logsDir, "service.log")}</string>
   <key>StandardErrorPath</key><string>${path.join(jp.logsDir, "service.error.log")}</string>
@@ -142,26 +162,11 @@ export async function stopService(profileName) {
     }
     const pid = await readPid(jp);
     if (pid) {
-        try {
-            process.kill(pid, "SIGTERM");
-        }
-        catch {
-            // already gone
-        }
+        killProcessTree(pid);
         for (let index = 0; index < 20; index += 1) {
             await new Promise((resolve) => setTimeout(resolve, 250));
-            try {
-                process.kill(pid, 0);
-            }
-            catch {
+            if (!isAlive(pid))
                 break;
-            }
-        }
-        try {
-            process.kill(pid, "SIGKILL");
-        }
-        catch {
-            // already gone
         }
     }
     await clearPid(jp);
