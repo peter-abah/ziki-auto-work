@@ -41,10 +41,15 @@ auto-work detect --json
 
 `--install-links` avoids an npm 10 global-Git-install bug. If it is ignored,
 install the archive instead:
-`npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/dev.tar.gz`.
+`npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/main.tar.gz`.
 
 If the user prefers a one-off, replace `auto-work` with
 `npx github:peter-abah/ziki-auto-work`.
+
+This installs the stable `main` release. For development builds, use
+`github:peter-abah/ziki-auto-work#dev` or
+`npx github:peter-abah/ziki-auto-work#dev`. Do not install `#dev` for a normal
+user unless they explicitly want to test unreleased work.
 
 This reports the OS, Node version, stack files, installed coding CLIs, the
 config path and the active profile.

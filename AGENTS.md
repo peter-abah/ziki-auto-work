@@ -27,3 +27,6 @@ Hard rules:
   access. Explain that before choosing them.
 - Never publish, push, or create GitHub resources for the user unless they
   explicitly ask for that action.
+- **Branches:** commit and push only to `dev`. Never push or merge to `main`;
+  `main` is release-only and is updated by a tested squash-merged PR from
+  `dev`.

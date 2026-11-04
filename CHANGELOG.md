@@ -58,6 +58,9 @@
   when a loop is already running.
 - Clean and abrupt run summaries: `LAST-RUN.json`, `LAST-RUN.md`, and
   `auto-work report` defaulting to the last run.
+- Branch policy: `dev` is the development/push branch; `main` is release-only
+  and the repository default. Do not commit to `main`; promote tested work with
+  a `dev` → `main` squash PR.
 - Packaging: `dist/` is committed and `prepare` is removed, so
   `npm i -g github:peter-abah/ziki-auto-work --install-links` no longer needs devDependencies.
   `prepack` still builds for publishing, and CI checks that `dist/` is current.
