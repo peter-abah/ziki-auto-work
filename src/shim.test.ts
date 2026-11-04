@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { chooseShimPath, installShim } from "./shim.js";
 
-test("chooseShimPath prefers an existing PATH directory", async () => {
+test("chooseShimPath prefers an existing PATH directory", { skip: process.platform === "win32" }, async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "auto-work-shim-"));
   try {
     const local = path.join(home, ".local/bin");
