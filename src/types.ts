@@ -31,6 +31,16 @@ export interface RepoConfig {
   teamLead?: string;
   protectedFiles?: string[];
   baselineFile?: string;
+  envFiles?: string[];
+  requiredEnv?: string[];
+}
+
+export interface WorkflowConfig {
+  maxFiles: number;
+  maxLines: number;
+  branchPrefix: string;
+  commitTypes: string[];
+  requireTests: boolean;
 }
 
 export interface AgentsConfig {
@@ -90,15 +100,82 @@ export interface LimitsConfig {
   maxAttemptsPerTask: number;
   maxCyclesBeforeDiscovery: number;
   maxOpenEscalations: number;
+  /** Default run limit in minutes; null means no time limit. */
+  maxRuntimeMinutes?: number | null;
+  /** Stop after this many cycles; null means no cycle limit. */
+  maxCycles?: number | null;
+  /** Stop at this ISO timestamp; null means no deadline. */
+  stopAt?: string | null;
+  /** Stop after this many deliveries in the current run; null means no limit. */
+  maxDeliveriesTotal?: number | null;
+  maxConcurrentDeliveries?: number;
+  maxConcurrentReviews?: number;
+  maxConcurrentAux?: number;
+  maxConcurrentDiscovery?: number;
+  maxConcurrentAgents?: number;
 }
+
+export interface RunLimitConfig {
+  maxRuntimeMinutes: number | null;
+  maxCycles: number | null;
+  stopAt: string | null;
+  maxDeliveriesTotal: number | null;
+}
+
+export type StopReason = "max-runtime" | "max-cycles" | "until" | "max-deliveries" | "stop" | "error" | null;
+
+export interface RunState {
+  startedAt: string | null;
+  limits: RunLimitConfig | null;
+  stopReason: StopReason;
+  deliveries: number;
+  reviews: number;
+  mergeReviews: number;
+  discoveries: number;
+  aux: number;
+  failures: number;
+}
+
+export interface RunSummary {
+  profile: string;
+  startedAt: string;
+  endedAt: string | null;
+  clean: boolean;
+  stopReason: StopReason | "killed";
+  cycles: number;
+  deliveries: number;
+  reviews: number;
+  mergeReviews: number;
+  discoveries: number;
+  aux: number;
+  failures: number;
+  interrupted: number;
+  needsYou: number;
+  needsYouLink: string | null;
+  issues: Array<{ number: number | string; title?: string | null; status: string; pr?: string | null }>;
+  lastActivityAt: string | null;
+}
+
+export interface LastCycleSummary {
+  at: string;
+  ms: number;
+  queue: Record<string, number> | null;
+  deliveries: number;
+  reviews: number;
+  aux: number;
+  errors: number;
+}
+
+export type NotifyMode = "auto" | "desktop" | "command" | "off";
 
 export interface HitlConfig {
   enabled: boolean;
   defaultType: EscalationType;
+  notify?: NotifyMode;
   notifyCommand?: string | null;
 }
 
-export interface JobConfig {
+export interface ProfileConfig {
   ziki: ZikiConfig;
   stack?: string;
   repo: RepoConfig;
@@ -110,17 +187,23 @@ export interface JobConfig {
   prompts: PromptsConfig;
   pr: PrConfig;
   discovery: DiscoveryConfig;
+  workflow: WorkflowConfig;
   limits: LimitsConfig;
   pollSeconds: number;
   memoryRefreshMinutes: number;
   hitl: HitlConfig;
 }
 
+export interface DoctorConfig {
+  minFreeGb?: number;
+}
+
 export interface Config {
-  version: 2;
-  activeJob: string;
-  defaults?: Partial<JobConfig>;
-  jobs: Record<string, JobConfig>;
+  version: 3;
+  activeProfile: string;
+  defaults?: Partial<ProfileConfig>;
+  profiles: Record<string, ProfileConfig>;
+  doctor?: DoctorConfig;
 }
 
 export interface Paths {
@@ -132,7 +215,9 @@ export interface Paths {
   stateDir: string;
   cacheDir: string;
   bin: string;
-  jobsDir: string;
+  profilesDir: string;
+  legacyShareDir: string;
+  legacyStateDir: string;
   packageRoot: string;
   promptsDir: string;
   configSamplesDir: string;
@@ -142,7 +227,7 @@ export interface Paths {
   launchdPlist: string;
 }
 
-export interface JobPaths {
+export interface ProfilePaths {
   stateDir: string;
   stateFile: string;
   statusFile: string;
@@ -158,6 +243,10 @@ export interface JobPaths {
   ownerRequestsFile: string;
   memoryFile: string;
   desktopCacheFile: string;
+  runLimitsFile: string;
+  historyFile: string;
+  lastRunFile: string;
+  lastRunMdFile: string;
 }
 
 export interface AgentKey {
@@ -165,12 +254,12 @@ export interface AgentKey {
   key: string;
 }
 
-export interface LoadedJob {
+export interface LoadedProfile {
   config: Config;
-  jobName: string;
-  job: JobConfig;
+  profileName: string;
+  profile: ProfileConfig;
   paths: Paths;
-  jobPaths: JobPaths;
+  profilePaths: ProfilePaths;
   env: Record<string, string>;
   keys: { workers: AgentKey[]; managers: AgentKey[] };
   getKey: (name: string) => string | null;
@@ -399,7 +488,7 @@ export interface Counters {
 
 export interface State {
   version: 1;
-  job: string | null;
+  profile: string | null;
   startedAt: string | null;
   stoppedAt: string | null;
   lastCycleAt: string | null;
@@ -416,6 +505,31 @@ export interface State {
   baselineSha: string | null;
   baselineAt: string | null;
   lastError: unknown;
+  run: RunState;
+  lastCycle: LastCycleSummary | null;
+  lastRun: RunSummary | null;
+  activePids: number[];
+}
+
+export interface HistoryEntry {
+  at: string;
+  type:
+    | "claim"
+    | "bid"
+    | "award"
+    | "accept"
+    | "delivery"
+    | "review"
+    | "merge_review"
+    | "discovery"
+    | "aux"
+    | "escalation"
+    | "failure"
+    | "stop";
+  issue?: number | string | null;
+  idea?: number | string | null;
+  detail?: string;
+  data?: Record<string, unknown>;
 }
 
 export interface AgentResult {
@@ -483,8 +597,8 @@ export interface ProviderAdapter {
     resultPath: string;
     model: string | null;
   }): ProviderCommand;
-  doctor(job: JobConfig): Promise<{ ok: boolean; detail: string }>;
-  models(job: JobConfig): Promise<{ items: string[]; note?: string }>;
+  doctor(profile: ProfileConfig): Promise<{ ok: boolean; detail: string }>;
+  models(profile: ProfileConfig): Promise<{ items: string[]; note?: string }>;
 }
 
 export interface QueueEntry {

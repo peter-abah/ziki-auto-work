@@ -1,3 +1,6 @@
+> Example parity map for the Zedu Desktop profile — not part of the engine.
+> The engine only reads the file path from `discovery.parityFile`.
+
 # Zedu Desktop — parity map
 
 > Living reference for the auto-work loop. Web = `zeduchat/zedu-fe` (Next.js

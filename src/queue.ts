@@ -1,4 +1,4 @@
-import type { JobConfig, Queue, QueueEntry, State, WorkFeed, WorkItem } from "./types.js";
+import type { ProfileConfig, Queue, QueueEntry, State, WorkFeed, WorkItem } from "./types.js";
 
 const PRIORITY: Record<string, number> = {
   owner_request: 1,
@@ -39,35 +39,35 @@ const AUX_KINDS = new Set([
 const REVIEW_KINDS = new Set(["test_fix", "accept_fix"]);
 const WORK_KINDS = new Set(["ready_issue", "active_claim", "offer"]);
 
-export function textMatchesPlatform(job: JobConfig, text: string): boolean {
-  if (job.platformMatch.regex) {
+export function textMatchesPlatform(profile: ProfileConfig, text: string): boolean {
+  if (profile.platformMatch.regex) {
     try {
-      return new RegExp(job.platformMatch.regex, "i").test(text);
+      return new RegExp(profile.platformMatch.regex, "i").test(text);
     } catch {
       return false;
     }
   }
-  const keywords = job.platformMatch.keywords ?? [];
+  const keywords = profile.platformMatch.keywords ?? [];
   if (!keywords.length) return false;
   const lower = text.toLowerCase();
   return keywords.some((keyword) => lower.includes(keyword.toLowerCase()));
 }
 
-export function matchesPlatform(job: JobConfig, item: WorkItem): boolean {
+export function matchesPlatform(profile: ProfileConfig, item: WorkItem): boolean {
   const text = `${item.title ?? ""} ${item.detail ?? ""} ${item.issue?.title ?? ""} ${item.idea?.title ?? ""}`;
-  return textMatchesPlatform(job, text);
+  return textMatchesPlatform(profile, text);
 }
 
 export function buildQueue(options: {
   feed: WorkFeed;
-  job: JobConfig;
+  profile: ProfileConfig;
   platformNumbers?: Set<number>;
   platformIdeaNumbers?: Set<number>;
   state?: State | null;
   now?: number;
   recentMs?: number;
 }): Queue {
-  const { feed, job } = options;
+  const { feed, profile } = options;
   const platformNumbers = options.platformNumbers ?? new Set<number>();
   const platformIdeaNumbers = options.platformIdeaNumbers ?? new Set<number>();
   const now = options.now ?? Date.now();
@@ -98,11 +98,11 @@ export function buildQueue(options: {
     if (kind === "owner_request" || kind === "categorize") {
       isPlatform = true;
     } else if (issueNumber !== null) {
-      isPlatform = platformNumbers.has(issueNumber) || matchesPlatform(job, item);
+      isPlatform = platformNumbers.has(issueNumber) || matchesPlatform(profile, item);
     } else if (ideaNumber !== null) {
-      isPlatform = platformIdeaNumbers.has(ideaNumber) || matchesPlatform(job, item);
+      isPlatform = platformIdeaNumbers.has(ideaNumber) || matchesPlatform(profile, item);
     } else {
-      isPlatform = matchesPlatform(job, item);
+      isPlatform = matchesPlatform(profile, item);
     }
     if (!isPlatform) continue;
 

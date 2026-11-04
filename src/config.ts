@@ -1,18 +1,20 @@
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
 import type {
   AgentKey,
   CheckSpec,
   Config,
-  JobConfig,
-  JobPaths,
+  ProfileConfig,
+  ProfilePaths,
   LimitsConfig,
-  LoadedJob,
+  LoadedProfile,
   ProviderName,
-  Role
+  Role,
+  RunLimitConfig,
+  WorkflowConfig
 } from "./types.js";
-import { PACKAGE_ROOT, expandHome, jobPaths, paths } from "./platform/paths.js";
+import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
 
 export const PROVIDERS: ProviderName[] = ["opencode", "claude", "codex", "gemini", "custom"];
 
@@ -24,13 +26,39 @@ export const DEFAULT_LIMITS: LimitsConfig = {
   maxActiveClaims: 2,
   maxAttemptsPerTask: 3,
   maxCyclesBeforeDiscovery: 6,
-  maxOpenEscalations: 5
+  maxOpenEscalations: 5,
+  maxRuntimeMinutes: 120,
+  maxCycles: null,
+  stopAt: null,
+  maxDeliveriesTotal: null,
+  maxConcurrentDeliveries: 2,
+  maxConcurrentReviews: 1,
+  maxConcurrentAux: 2,
+  maxConcurrentDiscovery: 1,
+  maxConcurrentAgents: 4
 };
+
+export const DEFAULT_RUN_LIMITS = {
+  maxRuntimeMinutes: 120,
+  maxCycles: null,
+  stopAt: null,
+  maxDeliveriesTotal: null
+};
+
+export const DEFAULT_WORKFLOW: WorkflowConfig = {
+  maxFiles: 5,
+  maxLines: 400,
+  branchPrefix: "fix",
+  commitTypes: ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
+  requireTests: true
+};
+
+export const DEFAULT_ENV_FILES = [".env", ".env.local"];
 
 export function defaultConfig(): Config {
   return {
-    version: 2,
-    activeJob: "",
+    version: 3,
+    activeProfile: "",
     defaults: {
       executor: {
         provider: "opencode",
@@ -39,16 +67,18 @@ export function defaultConfig(): Config {
         permissionMode: "auto"
       },
       limits: { ...DEFAULT_LIMITS },
+      workflow: { ...DEFAULT_WORKFLOW },
       pollSeconds: 120,
       memoryRefreshMinutes: 30,
-      hitl: { enabled: true, defaultType: "question", notifyCommand: null },
+      hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null },
       platformMatch: {},
       discovery: { enabled: false, maxIdeasPerRun: 3 },
       checks: [],
       prompts: { dir: "prompts/generic" },
       pr: { templateFile: "prompts/generic/pr.md" }
     },
-    jobs: {}
+    profiles: {},
+    doctor: { minFreeGb: 3 }
   };
 }
 
@@ -114,12 +144,12 @@ export async function loadConfig(): Promise<Config> {
     return config;
   }
   const raw = JSON.parse(await readFile(p.configFile, "utf8")) as Record<string, unknown>;
-  if (Number(raw.version) === 1) {
-    const migrated = migrateConfig(raw);
-    await mkdir(p.configDir, { recursive: true });
-    await copyFile(p.configFile, `${p.configFile}.v1.bak`).catch(() => {});
-    await saveConfig(migrated);
-    return migrated;
+  const version = Number(raw.version);
+  if (version !== 3) {
+    throw new Error(
+      `Config ${p.configFile} is version ${Number.isFinite(version) ? version : "unknown"}; this release uses version 3 (profiles/activeProfile). ` +
+        "Run `auto-work init` to write a new config."
+    );
   }
   return raw as unknown as Config;
 }
@@ -153,53 +183,83 @@ export function validateConfig(config: Config): ValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  if (Number(config.version) !== 2) errors.push("version must be 2");
-  if (!config.jobs || typeof config.jobs !== "object" || !Object.keys(config.jobs).length) {
-    errors.push("at least one job is required");
+  if (Number(config.version) !== 3) errors.push("version must be 3");
+  if (!config.profiles || typeof config.profiles !== "object" || !Object.keys(config.profiles).length) {
+    errors.push("at least one profile is required");
   }
-  if (!config.activeJob) {
-    errors.push("activeJob is required");
-  } else if (config.jobs && !config.jobs[config.activeJob]) {
-    errors.push(`activeJob "${config.activeJob}" does not exist in jobs`);
+  if (!config.activeProfile) {
+    errors.push("activeProfile is required");
+  } else if (config.profiles && !config.profiles[config.activeProfile]) {
+    errors.push(`activeProfile "${config.activeProfile}" does not exist in profiles`);
   }
 
-  for (const [name, rawJob] of Object.entries(config.jobs ?? {})) {
-    const prefix = `jobs.${name}`;
-    const job = deepMerge(config.defaults ?? {}, rawJob) as JobConfig;
-    requireString(job?.ziki?.baseUrl, `${prefix}.ziki.baseUrl`, errors);
-    requireString(job?.ziki?.projectId, `${prefix}.ziki.projectId`, errors);
-    requireString(job?.ziki?.projectSlug, `${prefix}.ziki.projectSlug`, errors);
-    requireString(job?.ziki?.platform, `${prefix}.ziki.platform`, errors);
-    requireString(job?.repo?.url, `${prefix}.repo.url`, errors);
-    requireString(job?.repo?.upstream, `${prefix}.repo.upstream`, errors);
-    requireString(job?.repo?.base, `${prefix}.repo.base`, errors);
-    requireString(job?.repo?.githubRepo, `${prefix}.repo.githubRepo`, errors);
-    requireString(job?.repo?.forkOwner, `${prefix}.repo.forkOwner`, errors);
-    requireString(job?.repo?.defaultBranch, `${prefix}.repo.defaultBranch`, errors);
-    if (!job?.repo?.teamLead) warnings.push(`${prefix}.repo.teamLead is empty; the PR template may need it`);
-    if (!Array.isArray(job?.agents?.workers) || !job.agents.workers.length) {
-      errors.push(`${prefix}.agents.workers must contain at least one env key name`);
+  for (const [name, rawProfile] of Object.entries(config.profiles ?? {})) {
+    const prefix = `profiles.${name}`;
+    const profile = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
+    requireString(profile?.ziki?.baseUrl, `${prefix}.ziki.baseUrl`, errors);
+    requireString(profile?.ziki?.projectId, `${prefix}.ziki.projectId`, errors);
+    requireString(profile?.ziki?.projectSlug, `${prefix}.ziki.projectSlug`, errors);
+    requireString(profile?.ziki?.platform, `${prefix}.ziki.platform`, errors);
+    requireString(profile?.repo?.url, `${prefix}.repo.url`, errors);
+    requireString(profile?.repo?.upstream, `${prefix}.repo.upstream`, errors);
+    requireString(profile?.repo?.base, `${prefix}.repo.base`, errors);
+    requireString(profile?.repo?.githubRepo, `${prefix}.repo.githubRepo`, errors);
+    requireString(profile?.repo?.forkOwner, `${prefix}.repo.forkOwner`, errors);
+    requireString(profile?.repo?.defaultBranch, `${prefix}.repo.defaultBranch`, errors);
+    if (!profile?.repo?.teamLead) warnings.push(`${prefix}.repo.teamLead is empty; the PR template may need it`);
+    const workers = profile?.agents?.workers;
+    const managers = profile?.agents?.managers;
+    if (!Array.isArray(workers)) errors.push(`${prefix}.agents.workers must be an array`);
+    if (!Array.isArray(managers)) errors.push(`${prefix}.agents.managers must be an array`);
+    if (Array.isArray(workers) && Array.isArray(managers) && !workers.length && !managers.length) {
+      errors.push(`${prefix}.agents needs at least one worker or manager env key name`);
     }
-    if (!Array.isArray(job?.agents?.managers) || !job.agents.managers.length) {
-      errors.push(`${prefix}.agents.managers must contain at least one env key name`);
+    if (Array.isArray(managers) && managers.length === 0) {
+      warnings.push(`${prefix}.agents.managers is empty; manager-only actions (merge review, accept, cross-platform moves) will be skipped`);
     }
-    if (!PROVIDERS.includes(job?.executor?.provider)) {
+    if (Array.isArray(workers) && workers.length === 0 && Array.isArray(managers) && managers.length > 0) {
+      warnings.push(`${prefix}.agents.workers is empty; manager keys will also do working tasks`);
+    }
+    if (!PROVIDERS.includes(profile?.executor?.provider)) {
       errors.push(`${prefix}.executor.provider must be one of ${PROVIDERS.join(", ")}`);
     }
-    if (job?.executor?.provider === "custom") {
-      requireString(job?.executor?.command, `${prefix}.executor.command`, errors);
+    if (profile?.executor?.provider === "custom") {
+      requireString(profile?.executor?.command, `${prefix}.executor.command`, errors);
     }
-    if (!Array.isArray(job?.checks)) {
+    if (!Array.isArray(profile?.checks)) {
       errors.push(`${prefix}.checks must be an array`);
     } else {
-      job.checks.forEach((check, index) => validateCheck(check, index, errors));
+      profile.checks.forEach((check, index) => validateCheck(check, index, errors));
     }
-    requireString(job?.prompts?.dir, `${prefix}.prompts.dir`, errors);
-    requireString(job?.pr?.templateFile, `${prefix}.pr.templateFile`, errors);
-    if (!job?.limits || typeof job.limits !== "object") {
+    requireString(profile?.prompts?.dir, `${prefix}.prompts.dir`, errors);
+    requireString(profile?.pr?.templateFile, `${prefix}.pr.templateFile`, errors);
+    if (!profile?.limits || typeof profile.limits !== "object") {
       errors.push(`${prefix}.limits is required`);
     }
-    if (typeof job?.pollSeconds !== "number" || job.pollSeconds < 10) {
+    const workflow = profile?.workflow;
+    if (!workflow || typeof workflow !== "object") {
+      warnings.push(`${prefix}.workflow is missing; defaults will be used`);
+    } else {
+      if (!Number.isInteger(workflow.maxFiles) || workflow.maxFiles < 1) {
+        errors.push(`${prefix}.workflow.maxFiles must be a positive integer`);
+      }
+      if (!Number.isInteger(workflow.maxLines) || workflow.maxLines < 1) {
+        errors.push(`${prefix}.workflow.maxLines must be a positive integer`);
+      }
+      if (typeof workflow.branchPrefix !== "string" || !workflow.branchPrefix.trim()) {
+        errors.push(`${prefix}.workflow.branchPrefix is required`);
+      }
+      if (!Array.isArray(workflow.commitTypes) || !workflow.commitTypes.length) {
+        errors.push(`${prefix}.workflow.commitTypes must be a non-empty array`);
+      }
+    }
+    if (profile?.repo?.envFiles !== undefined && !Array.isArray(profile.repo.envFiles)) {
+      errors.push(`${prefix}.repo.envFiles must be an array`);
+    }
+    if (profile?.repo?.requiredEnv !== undefined && !Array.isArray(profile.repo.requiredEnv)) {
+      errors.push(`${prefix}.repo.requiredEnv must be an array`);
+    }
+    if (typeof profile?.pollSeconds !== "number" || profile.pollSeconds < 10) {
       errors.push(`${prefix}.pollSeconds must be at least 10`);
     }
   }
@@ -207,50 +267,70 @@ export function validateConfig(config: Config): ValidationResult {
   return { ok: errors.length === 0, errors, warnings };
 }
 
-export function resolveModel(job: JobConfig, role: Role): string | null {
-  const models = job.executor.models ?? {};
-  return models[role] ?? job.executor.model ?? null;
+export function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig {
+  const base: RunLimitConfig = {
+    maxRuntimeMinutes: profile.limits.maxRuntimeMinutes ?? null,
+    maxCycles: profile.limits.maxCycles ?? null,
+    stopAt: profile.limits.stopAt ?? null,
+    maxDeliveriesTotal: profile.limits.maxDeliveriesTotal ?? null
+  };
+  if (!override) return base;
+  return {
+    maxRuntimeMinutes: override.maxRuntimeMinutes !== undefined ? override.maxRuntimeMinutes : base.maxRuntimeMinutes,
+    maxCycles: override.maxCycles !== undefined ? override.maxCycles : base.maxCycles,
+    stopAt: override.stopAt !== undefined ? override.stopAt : base.stopAt,
+    maxDeliveriesTotal: override.maxDeliveriesTotal !== undefined ? override.maxDeliveriesTotal : base.maxDeliveriesTotal
+  };
 }
 
-export function resolvePromptDir(job: JobConfig): string {
-  const dir = job.prompts.dir;
+export function resolveModel(profile: ProfileConfig, role: Role): string | null {
+  const models = profile.executor.models ?? {};
+  return models[role] ?? profile.executor.model ?? null;
+}
+
+export function resolvePromptDir(profile: ProfileConfig): string {
+  const dir = profile.prompts.dir;
   return path.isAbsolute(dir) ? dir : path.join(PACKAGE_ROOT, dir);
 }
 
-export function resolvePrTemplate(job: JobConfig): string {
-  const file = job.pr.templateFile;
+export function resolvePrTemplate(profile: ProfileConfig): string {
+  const file = profile.pr.templateFile;
   return path.isAbsolute(file) ? file : path.join(PACKAGE_ROOT, file);
 }
 
-export function resolveParityFile(job: JobConfig): string | null {
-  const file = job.discovery.parityFile;
+export function resolveParityFile(profile: ProfileConfig): string | null {
+  const file = profile.discovery.parityFile;
   if (!file) return null;
   return path.isAbsolute(file) ? file : path.join(PACKAGE_ROOT, file);
 }
 
-export async function ensureJobDirs(jobPathsValue: JobPaths): Promise<void> {
+export async function ensureProfileDirs(profilePathsValue: ProfilePaths): Promise<void> {
   await Promise.all([
-    mkdir(jobPathsValue.stateDir, { recursive: true }),
-    mkdir(jobPathsValue.logsDir, { recursive: true }),
-    mkdir(jobPathsValue.worktreesDir, { recursive: true }),
-    mkdir(jobPathsValue.reposDir, { recursive: true }),
-    mkdir(jobPathsValue.resultsDir, { recursive: true })
+    mkdir(profilePathsValue.stateDir, { recursive: true }),
+    mkdir(profilePathsValue.logsDir, { recursive: true }),
+    mkdir(profilePathsValue.worktreesDir, { recursive: true }),
+    mkdir(profilePathsValue.reposDir, { recursive: true }),
+    mkdir(profilePathsValue.resultsDir, { recursive: true })
   ]);
 }
 
-export async function loadJob(jobName?: string): Promise<LoadedJob> {
+export async function loadProfile(profileName?: string): Promise<LoadedProfile> {
   const config = await loadConfig();
-  const name = jobName || config.activeJob;
-  const rawJob = config.jobs?.[name];
-  if (!rawJob) {
+  const name = profileName || config.activeProfile;
+  const rawProfile = config.profiles?.[name];
+  if (!rawProfile) {
     throw new Error(
-      `Unknown job "${name || "(none)"}". Available: ${Object.keys(config.jobs ?? {}).join(", ") || "none"}. Run \`auto-work init\`.`
+      `Unknown profile "${name || "(none)"}". Available: ${Object.keys(config.profiles ?? {}).join(", ") || "none"}. Run \`auto-work init\`.`
     );
   }
-  const job = deepMerge(config.defaults ?? {}, rawJob) as JobConfig;
-  const validation = validateConfig({ ...config, activeJob: name, jobs: { [name]: job } });
+  const profile = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
+  profile.limits = { ...DEFAULT_LIMITS, ...(profile.limits ?? {}) };
+  profile.workflow = { ...DEFAULT_WORKFLOW, ...(profile.workflow ?? {}) };
+  profile.repo = { ...profile.repo, envFiles: profile.repo?.envFiles ?? DEFAULT_ENV_FILES };
+  profile.executor = { ...profile.executor, timeoutMs: profile.executor?.timeoutMs ?? 2_700_000, permissionMode: profile.executor?.permissionMode ?? "auto" };
+  const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });
   if (!validation.ok) {
-    throw new Error(`Invalid job "${name}":\n${validation.errors.join("\n")}`);
+    throw new Error(`Invalid profile "${name}":\n${validation.errors.join("\n")}`);
   }
 
   const env = await loadEnv();
@@ -261,105 +341,25 @@ export async function loadJob(jobName?: string): Promise<LoadedJob> {
       .filter((entry): entry is AgentKey => Boolean(entry.key));
 
   const keys = {
-    workers: toKeys(job.agents.workers),
-    managers: toKeys(job.agents.managers)
+    workers: toKeys(profile.agents.workers),
+    managers: toKeys(profile.agents.managers)
   };
   if (!keys.workers.length && !keys.managers.length) {
-    throw new Error(`No valid agent keys for job "${name}". Add them to ${paths().envFile}.`);
+    throw new Error(`No valid agent keys for profile "${name}". Add them to ${paths().envFile}.`);
   }
 
-  const jobPathsValue = jobPaths(name);
-  await ensureJobDirs(jobPathsValue);
+  const profilePathsValue = profilePaths(name);
+  await ensureProfileDirs(profilePathsValue);
 
   return {
     config,
-    jobName: name,
-    job,
+    profileName: name,
+    profile,
     paths: paths(),
-    jobPaths: jobPathsValue,
+    profilePaths: profilePathsValue,
     env,
     keys,
     getKey
-  };
-}
-
-export function migrateConfig(raw: Record<string, unknown>): Config {
-  const oldJobs = (raw.jobs ?? {}) as Record<string, Record<string, unknown>>;
-  const jobs: Record<string, JobConfig> = {};
-
-  for (const [name, old] of Object.entries(oldJobs)) {
-    const repo = (old.repo ?? {}) as Record<string, unknown>;
-    const isDesktop = String(repo.githubRepo ?? "").includes("zedu-desktop");
-    const checks: CheckSpec[] = isDesktop
-      ? [
-          { name: "deps", command: "flutter", args: ["pub", "get"], timeoutMs: 600_000 },
-          {
-            name: "format",
-            command: "dart",
-            args: ["format", "--output=none", "--set-exit-if-changed"],
-            filesOnly: true,
-            include: [".dart"]
-          },
-          { name: "analyze", command: "flutter", args: ["analyze", "--fatal-infos", "--fatal-warnings"] },
-          {
-            name: "test",
-            command: "flutter",
-            args: ["test", "--reporter", "json"],
-            reporter: "json",
-            baseline: true,
-            timeoutMs: 1_800_000
-          }
-        ]
-      : [];
-
-    jobs[name] = {
-      ziki: {
-        baseUrl: "https://ziki.dev",
-        projectId: String(old.projectId ?? ""),
-        projectSlug: String(old.projectSlug ?? ""),
-        platform: String(old.platform ?? ""),
-        ...(old.platformCategoryId ? { platformCategoryId: String(old.platformCategoryId) } : {}),
-        ...(isDesktop ? { projectName: "Zedu Desktop" } : {})
-      },
-      ...(isDesktop ? { stack: "Flutter 3.41.5 (Windows/macOS/Linux)" } : {}),
-      repo: {
-        url: String(repo.url ?? ""),
-        upstream: String(repo.upstream ?? ""),
-        base: String(repo.base ?? "main"),
-        githubRepo: String(repo.githubRepo ?? ""),
-        forkOwner: String(repo.forkOwner ?? ""),
-        defaultBranch: String(repo.defaultBranch ?? "main"),
-        ...(repo.teamLead ? { teamLead: String(repo.teamLead) } : {}),
-        ...(isDesktop ? { baselineFile: "lib/main.dart" } : {})
-      },
-      agents: (old.agents ?? { workers: [], managers: [] }) as JobConfig["agents"],
-      executor: {
-        provider: "opencode",
-        model: null,
-        timeoutMs: 2_700_000,
-        permissionMode: "auto"
-      },
-      toolchain: (old.toolchain ?? {}) as Record<string, string>,
-      checks,
-      platformMatch: isDesktop ? { keywords: ["desktop", "flutter", "linux", "windows", "macos"] } : {},
-      prompts: { dir: isDesktop ? "prompts/zedu-desktop" : "prompts/generic" },
-      pr: {
-        templateFile: isDesktop ? "prompts/zedu-desktop/pr.md" : "prompts/generic/pr.md",
-        ...(repo.teamLead ? { teamLead: String(repo.teamLead) } : {})
-      },
-      discovery: (old.discovery ?? { enabled: false, maxIdeasPerRun: 3 }) as JobConfig["discovery"],
-      limits: (old.limits ?? { ...DEFAULT_LIMITS }) as LimitsConfig,
-      pollSeconds: Number(old.pollSeconds ?? 120),
-      memoryRefreshMinutes: Number(old.memoryRefreshMinutes ?? 30),
-      hitl: (old.hitl ?? { enabled: true, defaultType: "question", notifyCommand: null }) as JobConfig["hitl"]
-    };
-  }
-
-  return {
-    version: 2,
-    activeJob: String(raw.activeJob ?? Object.keys(jobs)[0] ?? ""),
-    defaults: (raw.defaults ?? {}) as Partial<JobConfig>,
-    jobs
   };
 }
 

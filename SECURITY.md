@@ -9,8 +9,8 @@ Include the version, platform, a minimal reproduction, and the impact.
 
 ## Supported versions
 
-The latest `0.1.x` release is supported. Security fixes are released as patch
-versions.
+This is development-stage software with no versioned releases. Security fixes
+land on `main`.
 
 ## Scope and expectations
 

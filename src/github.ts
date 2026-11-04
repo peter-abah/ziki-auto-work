@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { Issue, JobConfig } from "./types.js";
+import type { Issue, ProfileConfig } from "./types.js";
 import { resolvePrTemplate } from "./config.js";
 import { runCommand } from "./platform/spawn.js";
+import { envFilesFor } from "./env.js";
 
 export function slugify(text: string, max = 40): string {
   const slug = String(text || "")
@@ -15,8 +16,9 @@ export function slugify(text: string, max = 40): string {
   return slug || "task";
 }
 
-export function branchName(issue: { number: number | string }, title: string): string {
-  return `fix/${issue.number}-${slugify(title)}`;
+export function branchName(issue: { number: number | string }, title: string, prefix = "fix"): string {
+  const clean = String(prefix || "fix").replace(/\/+$/, "");
+  return `${clean}/${issue.number}-${slugify(title)}`;
 }
 
 export function summarizeChecks(rollup: Array<Record<string, unknown>>): "passing" | "failing" | "pending" | "none" {
@@ -50,43 +52,43 @@ export interface GitHubPrStatus {
 }
 
 export class GitHub {
-  job: JobConfig;
-  jobName: string;
+  profile: ProfileConfig;
+  profileName: string;
   repoDir: string;
   logger: { info: (m: string, f?: Record<string, unknown>) => Promise<void>; warn: (m: string, f?: Record<string, unknown>) => Promise<void> } | null;
 
   constructor(options: {
-    job: JobConfig;
-    jobName: string;
+    profile: ProfileConfig;
+    profileName: string;
     reposDir: string;
     logger?: GitHub["logger"];
   }) {
-    this.job = options.job;
-    this.jobName = options.jobName;
+    this.profile = options.profile;
+    this.profileName = options.profileName;
     this.repoDir = path.join(options.reposDir, "repo");
     this.logger = options.logger ?? null;
   }
 
   async git(args: string[], options: { cwd?: string; timeoutMs?: number } = {}) {
-    return runCommand(this.job.toolchain.git || "git", args, {
+    return runCommand(this.profile.toolchain.git || "git", args, {
       cwd: options.cwd ?? this.repoDir,
       timeoutMs: options.timeoutMs ?? 120_000
     });
   }
 
   async gh(args: string[], options: { cwd?: string; timeoutMs?: number } = {}) {
-    return runCommand(this.job.toolchain.gh || "gh", args, {
+    return runCommand(this.profile.toolchain.gh || "gh", args, {
       cwd: options.cwd ?? this.repoDir,
       timeoutMs: options.timeoutMs ?? 120_000
     });
   }
 
   async ensureRepo(): Promise<string> {
-    const { url, upstream, base } = this.job.repo;
+    const { url, upstream, base } = this.profile.repo;
     await mkdir(this.repoDir, { recursive: true });
     if (!existsSync(path.join(this.repoDir, ".git"))) {
       this.logger?.info(`Cloning ${url} -> ${this.repoDir}`);
-      const clone = await runCommand(this.job.toolchain.git || "git", ["clone", url, this.repoDir], {
+      const clone = await runCommand(this.profile.toolchain.git || "git", ["clone", url, this.repoDir], {
         timeoutMs: 600_000
       });
       if (!clone.ok) throw new Error(clone.stderr || clone.stdout || "git clone failed");
@@ -118,13 +120,15 @@ export class GitHub {
   }
 
   async copyEnvTo(worktree: string): Promise<void> {
-    const source = path.join(this.repoDir, ".env");
-    const target = path.join(worktree, ".env");
-    if (existsSync(source) && !existsSync(target)) await copyFile(source, target);
+    for (const name of envFilesFor(this.profile)) {
+      const source = path.join(this.repoDir, name);
+      const target = path.join(worktree, name);
+      if (existsSync(source) && !existsSync(target)) await copyFile(source, target);
+    }
   }
 
   async baseSha(): Promise<string> {
-    return (await this.git(["rev-parse", `upstream/${this.job.repo.base}`])).stdout;
+    return (await this.git(["rev-parse", `upstream/${this.profile.repo.base}`])).stdout;
   }
 
   async createWorktree(branch: string, dir: string): Promise<string> {
@@ -134,7 +138,7 @@ export class GitHub {
     if (branches.includes(branch)) {
       await this.git(["worktree", "add", dir, branch]);
     } else {
-      await this.git(["worktree", "add", "-b", branch, dir, `upstream/${this.job.repo.base}`]);
+      await this.git(["worktree", "add", "-b", branch, dir, `upstream/${this.profile.repo.base}`]);
     }
     await this.copyEnvTo(dir);
     return dir;
@@ -143,7 +147,7 @@ export class GitHub {
   async createScratchWorktree(dir: string): Promise<string> {
     await mkdir(path.dirname(dir), { recursive: true });
     if (existsSync(dir)) await this.removeWorktree(dir, true).catch(() => {});
-    await this.git(["worktree", "add", "--detach", dir, `upstream/${this.job.repo.base}`]);
+    await this.git(["worktree", "add", "--detach", dir, `upstream/${this.profile.repo.base}`]);
     await this.copyEnvTo(dir);
     return dir;
   }
@@ -169,15 +173,34 @@ export class GitHub {
   }
 
   async changedFiles(worktree: string): Promise<string[]> {
-    const tracked = await this.git(["diff", "--name-only", `upstream/${this.job.repo.base}`], { cwd: worktree });
+    const tracked = await this.git(["diff", "--name-only", `upstream/${this.profile.repo.base}`], { cwd: worktree });
     const untracked = await this.git(["ls-files", "--others", "--exclude-standard"], { cwd: worktree }).catch(() => ({
       stdout: ""
     }));
     return [...new Set([...tracked.stdout.split("\n"), ...untracked.stdout.split("\n")].filter(Boolean))];
   }
 
+  async diffStats(worktree: string): Promise<{ files: number; insertions: number; deletions: number; total: number }> {
+    const out = await this.git(["diff", "--cached", "--numstat", `upstream/${this.profile.repo.base}`], { cwd: worktree });
+    let insertions = 0;
+    let deletions = 0;
+    let files = 0;
+    for (const line of out.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const [added, removed] = line.split("\t");
+      if (added === undefined || removed === undefined) continue;
+      const add = Number(added);
+      const del = Number(removed);
+      if (!Number.isFinite(add) || !Number.isFinite(del)) continue;
+      insertions += add;
+      deletions += del;
+      files += 1;
+    }
+    return { files, insertions, deletions, total: insertions + deletions };
+  }
+
   async stagedChangedFiles(worktree: string): Promise<string[]> {
-    const out = await this.git(["diff", "--cached", "--name-only", `upstream/${this.job.repo.base}`], {
+    const out = await this.git(["diff", "--cached", "--name-only", `upstream/${this.profile.repo.base}`], {
       cwd: worktree
     });
     return out.stdout.split("\n").filter(Boolean);
@@ -191,7 +214,7 @@ export class GitHub {
     await this.git(["add", "-A"], { cwd: worktree });
     const status = await this.status(worktree);
     if (!status) {
-      const ahead = await this.git(["rev-list", "--count", `upstream/${this.job.repo.base}..HEAD`], {
+      const ahead = await this.git(["rev-list", "--count", `upstream/${this.profile.repo.base}..HEAD`], {
         cwd: worktree
       }).catch(() => ({ stdout: "0" }));
       if (Number(ahead.stdout) > 0) {
@@ -217,9 +240,9 @@ export class GitHub {
       "pr",
       "list",
       "--repo",
-      this.job.repo.githubRepo,
+      this.profile.repo.githubRepo,
       "--head",
-      branch,
+      `${this.profile.repo.forkOwner}:${branch}`,
       "--state",
       "open",
       "--json",
@@ -238,11 +261,11 @@ export class GitHub {
         "pr",
         "create",
         "--repo",
-        this.job.repo.githubRepo,
+        this.profile.repo.githubRepo,
         "--base",
-        this.job.repo.base,
+        this.profile.repo.base,
         "--head",
-        `${this.job.repo.forkOwner}:${branch}`,
+        `${this.profile.repo.forkOwner}:${branch}`,
         "--title",
         title,
         "--body",
@@ -290,13 +313,13 @@ export class GitHub {
   }
 
   async remoteAccess(url: string) {
-    return runCommand(this.job.toolchain.git || "git", ["ls-remote", "--exit-code", url, "HEAD"], {
+    return runCommand(this.profile.toolchain.git || "git", ["ls-remote", "--exit-code", url, "HEAD"], {
       timeoutMs: 60_000
     });
   }
 }
 
-const GENERIC_PR_TEMPLATE = `## Ticket
+export const GENERIC_PR_TEMPLATE = `## Ticket
 
 {{ticket}}
 
@@ -356,18 +379,18 @@ export interface PrBodyInput {
   notes?: string[];
 }
 
-export async function buildPrBody(job: JobConfig, input: PrBodyInput): Promise<string> {
-  const templateFile = resolvePrTemplate(job);
+export async function buildPrBody(profile: ProfileConfig, input: PrBodyInput): Promise<string> {
+  const templateFile = resolvePrTemplate(profile);
   let template = GENERIC_PR_TEMPLATE;
   if (existsSync(templateFile)) template = await readFile(templateFile, "utf8");
 
-  const ticket = `Ziki: ${job.ziki.baseUrl.replace(/\/$/, "")}/${job.ziki.projectSlug}/${input.issue.number} — ${input.issue.title}`;
+  const ticket = `Ziki: ${profile.ziki.baseUrl.replace(/\/$/, "")}/${profile.ziki.projectSlug}/${input.issue.number} — ${input.issue.title}`;
   const howToTest = input.howToTest?.length
     ? input.howToTest.map((step, index) => `${index + 1}. ${step}`).join("\n")
     : "1. Check out the branch\n2. Run the project's checks";
   const values: Record<string, string> = {
     ticket,
-    teamLead: job.pr.teamLead || job.repo.teamLead || "",
+    teamLead: profile.pr.teamLead || profile.repo.teamLead || "",
     description: input.description || input.summary || "",
     why: input.issue.summary || input.issue.title,
     howToTest,

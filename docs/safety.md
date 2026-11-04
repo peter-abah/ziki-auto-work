@@ -33,6 +33,23 @@ block waiting for approval, which is not suitable for unattended runs.
 - Protected files are rejected before commit. They are a backstop too: the agent
   may still have read them.
 
+## Project env
+
+- Put project values in the clone's `.env`/`.env.local`; they are copied into
+  every worktree and stay protected from commit.
+- `executor.env` and `checks[].env` are for non-file values. They live in the
+  mode-600 config, so avoid long-lived secrets there when a `.env` works.
+- Agent children inherit the loop's process env. Do not export secrets in the
+  shell that starts the loop; use the env file instead.
+- Missing env/tool/auth failures are treated as blockers and escalated.
+
+## Notifications
+
+- Default `hitl.notify: "auto"` uses the OS desktop notifier; no tokens.
+- `command` mode runs a local command with `AW_TITLE`/`AW_BODY`. Keep any token
+  in the env file or the command's own config, never in the notification text.
+- Notifications contain only the count and Ziki link, no env values.
+
 ## GitHub
 
 - `gh auth login` with the minimum scopes needed to open PRs and read checks.
@@ -43,11 +60,18 @@ block waiting for approval, which is not suitable for unattended runs.
 ## Caps and stop switches
 
 - Daily caps for deliveries, reviews, discoveries and auxiliary work.
-- `maxActiveClaims` limits concurrent claims.
+- Per-run limits: `--max-runtime` (default 2h), `--max-cycles`, `--until`,
+  `--max-deliveries`, `--forever`. The loop finishes the current cycle, then
+  stops and records the reason.
+- Concurrency caps: 2 deliveries, 1 review, 2 auxiliary tasks, 1 discovery, and
+  4 agents total (`maxConcurrent*`). `maxActiveClaims` caps deliveries per owner.
 - `auto-work pause` stops work without killing the process.
-- `auto-work stop` sends SIGTERM and kills active agents.
-- `STOP` in the job state directory is a file-based kill switch.
-- `auto-work status` shows the open escalations and counters.
+- `auto-work stop` sends SIGTERM, aborts in-flight tasks, and kills child
+  process trees. systemd units use `KillMode=control-group` and a stop timeout.
+- On startup, stale agent PIDs are killed and stale worktrees are removed.
+- `STOP` in the profile state directory is a file-based kill switch.
+- `auto-work status [--verbose]` shows open escalations, counters, run limits,
+  in-flight tasks and the last error.
 
 ## Human escalation
 

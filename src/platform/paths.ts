@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { JobPaths, Paths } from "../types.js";
+import type { ProfilePaths, Paths } from "../types.js";
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -73,7 +73,9 @@ export function paths(): Paths {
     stateDir,
     cacheDir,
     bin,
-    jobsDir: path.join(stateDir, "jobs"),
+    profilesDir: path.join(stateDir, "profiles"),
+    legacyShareDir: path.join(home, ".local/share/auto-work"),
+    legacyStateDir: path.join(home, ".local/state/auto-work"),
     packageRoot: PACKAGE_ROOT,
     promptsDir: path.join(share, "prompts"),
     configSamplesDir: path.join(PACKAGE_ROOT, "config"),
@@ -88,8 +90,8 @@ export function safeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "default";
 }
 
-export function jobPaths(jobName: string): JobPaths {
-  const base = path.join(paths().jobsDir, safeName(jobName));
+export function profilePaths(profileName: string): ProfilePaths {
+  const base = path.join(paths().profilesDir, safeName(profileName));
   return {
     stateDir: base,
     stateFile: path.join(base, "state.json"),
@@ -105,7 +107,11 @@ export function jobPaths(jobName: string): JobPaths {
     needsHumanFile: path.join(base, "NEEDS-HUMAN.md"),
     ownerRequestsFile: path.join(base, "OWNER-REQUESTS.md"),
     memoryFile: path.join(base, "memory-context.json"),
-    desktopCacheFile: path.join(base, "platform-cache.json")
+    desktopCacheFile: path.join(base, "platform-cache.json"),
+    runLimitsFile: path.join(base, "run-limits.json"),
+    historyFile: path.join(base, "history.jsonl"),
+    lastRunFile: path.join(base, "LAST-RUN.json"),
+    lastRunMdFile: path.join(base, "LAST-RUN.md")
   };
 }
 

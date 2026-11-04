@@ -1,17 +1,17 @@
 # Configuration reference
 
-The config is a **workspace** with one or more **jobs**.
+The config is a **workspace** with one or more **profiles** (config version 3).
 
 ```json
 {
-  "version": 2,
-  "activeJob": "web",
+  "version": 3,
+  "activeProfile": "web",
   "defaults": {
     "executor": { "provider": "opencode", "model": null },
     "limits": { "maxActiveClaims": 2 },
     "pollSeconds": 120
   },
-  "jobs": {
+  "profiles": {
     "web": {
       "ziki": {
         "baseUrl": "https://ziki.dev",
@@ -30,7 +30,9 @@ The config is a **workspace** with one or more **jobs**.
         "defaultBranch": "main",
         "teamLead": "@lead",
         "protectedFiles": [".github/**", "AGENTS.md", ".env", ".env.*"],
-        "baselineFile": "src/main.ts"
+        "baselineFile": "src/main.ts",
+        "envFiles": [".env", ".env.local"],
+        "requiredEnv": ["API_URL", "API_TOKEN"]
       },
       "agents": {
         "workers": ["ZIKI_KEY1"],
@@ -59,6 +61,13 @@ The config is a **workspace** with one or more **jobs**.
       "prompts": { "dir": "prompts/web" },
       "pr": { "templateFile": "prompts/web/pr.md", "teamLead": "@lead" },
       "discovery": { "enabled": true, "parityFile": "PARITY.md", "maxIdeasPerRun": 3 },
+      "workflow": {
+        "maxFiles": 5,
+        "maxLines": 400,
+        "branchPrefix": "fix",
+        "commitTypes": ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
+        "requireTests": true
+      },
       "limits": {
         "maxDeliveriesPerDay": 10,
         "maxReviewsPerDay": 20,
@@ -67,28 +76,45 @@ The config is a **workspace** with one or more **jobs**.
         "maxActiveClaims": 2,
         "maxAttemptsPerTask": 3,
         "maxCyclesBeforeDiscovery": 6,
-        "maxOpenEscalations": 5
+        "maxOpenEscalations": 5,
+        "maxRuntimeMinutes": 120,
+        "maxCycles": null,
+        "stopAt": null,
+        "maxDeliveriesTotal": null,
+        "maxConcurrentDeliveries": 2,
+        "maxConcurrentReviews": 1,
+        "maxConcurrentAux": 2,
+        "maxConcurrentDiscovery": 1,
+        "maxConcurrentAgents": 4
       },
       "pollSeconds": 120,
       "memoryRefreshMinutes": 30,
-      "hitl": { "enabled": true, "defaultType": "question", "notifyCommand": null }
+      "hitl": { "enabled": true, "defaultType": "question", "notify": "auto", "notifyCommand": null }
     }
-  }
+  },
+  "doctor": { "minFreeGb": 3 }
 }
 ```
 
+Version 2 configs (`jobs` / `activeJob`) are **not migrated**. Run
+`auto-work init` to write a version 3 config.
+
 ## defaults
 
-`defaults` is deep-merged into every job (arrays replace). Use it for executor,
-limits, poll interval and HITL so jobs stay short.
+`defaults` is deep-merged into every profile (arrays replace). Use it for
+executor, limits, poll interval and HITL so profiles stay short.
 
 ## ziki
 
 - `baseUrl`: Ziki site.
 - `projectId`, `projectSlug`: the project the agent keys belong to.
-- `platform`: the platform slug used to filter issues and ideas.
+- `platform`: the Ziki platform slug used to filter issues and ideas. Get the
+  real values from `GET /api/v1/platforms` (`desktop`, `mobile`, `web`, …).
 - `projectName`: human name used in prompts.
 - `platformCategoryId`: optional platform id, for discovery.
+
+`stack` is separate from `platform`: it is the technology label used in prompts
+and check presets (`Flutter`, `Next.js`, …).
 
 ## repo
 
@@ -101,11 +127,21 @@ limits, poll interval and HITL so jobs stay short.
 - `teamLead`: PR template handle.
 - `protectedFiles`: glob patterns; matched against changed paths and basenames.
 - `baselineFile`: file passed to a `filesOnly` baseline check (optional).
+- `envFiles`: files copied from the clone into every ticket/review worktree
+  (default `[".env", ".env.local"]`). They stay protected and are never committed.
+- `requiredEnv`: env keys `doctor` requires in those files; values are never printed.
 
 ## agents
 
-Env var names, not keys. Example: `workers: ["ZIKI_KEY1"]`. The env file lives
-next to the config and is mode 600.
+Env var names, not keys. Example: `workers: ["ZIKI_KEY2"]`,
+`managers: ["ZIKI_KEY1"]`. `init` assigns `working` keys to workers and
+`manager`/`merger` keys to managers. The env file lives next to the config and is
+mode 600.
+
+`managers` may be empty. Without a manager/merger, the loop skips merge
+reviews, accept, cross-platform moves, and manager-only categorization.
+Working keys still bid, award (self-award), confirm at weight 1, triage ideas,
+and deliver. If `workers` is empty, manager keys are used for working tasks.
 
 ## executor
 
@@ -136,7 +172,7 @@ Each check:
 
 ## prompts and pr
 
-`prompts.dir` is the per-job prompt folder. `pr.templateFile` is the PR body
+`prompts.dir` is the per-profile prompt folder. `pr.templateFile` is the PR body
 template. Both are relative to the package root or absolute. The engine fills
 placeholders such as `{{projectName}}`, `{{stack}}`, `{{checks}}`,
 `{{issueUrl}}`, `{{worktree}}`, `{{memory}}`, `{{previousError}}`,
@@ -144,23 +180,65 @@ placeholders such as `{{projectName}}`, `{{stack}}`, `{{checks}}`,
 
 ## platformMatch
 
-Keywords or a regex. Used to decide whether a work item belongs to this job.
+Keywords or a regex. Used to decide whether a work item belongs to this profile.
 Issues already tagged with the platform are included regardless.
 
 ## discovery
 
 `enabled`, optional `parityFile`, `maxIdeasPerRun`, `maxCyclesBeforeRun`.
 
+## workflow
+
+- `maxFiles`: changed-file cap enforced before commit.
+- `maxLines`: changed-line cap (insertions + deletions) enforced before commit.
+- `branchPrefix`: branch name prefix, e.g. `fix` → `fix/<issue>-<slug>`.
+- `commitTypes`: accepted conventional-commit types; others fall back.
+- `requireTests`: prompt rule (not auto-enforced, to avoid false rejects).
+
+The worker prompt receives these as `{{workflowRules}}`, plus
+`{{protectedFiles}}`, `{{prBase}}`, `{{forkOwner}}`, `{{teamLead}}`,
+`{{prTemplate}}`, `{{maxFiles}}` and `{{maxLines}}`.
+
 ## limits
 
 Daily caps, active claims, retry attempts, discovery cadence and open
 escalation cap.
 
+Run limits:
+
+- `maxRuntimeMinutes`: default 120; `null` disables the time limit.
+- `maxCycles`: stop after N cycles; `null` disables.
+- `stopAt`: ISO timestamp deadline; `null` disables.
+- `maxDeliveriesTotal`: stop after N deliveries in this run; `null` disables.
+
+These can be overridden per start with `--max-runtime`, `--max-cycles`,
+`--until`, `--max-deliveries`, or `--forever`.
+
+Concurrency:
+
+- `maxConcurrentDeliveries` (default 2), capped by `maxActiveClaims`.
+- `maxConcurrentReviews` (default 1).
+- `maxConcurrentAux` (default 2).
+- `maxConcurrentDiscovery` (default 1).
+- `maxConcurrentAgents` (default 4) caps all in-flight tasks.
+
+## hitl
+
+- `enabled`, `defaultType`.
+- `notify`: `auto` (desktop if available), `desktop`, `command`, or `off`.
+- `notifyCommand`: shell command used by `command`/`auto` fallback; receives
+  `AW_TITLE` and `AW_BODY`.
+
+## doctor
+
+`doctor.minFreeGb` sets the disk-space warning threshold (default 3).
+
 ## State locations
 
-- Linux: `~/.local/state/auto-work/jobs/<job>/`
-- macOS: `~/Library/Application Support/auto-work/jobs/<job>/`
-- Windows: `%LOCALAPPDATA%\auto-work\jobs\<job>\`
+- Linux: `~/.local/state/auto-work/profiles/<profile>/`
+- macOS: `~/Library/Application Support/auto-work/profiles/<profile>/`
+- Windows: `%LOCALAPPDATA%\auto-work\profiles\<profile>\`
 
-Each job has `state.json`, `status.json`, `logs/`, `worktrees/`, `repos/`,
-`results/`, `NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.
+Each profile has `state.json`, `status.json`, `history.jsonl`,
+`run-limits.json`, `LAST-RUN.json`, `LAST-RUN.md`, `logs/`, `worktrees/`,
+`repos/`, `results/`, `NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.

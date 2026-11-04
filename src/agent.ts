@@ -1,30 +1,68 @@
+import { spawn as nodeSpawn } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentResult, Idea, Issue, JobConfig, JobPaths, Role } from "./types.js";
+import type { AgentResult, Idea, Issue, ProfileConfig, ProfilePaths, Role } from "./types.js";
 import { resolveModel, resolvePromptDir } from "./config.js";
 import { getProvider } from "./providers/index.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { spawnCommand } from "./platform/spawn.js";
 import { issueUrl, ideaUrl } from "./urls.js";
+import { resolveCommand } from "./checks.js";
+import { buildAgentEnv } from "./env.js";
+import {
+  formatPrFieldMap,
+  formatProtectedFiles,
+  formatWorkflowRules,
+  loadPrTemplateText
+} from "./rules.js";
 import { truncate } from "./log.js";
 import type { Logger } from "./log.js";
 
 const activeChildren = new Set<ReturnType<typeof spawnCommand>>();
 
-export function killActiveAgents(): void {
-  for (const child of activeChildren) {
+export function killProcessTree(pid: number | null | undefined): void {
+  if (!pid) return;
+  if (process.platform === "win32") {
     try {
-      if (process.platform === "win32") child.kill("SIGTERM");
-      else if (child.pid) process.kill(-child.pid, "SIGTERM");
+      const child = nodeSpawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", detached: true });
+      child.unref();
+    } catch {
+      // already gone
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+  const timer = setTimeout(() => {
+    try {
+      process.kill(-pid, "SIGKILL");
     } catch {
       try {
-        child.kill("SIGTERM");
+        process.kill(pid, "SIGKILL");
       } catch {
         // already gone
       }
     }
+  }, 3000);
+  timer.unref?.();
+}
+
+export function killActiveAgents(): void {
+  for (const child of activeChildren) {
+    killProcessTree(child.pid);
   }
+}
+
+export function activeAgentPids(): number[] {
+  return [...activeChildren].map((child) => child.pid).filter((pid): pid is number => Boolean(pid));
 }
 
 export function render(template: string, vars: Record<string, unknown>): string {
@@ -34,8 +72,8 @@ export function render(template: string, vars: Record<string, unknown>): string 
   });
 }
 
-export async function loadPrompt(job: JobConfig, role: Role | "pr"): Promise<string> {
-  const dir = resolvePromptDir(job);
+export async function loadPrompt(profile: ProfileConfig, role: Role | "pr"): Promise<string> {
+  const dir = resolvePromptDir(profile);
   const primary = path.join(dir, `${role}.md`);
   if (existsSync(primary)) return readFile(primary, "utf8");
   const fallback = path.join(PACKAGE_ROOT, "prompts", "generic", `${role}.md`);
@@ -43,19 +81,19 @@ export async function loadPrompt(job: JobConfig, role: Role | "pr"): Promise<str
   throw new Error(`Prompt "${role}.md" not found in ${dir}`);
 }
 
-function resultPaths(jobPaths: JobPaths, kind: string, label: string | number): { resultPath: string; logPath: string } {
+function resultPaths(profilePaths: ProfilePaths, kind: string, label: string | number): { resultPath: string; logPath: string } {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]+/g, "-");
   const base = `${kind}-${safeLabel}-${stamp}`;
   return {
-    resultPath: path.join(jobPaths.resultsDir, `${base}.json`),
-    logPath: path.join(jobPaths.logsDir, "agents", `${base}.log`)
+    resultPath: path.join(profilePaths.resultsDir, `${base}.json`),
+    logPath: path.join(profilePaths.logsDir, "agents", `${base}.log`)
   };
 }
 
 export async function runAgent(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   role: Role;
   prompt: string;
   cwd: string;
@@ -64,12 +102,14 @@ export async function runAgent(options: {
   logger?: Logger;
   timeoutMs?: number;
   extraEnv?: Record<string, string>;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, role, prompt, cwd, resultPath, logPath, logger } = options;
-  const model = resolveModel(job, role);
-  const provider = getProvider(job.executor.provider, job);
+  const { profile, profilePaths, role, prompt, cwd, resultPath, logPath, logger } = options;
+  const model = resolveModel(profile, role);
+  const provider = getProvider(profile.executor.provider, profile);
   const command = provider.build({ prompt, cwd, resultPath, model });
-  const limit = options.timeoutMs ?? job.executor.timeoutMs ?? 45 * 60 * 1000;
+  const limit = options.timeoutMs ?? profile.executor.timeoutMs ?? 45 * 60 * 1000;
 
   await mkdir(path.dirname(resultPath), { recursive: true });
   await mkdir(path.dirname(logPath), { recursive: true });
@@ -77,7 +117,7 @@ export async function runAgent(options: {
   let tail = "";
 
   logger?.info(`Starting ${role} agent`, {
-    provider: job.executor.provider,
+    provider: profile.executor.provider,
     model: model ?? "(provider default)",
     cwd,
     logPath
@@ -86,14 +126,14 @@ export async function runAgent(options: {
   const child = spawnCommand(command.command, command.args, {
     cwd,
     env: {
-      ...command.env,
-      ...options.extraEnv,
+      ...buildAgentEnv(profile, command.env, options.extraEnv),
       AW_RESULT_PATH: resultPath,
       AW_ROLE: role,
-      AW_JOB: job.ziki.projectSlug
+      AW_PROFILE: profile.ziki.projectSlug
     }
   });
   activeChildren.add(child);
+  if (child.pid) options.onSpawn?.(child.pid);
 
   if (command.stdin !== undefined) {
     child.stdin?.write(command.stdin);
@@ -111,12 +151,7 @@ export async function runAgent(options: {
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    try {
-      if (process.platform === "win32") child.kill("SIGTERM");
-      else if (child.pid) process.kill(-child.pid, "SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
-    }
+    killProcessTree(child.pid);
   }, limit);
 
   const exit = await new Promise<{ code: number; signal?: string; error?: Error }>((resolve) => {
@@ -124,6 +159,7 @@ export async function runAgent(options: {
     child.on("close", (code, signal) => resolve({ code: code ?? -1, signal: signal ?? undefined }));
   });
   activeChildren.delete(child);
+  if (child.pid) options.onExit?.(child.pid);
   clearTimeout(timer);
   stream.end();
 
@@ -164,20 +200,23 @@ export async function runAgent(options: {
   };
 }
 
-export function checksText(job: JobConfig): string {
-  if (!job.checks.length) return "(no checks configured)";
-  return job.checks
-    .map((check) => `- ${check.name}: \`${check.command} ${check.args.join(" ")}\``)
+export function checksText(profile: ProfileConfig): string {
+  if (!profile.checks.length) return "(no checks configured)";
+  return profile.checks
+    .map((check) => {
+      const command = resolveCommand(profile, check.command);
+      return `- ${check.name}: \`${command} ${check.args.join(" ")}\``;
+    })
     .join("\n");
 }
 
-export function projectName(job: JobConfig): string {
-  return job.ziki.projectName || job.ziki.projectSlug;
+export function projectName(profile: ProfileConfig): string {
+  return profile.ziki.projectName || profile.ziki.projectSlug;
 }
 
 export async function runWorker(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   issue: Issue;
   memoryText: string;
   worktree: string;
@@ -186,20 +225,28 @@ export async function runWorker(options: {
   previousError?: string;
   issueContext?: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, issue, memoryText, worktree, branch, base, logger } = options;
-  const { resultPath, logPath } = resultPaths(jobPaths, "worker", issue.number);
-  const template = await loadPrompt(job, "worker");
+  const { profile, profilePaths, issue, memoryText, worktree, branch, base, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "worker", issue.number);
+  const template = await loadPrompt(profile, "worker");
+  const workflowRules = formatWorkflowRules(profile, { branch });
+  const prTemplate = await loadPrTemplateText(profile);
   const prompt = render(template, {
-    projectName: projectName(job),
-    stack: job.stack || job.ziki.platform,
-    repoUrl: job.repo.githubRepo,
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
+    githubRepo: profile.repo.githubRepo,
+    forkOwner: profile.repo.forkOwner,
+    prBase: profile.repo.base,
+    teamLead: profile.pr.teamLead || profile.repo.teamLead || "",
     base,
-    platform: job.ziki.platform,
+    platform: profile.ziki.platform,
     issueNumber: issue.number,
     issueTitle: issue.title,
     issueId: issue.id,
-    issueUrl: issueUrl(job, issue),
+    issueUrl: issueUrl(profile, issue),
     issueSummary: issue.summary || "",
     issueDescription: issue.description || "",
     issueStatus: issue.status,
@@ -207,190 +254,220 @@ export async function runWorker(options: {
     issueContext: options.issueContext || "(none)",
     previousError: options.previousError || "(none)",
     memory: memoryText,
-    checks: checksText(job),
+    checks: checksText(profile),
+    workflowRules,
+    protectedFiles: formatProtectedFiles(profile),
+    maxFiles: profile.workflow.maxFiles,
+    maxLines: profile.workflow.maxLines,
+    branchPrefix: profile.workflow.branchPrefix,
+    commitTypes: profile.workflow.commitTypes.join(", "),
+    prTemplate,
+    prFieldMap: formatPrFieldMap(),
     worktree,
     branch,
     resultPath,
     logPath
   });
-  return runAgent({ job, jobPaths, role: "worker", prompt, cwd: worktree, resultPath, logPath, logger });
+  return runAgent({ profile, profilePaths, role: "worker", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
 export async function runDiscovery(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   memoryText: string;
   repoDir: string;
   parity: string;
   existingIssues: string;
   maxIdeas: number;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, memoryText, repoDir, parity, existingIssues, maxIdeas, logger } = options;
-  const { resultPath, logPath } = resultPaths(jobPaths, "discovery", "parity");
-  const template = await loadPrompt(job, "discovery");
+  const { profile, profilePaths, memoryText, repoDir, parity, existingIssues, maxIdeas, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "discovery", "parity");
+  const template = await loadPrompt(profile, "discovery");
   const prompt = render(template, {
-    projectName: projectName(job),
-    stack: job.stack || job.ziki.platform,
-    repoUrl: job.repo.githubRepo,
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
     repoDir,
-    platform: job.ziki.platform,
+    platform: profile.ziki.platform,
     parity,
     existingIssues,
     maxIdeas,
     memory: memoryText,
-    checks: checksText(job),
+    checks: checksText(profile),
     resultPath,
     logPath
   });
   return runAgent({
-    job,
-    jobPaths,
+    profile,
+    profilePaths,
     role: "discovery",
     prompt,
     cwd: repoDir,
     resultPath,
     logPath,
     logger,
-    timeoutMs: 45 * 60 * 1000
+    timeoutMs: 45 * 60 * 1000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
   });
 }
 
 export async function runReview(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   issue: Issue;
   memoryText: string;
   worktree: string;
   prUrl: string;
   headSha: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, issue, memoryText, worktree, prUrl, headSha, logger } = options;
-  const { resultPath, logPath } = resultPaths(jobPaths, "review", issue.number);
-  const template = await loadPrompt(job, "review");
+  const { profile, profilePaths, issue, memoryText, worktree, prUrl, headSha, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "review", issue.number);
+  const template = await loadPrompt(profile, "review");
   const prompt = render(template, {
-    projectName: projectName(job),
-    stack: job.stack || job.ziki.platform,
-    repoUrl: job.repo.githubRepo,
-    base: job.repo.base,
-    platform: job.ziki.platform,
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
+    base: profile.repo.base,
+    platform: profile.ziki.platform,
     issueNumber: issue.number,
     issueTitle: issue.title,
-    issueUrl: issueUrl(job, issue),
+    issueUrl: issueUrl(profile, issue),
     issueDescription: issue.description || "",
     memory: memoryText,
-    checks: checksText(job),
+    checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile),
+    protectedFiles: formatProtectedFiles(profile),
     worktree,
     prUrl,
     headSha,
     resultPath,
     logPath
   });
-  return runAgent({ job, jobPaths, role: "review", prompt, cwd: worktree, resultPath, logPath, logger });
+  return runAgent({ profile, profilePaths, role: "review", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
 export async function runConfirm(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   issue: Issue;
   memoryText: string;
   repoDir: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, issue, memoryText, repoDir, logger } = options;
-  const { resultPath, logPath } = resultPaths(jobPaths, "confirm", issue.number);
-  const template = await loadPrompt(job, "confirm");
+  const { profile, profilePaths, issue, memoryText, repoDir, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "confirm", issue.number);
+  const template = await loadPrompt(profile, "confirm");
   const prompt = render(template, {
-    projectName: projectName(job),
-    stack: job.stack || job.ziki.platform,
-    repoUrl: job.repo.githubRepo,
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
     repoDir,
-    platform: job.ziki.platform,
+    platform: profile.ziki.platform,
     issueNumber: issue.number,
     issueTitle: issue.title,
-    issueUrl: issueUrl(job, issue),
+    issueUrl: issueUrl(profile, issue),
     issueSummary: issue.summary || "",
     issueDescription: issue.description || "",
     memory: memoryText,
-    checks: checksText(job),
+    checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile),
+    protectedFiles: formatProtectedFiles(profile),
     resultPath,
     logPath
   });
-  return runAgent({ job, jobPaths, role: "confirm", prompt, cwd: repoDir, resultPath, logPath, logger });
+  return runAgent({ profile, profilePaths, role: "confirm", prompt, cwd: repoDir, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
 
 export async function runTriage(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   idea: Idea;
   memoryText: string;
   repoDir: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, idea, memoryText, repoDir, logger } = options;
-  const { resultPath, logPath } = resultPaths(jobPaths, "triage", idea.number);
-  const template = await loadPrompt(job, "triage");
+  const { profile, profilePaths, idea, memoryText, repoDir, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "triage", idea.number);
+  const template = await loadPrompt(profile, "triage");
   const prompt = render(template, {
-    projectName: projectName(job),
-    stack: job.stack || job.ziki.platform,
-    repoUrl: job.repo.githubRepo,
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
     repoDir,
-    platform: job.ziki.platform,
+    platform: profile.ziki.platform,
     ideaNumber: idea.number,
     ideaTitle: idea.title,
-    ideaUrl: ideaUrl(job, idea),
+    ideaUrl: ideaUrl(profile, idea),
     ideaSummary: idea.summary || "",
     ideaDescription: idea.description || "",
     memory: memoryText,
-    checks: checksText(job),
+    checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile),
+    protectedFiles: formatProtectedFiles(profile),
     resultPath,
     logPath
   });
   return runAgent({
-    job,
-    jobPaths,
+    profile,
+    profilePaths,
     role: "triage",
     prompt,
     cwd: repoDir,
     resultPath,
     logPath,
     logger,
-    timeoutMs: 20 * 60 * 1000
+    timeoutMs: 20 * 60 * 1000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
   });
 }
 
 export async function runOwner(options: {
-  job: JobConfig;
-  jobPaths: JobPaths;
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
   request: { id: string; body: string };
   memoryText: string;
   repoDir: string;
   logger?: Logger;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
-  const { job, jobPaths, request, memoryText, repoDir, logger } = options;
-  const { resultPath, logPath } = resultPaths(jobPaths, "owner", request.id || "request");
-  const template = await loadPrompt(job, "owner");
+  const { profile, profilePaths, request, memoryText, repoDir, logger } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "owner", request.id || "request");
+  const template = await loadPrompt(profile, "owner");
   const prompt = render(template, {
-    projectName: projectName(job),
-    stack: job.stack || job.ziki.platform,
-    repoUrl: job.repo.githubRepo,
+    projectName: projectName(profile),
+    stack: profile.stack || profile.ziki.platform,
+    repoUrl: profile.repo.githubRepo,
     repoDir,
     request: request.body,
     memory: memoryText,
-    checks: checksText(job),
+    checks: checksText(profile),
     resultPath,
     logPath
   });
   return runAgent({
-    job,
-    jobPaths,
+    profile,
+    profilePaths,
     role: "owner",
     prompt,
     cwd: repoDir,
     resultPath,
     logPath,
     logger,
-    timeoutMs: 30 * 60 * 1000
+    timeoutMs: 30 * 60 * 1000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
   });
 }

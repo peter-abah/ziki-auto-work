@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { JobPaths, State } from "./types.js";
+import type { ProfilePaths, State } from "./types.js";
 import type { ZikiClient } from "./ziki.js";
 
 export interface MemoryContext {
@@ -14,30 +14,30 @@ export interface MemoryContext {
   fromCache?: boolean;
 }
 
-function cacheFile(jobPaths: JobPaths): string {
-  return jobPaths.memoryFile;
+function cacheFile(profilePaths: ProfilePaths): string {
+  return profilePaths.memoryFile;
 }
 
-export async function readCachedMemory(jobPaths: JobPaths): Promise<MemoryContext | null> {
-  if (!existsSync(cacheFile(jobPaths))) return null;
+export async function readCachedMemory(profilePaths: ProfilePaths): Promise<MemoryContext | null> {
+  if (!existsSync(cacheFile(profilePaths))) return null;
   try {
-    return JSON.parse(await readFile(cacheFile(jobPaths), "utf8")) as MemoryContext;
+    return JSON.parse(await readFile(cacheFile(profilePaths), "utf8")) as MemoryContext;
   } catch {
     return null;
   }
 }
 
-export async function writeCachedMemory(jobPaths: JobPaths, memory: MemoryContext): Promise<void> {
-  await mkdir(jobPaths.stateDir, { recursive: true });
-  await writeFile(cacheFile(jobPaths), `${JSON.stringify(memory, null, 2)}\n`, "utf8");
+export async function writeCachedMemory(profilePaths: ProfilePaths, memory: MemoryContext): Promise<void> {
+  await mkdir(profilePaths.stateDir, { recursive: true });
+  await writeFile(cacheFile(profilePaths), `${JSON.stringify(memory, null, 2)}\n`, "utf8");
 }
 
 export async function loadMemoryContext(
   client: ZikiClient,
-  jobPaths: JobPaths,
+  profilePaths: ProfilePaths,
   options: { maxAgeMinutes?: number; force?: boolean } = {}
 ): Promise<MemoryContext> {
-  const cached = await readCachedMemory(jobPaths);
+  const cached = await readCachedMemory(profilePaths);
   if (!options.force && cached?.loadedAt) {
     const ageMinutes = (Date.now() - new Date(cached.loadedAt).getTime()) / 60000;
     if (ageMinutes < (options.maxAgeMinutes ?? 30)) return { ...cached, fromCache: true };
@@ -63,7 +63,7 @@ export async function loadMemoryContext(
     ownNotes: (ownNotes?.items ?? []).slice(0, 50),
     mistakes: (mistakeList as Array<Record<string, unknown>>).slice(0, 50)
   };
-  await writeCachedMemory(jobPaths, memory);
+  await writeCachedMemory(profilePaths, memory);
   return { ...memory, fromCache: false };
 }
 

@@ -15,7 +15,7 @@ launching). TypeScript is dev-only.
 ## Rules
 
 - No project-specific literals in `src/`. Projects live in config; prompts live
-  in `prompts/<job>/`; PR templates live in `prompts/<job>/pr.md`.
+  in `prompts/<profile>/`; PR templates live in `prompts/<profile>/pr.md`.
 - Keep the result contract stable: every agent writes JSON to an absolute
   `resultPath`.
 - Do not add a model catalog. Use provider discovery or free text.
@@ -28,8 +28,8 @@ launching). TypeScript is dev-only.
 ## Tests
 
 - `node:test` via `npm test`.
-- Add tests for pure logic: config, migration, URLs, queue, checks, providers,
-  PR rendering.
+- Add tests for pure logic: config, keys, URLs, queue, checks, providers, PR
+  rendering.
 - Do not make tests depend on the user's real config or state. Use temp
   directories and env overrides.
 

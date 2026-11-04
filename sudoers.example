@@ -16,4 +16,4 @@
 # Deliberately NOT granted: a blanket ALL=(ALL) NOPASSWD:ALL, shells, editors,
 # rm, dd, or anything that can rewrite arbitrary files.
 
-peter ALL=(root) NOPASSWD: /usr/bin/apt-get
+YOUR_USER ALL=(root) NOPASSWD: /usr/bin/apt-get

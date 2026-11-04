@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "activeJob": "zedu-desktop",
+  "version": 3,
+  "activeProfile": "zedu-desktop",
   "defaults": {
     "executor": {
       "provider": "opencode",
@@ -16,17 +16,43 @@
       "maxActiveClaims": 2,
       "maxAttemptsPerTask": 3,
       "maxCyclesBeforeDiscovery": 6,
-      "maxOpenEscalations": 5
+      "maxOpenEscalations": 5,
+      "maxRuntimeMinutes": 120,
+      "maxCycles": null,
+      "stopAt": null,
+      "maxDeliveriesTotal": null,
+      "maxConcurrentDeliveries": 2,
+      "maxConcurrentReviews": 1,
+      "maxConcurrentAux": 2,
+      "maxConcurrentDiscovery": 1,
+      "maxConcurrentAgents": 4
     },
     "pollSeconds": 120,
     "memoryRefreshMinutes": 30,
     "hitl": {
       "enabled": true,
       "defaultType": "question",
-      "notifyCommand": null
+      "notifyCommand": null,
+      "notify": "auto"
+    },
+    "workflow": {
+      "maxFiles": 5,
+      "maxLines": 400,
+      "branchPrefix": "fix",
+      "commitTypes": [
+        "fix",
+        "feat",
+        "test",
+        "refactor",
+        "chore",
+        "docs",
+        "perf",
+        "security"
+      ],
+      "requireTests": true
     }
   },
-  "jobs": {
+  "profiles": {
     "zedu-desktop": {
       "ziki": {
         "baseUrl": "https://ziki.dev",
@@ -60,11 +86,22 @@
           "*.p8",
           "*.jks",
           "*.keystore"
-        ]
+        ],
+        "envFiles": [
+          ".env",
+          ".env.local"
+        ],
+        "requiredEnv": []
       },
       "agents": {
-        "workers": ["ZIKI_KEY2", "ZIKI_KEY4"],
-        "managers": ["ZIKI_KEY1", "ZIKI_KEY3"]
+        "workers": [
+          "ZIKI_KEY2",
+          "ZIKI_KEY4"
+        ],
+        "managers": [
+          "ZIKI_KEY1",
+          "ZIKI_KEY3"
+        ]
       },
       "toolchain": {
         "flutter": "~/sdks/flutter/bin/flutter",
@@ -76,32 +113,55 @@
         {
           "name": "deps",
           "command": "flutter",
-          "args": ["pub", "get"],
+          "args": [
+            "pub",
+            "get"
+          ],
           "timeoutMs": 600000
         },
         {
           "name": "format",
           "command": "dart",
-          "args": ["format", "--output=none", "--set-exit-if-changed"],
+          "args": [
+            "format",
+            "--output=none",
+            "--set-exit-if-changed"
+          ],
           "filesOnly": true,
-          "include": [".dart"]
+          "include": [
+            ".dart"
+          ]
         },
         {
           "name": "analyze",
           "command": "flutter",
-          "args": ["analyze", "--fatal-infos", "--fatal-warnings"]
+          "args": [
+            "analyze",
+            "--fatal-infos",
+            "--fatal-warnings"
+          ]
         },
         {
           "name": "test",
           "command": "flutter",
-          "args": ["test", "--reporter", "json"],
+          "args": [
+            "test",
+            "--reporter",
+            "json"
+          ],
           "reporter": "json",
           "baseline": true,
           "timeoutMs": 1800000
         }
       ],
       "platformMatch": {
-        "keywords": ["desktop", "flutter", "linux", "windows", "macos"]
+        "keywords": [
+          "desktop",
+          "flutter",
+          "linux",
+          "windows",
+          "macos"
+        ]
       },
       "prompts": {
         "dir": "prompts/zedu-desktop"
@@ -112,7 +172,7 @@
       },
       "discovery": {
         "enabled": true,
-        "parityFile": "DESKTOP-PARITY.md",
+        "parityFile": "examples/zedu-desktop/parity.md",
         "maxIdeasPerRun": 3,
         "maxCyclesBeforeRun": 6
       }

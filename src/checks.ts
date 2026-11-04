@@ -1,12 +1,13 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { CheckResult, CheckRunResult, CheckSpec, JobConfig } from "./types.js";
+import type { CheckResult, CheckRunResult, CheckSpec, ProfileConfig } from "./types.js";
 import { expandHome } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
+import { buildCheckEnv } from "./env.js";
 import type { Logger } from "./log.js";
 
-function resolveCommand(job: JobConfig, command: string): string {
-  const mapped = job.toolchain[command];
+export function resolveCommand(profile: ProfileConfig, command: string): string {
+  const mapped = profile.toolchain[command];
   if (mapped) {
     const expanded = expandHome(mapped);
     if (existsSync(expanded)) return expanded;
@@ -57,7 +58,7 @@ function filesFor(spec: CheckSpec, changedFiles: string[]): string[] {
 }
 
 export async function runChecks(
-  job: JobConfig,
+  profile: ProfileConfig,
   worktree: string,
   options: {
     changedFiles: string[];
@@ -68,9 +69,9 @@ export async function runChecks(
   const results: CheckResult[] = [];
   const baselineAll = options.baselineFailures ?? {};
 
-  for (const spec of job.checks) {
+  for (const spec of profile.checks) {
     const required = spec.required !== false;
-    const command = resolveCommand(job, spec.command);
+    const command = resolveCommand(profile, spec.command);
     const files = filesFor(spec, options.changedFiles);
 
     if (spec.filesOnly && !files.length) {
@@ -82,7 +83,7 @@ export async function runChecks(
     const result = await runCommand(command, args, {
       cwd: worktree,
       timeoutMs: spec.timeoutMs ?? 20 * 60 * 1000,
-      env: spec.env
+      env: buildCheckEnv(profile, spec.env)
     });
 
     let failures: string[] | undefined;
@@ -121,12 +122,10 @@ export async function runChecks(
   return { ok, results };
 }
 
-const DEFAULT_PROTECTED = [
+export const DEFAULT_PROTECTED = [
   ".github/**",
   "AGENTS.md",
   "CONTRIBUTING.md",
-  "analysis_options.yaml",
-  "scripts/**",
   ".env",
   ".env.*",
   "*.p12",

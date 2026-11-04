@@ -1,0 +1,94 @@
+import type { AgentResult, Idea, Issue, ProfileConfig, ProfilePaths, Role } from "./types.js";
+import type { Logger } from "./log.js";
+export declare function killProcessTree(pid: number | null | undefined): void;
+export declare function killActiveAgents(): void;
+export declare function activeAgentPids(): number[];
+export declare function render(template: string, vars: Record<string, unknown>): string;
+export declare function loadPrompt(profile: ProfileConfig, role: Role | "pr"): Promise<string>;
+export declare function runAgent(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    role: Role;
+    prompt: string;
+    cwd: string;
+    resultPath: string;
+    logPath: string;
+    logger?: Logger;
+    timeoutMs?: number;
+    extraEnv?: Record<string, string>;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function checksText(profile: ProfileConfig): string;
+export declare function projectName(profile: ProfileConfig): string;
+export declare function runWorker(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    worktree: string;
+    branch: string;
+    base: string;
+    previousError?: string;
+    issueContext?: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runDiscovery(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    memoryText: string;
+    repoDir: string;
+    parity: string;
+    existingIssues: string;
+    maxIdeas: number;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runReview(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    worktree: string;
+    prUrl: string;
+    headSha: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runConfirm(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    repoDir: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runTriage(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    idea: Idea;
+    memoryText: string;
+    repoDir: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runOwner(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    request: {
+        id: string;
+        body: string;
+    };
+    memoryText: string;
+    repoDir: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
