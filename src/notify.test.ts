@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProfileConfig } from "./types.js";
@@ -55,8 +55,14 @@ test("off mode sends nothing", async () => {
 test("command mode runs the configured command with AW_TITLE and AW_BODY", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "auto-work-notify-"));
   const target = path.join(dir, "out.txt");
+  const script = path.join(dir, "write-result.cjs");
   try {
-    const command = `printf '%s|%s' "$AW_TITLE" "$AW_BODY" > ${JSON.stringify(target)}`;
+    await writeFile(
+      script,
+      `require("fs").writeFileSync(${JSON.stringify(target)}, process.env.AW_TITLE + "|" + process.env.AW_BODY);\n`,
+      "utf8"
+    );
+    const command = `"${process.execPath}" "${script}"`;
     const result = await notifyProfile(
       profile({ hitl: { enabled: true, defaultType: "question", notify: "command", notifyCommand: command } }),
       "Title",
