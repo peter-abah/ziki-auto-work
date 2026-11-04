@@ -358,10 +358,15 @@ npm ci
 npm run check
 npm test
 npm run build
+npm run verify     # build + fail if dist/ is stale
 ```
 
 Node 20+. TypeScript is dev-only; the runtime dependency is `cross-spawn` for
 reliable Windows process launching.
+
+`dist/` is committed so `npm i -g github:peter-abah/ziki-auto-work` works
+without devDependencies. After changing `src/`, run `npm run build` and commit
+the updated `dist/`; CI fails if `dist/` is stale.
 
 ## License
 
