@@ -18,6 +18,7 @@ import { runChecks, scanSecrets, protectedFiles } from "./checks.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
+import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
 const TERMINAL = new Set(["resolved", "closed"]);
 function isOurAgent(ctx, name) {
@@ -74,6 +75,57 @@ function markRecent(ctx, key) {
 }
 function history(ctx, entry) {
     void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => { });
+}
+function taskUsage(ctx, issue, usage) {
+    if (!usage)
+        return;
+    ctx.state.run.tokens = addUsage(ctx.state.run.tokens, usage);
+    if (issue) {
+        const task = ctx.state.tasks[taskKey(issue)];
+        if (task)
+            task.tokens = addUsage(task.tokens ?? emptyUsage(), usage);
+    }
+    const limit = ctx.profile.limits.maxTokensPerRun ?? null;
+    const percent = usagePercent(ctx.state.run.tokens.total, limit);
+    if (limit !== null && ctx.state.run.tokens.total >= limit && !ctx.tokenLimitReached) {
+        ctx.tokenLimitReached = true;
+        ctx.logger.warn(`Token limit reached: ${formatTokens(ctx.state.run.tokens.total)}/${formatTokens(limit)}`);
+        void notifyProfile(ctx.profile, "auto-work: token limit reached", `Used ${formatTokens(ctx.state.run.tokens.total)} of ${formatTokens(limit)} tokens. The loop will stop after the current task.`, ctx.logger);
+    }
+    else if (percent !== null && percent >= (ctx.profile.limits.tokenWarnPercent ?? 80) && !ctx.tokenWarned) {
+        ctx.tokenWarned = true;
+        ctx.logger.warn(`Token warning: ${percent}% of the run budget used`);
+        void notifyProfile(ctx.profile, "auto-work: token budget warning", `${percent}% used (${formatTokens(ctx.state.run.tokens.total)}/${formatTokens(limit)}).`, ctx.logger);
+    }
+}
+async function handleProviderLimit(ctx, result) {
+    if (!result.providerLimit) {
+        ctx.rateLimitCount = 0;
+        return false;
+    }
+    if (result.providerLimit === "quota") {
+        ctx.providerLimit = "quota";
+        if (!ctx.providerLimitNotified) {
+            ctx.providerLimitNotified = true;
+            await notifyProfile(ctx.profile, "auto-work: provider quota exhausted", "The provider account has no quota/credits left. The loop will stop after the current cycle.", ctx.logger);
+        }
+        return true;
+    }
+    if (result.providerLimit === "rate-limit") {
+        const minutes = ctx.profile.limits.providerRetryMinutes ?? 15;
+        ctx.rateLimitCount += 1;
+        ctx.rateLimitUntil = Date.now() + minutes * 60 * 1000;
+        ctx.logger.warn(`Provider rate limit hit; backing off ${minutes} minutes (${ctx.rateLimitCount}/3)`);
+        if (ctx.rateLimitCount >= 3) {
+            ctx.providerLimit = "quota";
+            if (!ctx.providerLimitNotified) {
+                ctx.providerLimitNotified = true;
+                await notifyProfile(ctx.profile, "auto-work: provider rate limit repeated", "Stopping after three consecutive rate limits.", ctx.logger);
+            }
+        }
+        return true;
+    }
+    return false;
 }
 async function notifyNeedsYou(ctx) {
     const open = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open");
@@ -178,6 +230,7 @@ async function buildStatus(ctx, extra = {}) {
             status: task.status,
             pr: task.prUrl ?? null,
             agent: task.agentName ?? null,
+            tokens: task.tokens?.total ?? null,
             lastError: task.lastError ?? null,
             updatedAt: task.updatedAt
         })),
@@ -215,6 +268,12 @@ async function buildStatus(ctx, extra = {}) {
                 : Math.max(0, ctx.runLimits.maxDeliveriesTotal - ctx.state.run.deliveries),
             deliveries: ctx.state.run.deliveries,
             stopReason: ctx.state.run.stopReason
+        },
+        tokens: {
+            ...ctx.state.run.tokens,
+            limit: ctx.profile.limits.maxTokensPerRun ?? null,
+            percent: usagePercent(ctx.state.run.tokens.total, ctx.profile.limits.maxTokensPerRun ?? null),
+            warnPercent: ctx.profile.limits.tokenWarnPercent ?? 80
         },
         inFlight: {
             total: ctx.pool.total(),
@@ -396,6 +455,9 @@ async function processOwnerItem(ctx, item) {
         logger: ctx.logger,
         ...agentHooks(ctx)
     }));
+    taskUsage(ctx, null, result.tokens);
+    if (await handleProviderLimit(ctx, result))
+        return;
     if (result.ok) {
         try {
             await agent.client.completeOwnerRequest(requestId);
@@ -542,6 +604,14 @@ async function processWorkItem(ctx, item, preferredWorker) {
     finally {
         clearInterval(heartbeat);
     }
+    taskUsage(ctx, issue, result.tokens);
+    if (await handleProviderLimit(ctx, result)) {
+        await cleanupWorktree(ctx.github, dir);
+        setTask(ctx.state, issue, { status: "queued", lastError: result.error ?? "provider limit", worktree: undefined });
+        markRecent(ctx, item.key);
+        await save(ctx);
+        return;
+    }
     if (!result.ok) {
         await handleWorkFailure(ctx, issue, item, result, worker, dir);
         return;
@@ -687,10 +757,12 @@ async function handleWorkFailure(ctx, issue, item, result, worker, dir) {
     ctx.state.lastError = { at: new Date().toISOString(), issue: issue.number, error: truncate(error, 500) };
     history(ctx, { type: "failure", issue: issue.number, detail: truncate(error, 300), data: { attempts } });
     await cleanupWorktree(ctx.github, dir);
-    if (result.blocked || environmentHint) {
-        const body = environmentHint
-            ? `#${issue.number} is blocked by the environment: ${environmentHint}. ${result.blocker ?? result.summary ?? error}`
-            : `#${issue.number} needs a human: ${result.blocker ?? result.summary ?? error}`;
+    if (result.blocked || environmentHint || result.providerLimit === "context") {
+        const body = result.providerLimit === "context"
+            ? `#${issue.number} exceeded the model context window. Split the task or reduce the prompt size. ${result.error ?? ""}`.trim()
+            : environmentHint
+                ? `#${issue.number} is blocked by the environment: ${environmentHint}. ${result.blocker ?? result.summary ?? error}`
+                : `#${issue.number} needs a human: ${result.blocker ?? result.summary ?? error}`;
         const escalation = await escalate(worker.client, ctx.profile, ctx.profilePaths, ctx.state, {
             issue,
             type: "blocker",
@@ -741,6 +813,9 @@ async function ensureReady(ctx, issue) {
             logger: ctx.logger,
             ...agentHooks(ctx)
         }));
+        taskUsage(ctx, issue, result.tokens);
+        if (await handleProviderLimit(ctx, result))
+            return false;
         if (!result.ok) {
             if (result.blocked) {
                 const escalation = await escalate(confirmer.client, ctx.profile, ctx.profilePaths, ctx.state, {
@@ -911,6 +986,11 @@ async function processTestFix(ctx, item) {
     }
     finally {
         await cleanupWorktree(ctx.github, dir);
+    }
+    taskUsage(ctx, issue, result.tokens);
+    if (await handleProviderLimit(ctx, result)) {
+        markRecent(ctx, item.key);
+        return;
     }
     if (!result.ok) {
         ctx.logger.warn(`Review of #${issue.number} failed: ${result.error ?? result.blocker ?? "unknown"}`);
@@ -1218,6 +1298,11 @@ async function processIdeaVerdict(ctx, item) {
         logger: ctx.logger,
         ...agentHooks(ctx)
     }));
+    taskUsage(ctx, null, result.tokens);
+    if (await handleProviderLimit(ctx, result)) {
+        markRecent(ctx, item.key);
+        return false;
+    }
     if (!result.ok) {
         markRecent(ctx, item.key);
         return false;
@@ -1276,6 +1361,11 @@ async function processConfirm(ctx, item) {
         logger: ctx.logger,
         ...agentHooks(ctx)
     }));
+    taskUsage(ctx, issue, result.tokens);
+    if (await handleProviderLimit(ctx, result)) {
+        markRecent(ctx, item.key);
+        return false;
+    }
     if (!result.ok) {
         markRecent(ctx, item.key);
         return false;
@@ -1320,6 +1410,9 @@ async function discoveryPass(ctx) {
         logger: ctx.logger,
         ...agentHooks(ctx)
     }));
+    taskUsage(ctx, null, result.tokens);
+    if (await handleProviderLimit(ctx, result))
+        return;
     if (!result.ok) {
         ctx.logger.warn(`Discovery failed: ${result.error ?? result.blocker ?? "unknown"}`);
         return;
@@ -1526,6 +1619,8 @@ async function processReviewSafe(ctx, item) {
     }
 }
 function dispatch(ctx) {
+    if (ctx.providerLimit || ctx.tokenLimitReached || Date.now() < ctx.rateLimitUntil)
+        return;
     const limits = ctx.profile.limits;
     const pool = ctx.pool;
     ctx.auxThisCycle = 0;
@@ -1639,7 +1734,13 @@ async function createContext(loaded, state, logger, options) {
         auxThisCycle: 0,
         reservedAgents: new Set(),
         cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 },
-        lastNeedsYouCount: null
+        lastNeedsYouCount: null,
+        tokenWarned: false,
+        tokenLimitReached: false,
+        providerLimit: null,
+        providerLimitNotified: false,
+        rateLimitUntil: 0,
+        rateLimitCount: 0
     };
 }
 async function readRunLimitsFile(profilePaths) {
@@ -1758,7 +1859,8 @@ export async function runLoop(options = {}) {
         mergeReviews: 0,
         discoveries: 0,
         aux: 0,
-        failures: 0
+        failures: 0,
+        tokens: emptyUsage()
     };
     state.lastRun = buildRunSummary({
         state,
@@ -1832,9 +1934,25 @@ export async function runLoop(options = {}) {
                     break;
                 }
             }
+            if (ctx.tokenLimitReached) {
+                stopReason = "token-limit";
+                logger.info("Run token budget reached", { tokens: ctx.state.run.tokens.total });
+                await ctx.pool.drain(120_000);
+                break;
+            }
+            if (ctx.providerLimit) {
+                stopReason = "provider-limit";
+                logger.info("Provider limit reached; stopping");
+                await ctx.pool.drain(120_000);
+                break;
+            }
             if (options.once) {
                 await ctx.pool.drain(120_000);
                 break;
+            }
+            if (ctx.rateLimitUntil > Date.now()) {
+                await sleep(ctx.rateLimitUntil - Date.now(), controller.signal);
+                continue;
             }
             const reason = limitReached(ctx);
             if (reason) {

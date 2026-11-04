@@ -34,7 +34,8 @@ import {
 import { loadState, readHistory, readPid } from "./state.js";
 import { clientForAgent } from "./ziki.js";
 import { escalationUrl } from "./urls.js";
-import { getProvider } from "./providers/index.js";
+import { BUILTIN_PROVIDERS, getProvider, listProviderIds, SHORTLIST_PROVIDER_IDS } from "./providers/index.js";
+import { SHORTLIST_SPECS } from "./providers/specs.js";
 import {
   assignRoles,
   formatKeyTable,
@@ -46,6 +47,7 @@ import {
 import { runUninstall } from "./uninstall.js";
 import { GitHub } from "./github.js";
 import { formatRunSummary } from "./run-report.js";
+import { formatTokens } from "./usage.js";
 import {
   detectedStackAt,
   ensureFork,
@@ -74,6 +76,7 @@ Usage:
   auto-work uninstall [--dry-run] [--keep-data] [--yes]
   auto-work detect [--json]
   auto-work models [--provider <p>] [--profile <name>] [--json]
+  auto-work providers [--check]
   auto-work profiles
   auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
                   [--max-runtime 2h] [--max-cycles N] [--until ISO] [--max-deliveries N] [--forever]
@@ -345,9 +348,13 @@ function detectedStack(): string {
 
 async function detectedProviders(): Promise<ProviderName[]> {
   const found: ProviderName[] = [];
-  for (const provider of ["opencode", "claude", "codex", "gemini"] as ProviderName[]) {
+  const candidates = [
+    ...BUILTIN_PROVIDERS.filter((provider) => provider !== "custom"),
+    ...Object.values(SHORTLIST_SPECS).map((spec) => spec.command)
+  ];
+  for (const provider of candidates) {
     const result = await runCommand(provider, ["--version"], { timeoutMs: 10_000 });
-    if (result.ok) found.push(provider);
+    if (result.ok && !found.includes(provider)) found.push(provider);
   }
   return found;
 }
@@ -933,7 +940,8 @@ async function models(flags: Flags): Promise<void> {
     loaded = null;
   }
   const providerName = (str(flags, "provider") as ProviderName) || loaded?.profile.executor.provider || "opencode";
-  if (!PROVIDERS.includes(providerName)) throw new Error(`Unknown provider "${providerName}"`);
+  const providerIds = loaded ? listProviderIds(loaded.profile) : PROVIDERS;
+  if (!providerIds.includes(providerName)) throw new Error(`Unknown provider "${providerName}"`);
   const profile = loaded?.profile ?? baseProfile({ executor: { provider: providerName } });
   const provider = getProvider(providerName, { ...profile, executor: { ...profile.executor, provider: providerName } });
   const result = await provider.models(profile);
@@ -948,6 +956,32 @@ async function models(flags: Flags): Promise<void> {
     console.log("  (no list available; pass a model name as free text)");
   }
   if (result.note) console.log(`\n${result.note}`);
+}
+
+async function providersCommand(flags: Flags): Promise<void> {
+  let loaded: Awaited<ReturnType<typeof loadProfile>> | null = null;
+  try {
+    loaded = await loadProfile(str(flags, "profile"));
+  } catch {
+    loaded = null;
+  }
+  const ids = listProviderIds(loaded?.profile);
+  for (const id of ids) {
+    const spec = loaded?.profile.providers?.[id] ?? SHORTLIST_SPECS[id];
+    let status = "";
+    if (flags.check) {
+      try {
+        const provider = getProvider(id, loaded?.profile ?? baseProfile({ executor: { provider: id } }));
+        const doctor = await provider.doctor(loaded?.profile ?? baseProfile({ executor: { provider: id } }));
+        status = doctor.ok ? "installed" : `missing (${doctor.detail.split("\n")[0]})`;
+      } catch (error) {
+        status = error instanceof Error ? error.message : String(error);
+      }
+    }
+    const label = spec?.label ?? id;
+    const kind = spec?.experimental ? " experimental" : "";
+    console.log(`${id.padEnd(14)} ${label}${kind}${status ? ` — ${status}` : ""}`);
+  }
 }
 
 async function profiles(): Promise<void> {
@@ -1042,10 +1076,13 @@ function statusLine(name: string, result: Awaited<ReturnType<typeof statusServic
   const inflight = status.inFlight?.total ?? 0;
   const queue = status.queue ? Object.values(status.queue as Record<string, number>).reduce((sum, value) => sum + Number(value || 0), 0) : 0;
   const last = status.lastCycleMs != null ? formatDuration(status.lastCycleMs) : "-";
+  const tokenText = status.tokens
+    ? ` | tokens ${formatTokens(status.tokens.total)}${status.tokens.limit ? `/${formatTokens(status.tokens.limit)} (${status.tokens.percent ?? 0}%)` : ""}`
+    : "";
   const lastRun = status.lastRun
     ? ` | last run: ${status.lastRun.cycles}c/${status.lastRun.deliveries}d${status.lastRun.clean ? "" : " (incomplete)"}`
     : "";
-  return `${name} | ${state} | ${spent}/${limit} | Ziki needs you: ${needs} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}`;
+  return `${name} | ${state} | ${spent}/${limit} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}`;
 }
 
 async function status(flags: Flags): Promise<void> {
@@ -1099,6 +1136,13 @@ function printDetailedStatusWithFlags(
     }
   }
   console.log(`  counters: ${JSON.stringify(status.counters ?? {})}`);
+  if (status.tokens) {
+    console.log(
+      `  tokens: ${status.tokens.total?.toLocaleString?.() ?? status.tokens.total} (${status.tokens.input} in / ${status.tokens.output} out)` +
+        `${status.tokens.limit ? ` · ${status.tokens.percent ?? 0}% of ${status.tokens.limit.toLocaleString()}` : ""}` +
+        `${status.tokens.estimated ? " · estimated" : ""}`
+    );
+  }
   const needs = status.needsYou?.count ?? 0;
   console.log(`  Ziki needs you: ${needs}${needs ? ` → ${status.needsYou?.link}` : ""}`);
   if (status.inFlight) {
@@ -1128,7 +1172,7 @@ function printDetailedStatusWithFlags(
     console.log(`  tasks (${taskList.length}):`);
     for (const task of taskList) {
       console.log(
-        `    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`
+        `    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.tokens != null ? ` · ${formatTokens(Number(task.tokens))} tokens` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`
       );
     }
     const inFlight = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined) ?? [];
@@ -1201,6 +1245,7 @@ async function report(flags: Flags): Promise<void> {
     prsTouched: [...prs],
     stopReason: status?.run?.stopReason ?? state.run.stopReason ?? state.lastRun?.stopReason ?? null,
     limits: status?.run?.limits ?? state.run.limits ?? null,
+    tokens: status?.tokens ?? state.run.tokens ?? state.lastRun?.tokens ?? null,
     lastCycle: status?.lastCycle ?? state.lastCycle ?? null
   };
   if (flags.json) {
@@ -1222,6 +1267,9 @@ async function report(flags: Flags): Promise<void> {
   const daily = state.counters[today] ?? { deliveries: 0, reviews: 0, discoveries: 0, aux: 0, errors: 0 };
   console.log(
     `  today: ${daily.deliveries} deliveries · ${daily.reviews} reviews · ${daily.discoveries} discoveries · ${daily.aux} aux · ${daily.errors} errors`
+  );
+  console.log(
+    `  tokens: ${data.tokens?.total ?? 0} (${data.tokens?.input ?? 0} in / ${data.tokens?.output ?? 0} out)`
   );
   console.log(`  history: ${JSON.stringify(counts)}`);
   console.log(`  failures: ${counts.failure ?? 0}`);
@@ -1457,6 +1505,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break;
     case "models":
       await models(flags);
+      break;
+    case "providers":
+      await providersCommand(flags);
       break;
     case "profiles":
       await profiles();

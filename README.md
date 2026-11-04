@@ -172,7 +172,9 @@ auto-work history [--profile <name>] [--limit 50]
   in-flight counts. `--verbose` lists tasks with issue, status, PR, and last
   error.
 - `report` aggregates cycles, deliveries, reviews, discoveries, auxiliary work,
-  failures, open escalations, issues/PRs touched, and the stop reason.
+  failures, open escalations, issues/PRs touched, tokens and the stop reason.
+- `status --line` includes `tokens used/limit (percent)` when a token budget is
+  configured.
 - `history` reads `history.jsonl` for claims, bids, awards, acceptances,
   deliveries, reviews, merge reviews, discoveries, auxiliary work, escalations,
   and failures.
@@ -240,6 +242,12 @@ uses a stronger one:
 | Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -C <cwd> <prompt>` |
 | Gemini CLI | `gemini -p <prompt> --yolo --skip-trust` |
 | custom | your command + `{{prompt}}` / `{{cwd}}` / `{{resultPath}}` / `{{model}}` |
+| registry | any headless CLI via `providers` in the config |
+| experimental | Aider, Goose, Copilot CLI, Cursor Agent, Qwen Code, Amp |
+
+`auto-work providers` lists built-ins, the experimental shortlist and custom
+providers. `auto-work providers --check` runs each version check. IDE-only
+tools need a CLI/headless mode; otherwise they are unsupported.
 
 See [`docs/providers.md`](./docs/providers.md) for auth, models, safe modes and
 cost notes.
@@ -280,6 +288,11 @@ It writes `LAST-RUN.json` and `LAST-RUN.md` to the profile state directory. If
 the process was killed abruptly, the next start (or `auto-work report`) shows
 the last saved state and marks the run incomplete.
 
+Token usage is reported where the provider exposes it, with optional regex or
+estimated fallback. `limits.maxTokensPerRun` and `tokenWarnPercent` warn and stop
+after the current task (`stopReason: "token-limit"`). A hard provider quota
+stops with `provider-limit`; rate limits back off and retry.
+
 ## Checks and safety
 
 - Per-profile `checks[]`: commands, `filesOnly`, `include`, `reporter: "json"`,
@@ -314,6 +327,7 @@ auto-work keys check
 auto-work uninstall [--dry-run] [--keep-data] [--yes]
 auto-work detect [--json]
 auto-work models [--provider <p>] [--profile <name>] [--json]
+auto-work providers [--check]
 auto-work profiles
 auto-work doctor [--profile <name>] [--json]
 auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]

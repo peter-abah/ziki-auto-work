@@ -61,6 +61,13 @@
 - Branch policy: `dev` is the development/push branch; `main` is release-only
   and the repository default. Do not commit to `main`; promote tested work with
   a `dev` → `main` squash PR.
+- Provider registry: config-defined provider specs, `resultMode: "file"|"stdout"`,
+  experimental shortlist (Aider, Goose, Copilot CLI, Cursor Agent, Qwen Code,
+  Amp), and `auto-work providers [--check]`.
+- Token tracking: provider JSON/JSONL usage parsing, regex/estimate fallback,
+  `maxTokensPerRun`/`tokenWarnPercent`, token fields in status/report/LAST-RUN.
+- Provider limits: hard quota stops with `provider-limit`; 429/rate limits back
+  off and retry; context-window overflow escalates the task.
 - Audit fixes: host-aware `gh` git protocol, packaged `install.ps1`/`install.sh`,
   PATH diagnostics, macOS launchd `PATH`, Windows toast notifications,
   `taskkill /T /F` process-tree shutdown, Windows `core.longpaths`, and a

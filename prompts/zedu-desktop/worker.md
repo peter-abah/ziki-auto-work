@@ -83,7 +83,7 @@ Do not hardcode a local Flutter path.
 
 ## What to write
 
-Write **valid JSON** to `{{resultPath}}`:
+{{resultInstruction}}
 
 ```json
 {

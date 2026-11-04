@@ -14,7 +14,7 @@ opencode models            # real model IDs
 Command built by auto-work:
 
 ```bash
-opencode run --auto --format default --dir <cwd> <prompt>
+opencode run --auto --format json --dir <cwd> <prompt>
 ```
 
 - `--auto` auto-approves tool permissions.
@@ -32,7 +32,7 @@ claude          # authenticate once
 Command:
 
 ```bash
-claude -p <prompt> --dangerously-skip-permissions [--model <model>]
+claude -p --output-format json <prompt> --dangerously-skip-permissions [--model <model>]
 ```
 
 - `--model` accepts aliases (`sonnet`, `opus`, `haiku`) or full names.
@@ -51,7 +51,7 @@ codex --version
 Command:
 
 ```bash
-codex exec --dangerously-bypass-approvals-and-sandbox -C <cwd> [ -m <model> ] <prompt>
+codex exec --json --dangerously-bypass-approvals-and-sandbox -C <cwd> [ -m <model> ] <prompt>
 ```
 
 - `permissionMode: "safe"` uses `-s workspace-write`.
@@ -67,31 +67,60 @@ gemini --version
 Command:
 
 ```bash
-gemini -p <prompt> --yolo --skip-trust [ -m <model> ]
+gemini -p --output-format json <prompt> --yolo --skip-trust [ -m <model> ]
 ```
 
 - `permissionMode: "safe"` uses `--approval-mode auto_edit`.
 - Gemini has no model-list command; pass a model name or leave it blank for the
   provider default.
 
-## custom
+## Config-defined providers
+
+Any headless CLI can be added without changing auto-work:
 
 ```json
-"executor": {
-  "provider": "custom",
-  "command": "my-agent",
-  "args": ["run", "--prompt", "{{prompt}}", "--cwd", "{{cwd}}"],
-  "promptMode": "arg"
+"providers": {
+  "my-tool": {
+    "id": "my-tool",
+    "command": "my-tool",
+    "args": ["run", "--yes", "--prompt", "{{prompt}}"],
+    "promptMode": "arg",
+    "resultMode": "file",
+    "autoArgs": [],
+    "safeArgs": [],
+    "usage": { "regex": { "input": "input (\d+)", "output": "output (\d+)" } }
+  }
 }
 ```
+
+`executor.provider` can be any built-in or custom id. `auto-work providers`
+lists them; `auto-work providers --check` runs each provider's version check.
 
 Placeholders: `{{prompt}}`, `{{cwd}}`, `{{resultPath}}`, `{{model}}`.
 
 - `promptMode: "arg"` appends the prompt if no `{{prompt}}` placeholder exists.
 - `promptMode: "stdin"` pipes the prompt to stdin instead.
+- `resultMode: "file"` expects the agent to write `{{resultPath}}`.
+- `resultMode: "stdout"` captures the final JSON object from stdout.
 
-Your command must write the result JSON to `{{resultPath}}` (the prompt includes
-the absolute path).
+## Built-in shortlist (experimental)
+
+The registry also includes experimental specs for Aider, Goose, GitHub Copilot
+CLI, Cursor Agent, Qwen Code and Amp. Flags change between versions; run
+`auto-work providers --check` and verify the command before relying on one.
+IDE-only tools (Windsurf, Cline, Roo) need a CLI/headless mode and are otherwise
+unsupported.
+
+## Usage and quota
+
+Provider JSON output is parsed for token usage where available. If a provider
+has no usage data, `executor.usage.regex` or `executor.usage.estimate: true` can
+supply a fallback; estimates are marked.
+
+At `limits.maxTokensPerRun`, auto-work warns at `tokenWarnPercent` and stops
+after the current task with `stopReason: "token-limit"`. A hard provider
+quota/credit error stops with `provider-limit`; a 429-backed off and retries,
+stopping after three consecutive rate limits.
 
 ## Models and cost
 

@@ -25,7 +25,10 @@
       "maxConcurrentReviews": 1,
       "maxConcurrentAux": 2,
       "maxConcurrentDiscovery": 1,
-      "maxConcurrentAgents": 4
+      "maxConcurrentAgents": 4,
+      "maxTokensPerRun": null,
+      "tokenWarnPercent": 80,
+      "providerRetryMinutes": 15
     },
     "pollSeconds": 120,
     "memoryRefreshMinutes": 30,

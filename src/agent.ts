@@ -10,6 +10,8 @@ import { killProcessTree } from "./platform/process.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { resolveCommand } from "./checks.js";
 import { buildAgentEnv } from "./env.js";
+import { classifyProviderLimit } from "./provider-errors.js";
+import { parseUsage } from "./usage.js";
 import {
   formatPrFieldMap,
   formatProtectedFiles,
@@ -57,6 +59,29 @@ function resultPaths(profilePaths: ProfilePaths, kind: string, label: string | n
   };
 }
 
+function extractJsonResult(text: string): AgentResult | null {
+  const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1] ?? "").reverse();
+  const candidates = [...fenced];
+  for (let index = text.lastIndexOf("{"); index >= 0; index = text.lastIndexOf("{", index - 1)) {
+    candidates.push(text.slice(index));
+    if (candidates.length > 300) break;
+  }
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim();
+    const end = trimmed.lastIndexOf("}");
+    if (end < 0) continue;
+    try {
+      const parsed = JSON.parse(trimmed.slice(0, end + 1)) as AgentResult;
+      if (parsed && typeof parsed === "object" && ("ok" in parsed || "blocked" in parsed || "summary" in parsed)) {
+        return parsed;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
 export async function runAgent(options: {
   profile: ProfileConfig;
   profilePaths: ProfilePaths;
@@ -74,6 +99,7 @@ export async function runAgent(options: {
   const { profile, profilePaths, role, prompt, cwd, resultPath, logPath, logger } = options;
   const model = resolveModel(profile, role);
   const provider = getProvider(profile.executor.provider, profile);
+  const resultMode = provider.resultMode ?? "file";
   const command = provider.build({ prompt, cwd, resultPath, model });
   const limit = options.timeoutMs ?? profile.executor.timeoutMs ?? 45 * 60 * 1000;
 
@@ -130,39 +156,58 @@ export async function runAgent(options: {
   stream.end();
 
   if (timedOut) {
-    return { ok: false, error: `agent timed out after ${Math.round(limit / 60000)} min`, logPath, tail: truncate(tail, 2000) };
+    return {
+      ok: false,
+      error: `agent timed out after ${Math.round(limit / 60000)} min`,
+      logPath,
+      tail: truncate(tail, 2000),
+      tokens: provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined,
+      providerLimit: classifyProviderLimit(tail)
+    };
   }
   if (exit.error) {
     return { ok: false, error: `agent failed to start: ${exit.error.message}`, logPath, tail: truncate(tail, 2000) };
   }
-  if (!existsSync(resultPath)) {
+  let parsed: AgentResult | null = null;
+  if (existsSync(resultPath)) {
+    try {
+      parsed = JSON.parse(await readFile(resultPath, "utf8")) as AgentResult;
+    } catch (error) {
+      return {
+        ok: false,
+        error: `result is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        logPath,
+        tail: truncate(tail, 2000),
+        tokens: provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined,
+        providerLimit: classifyProviderLimit(`${error instanceof Error ? error.message : String(error)}\n${tail}`)
+      };
+    }
+  } else if (resultMode === "stdout") {
+    parsed = extractJsonResult(tail);
+  }
+
+  if (!parsed) {
     return {
       ok: false,
       error: `agent exited (${exit.code}) without writing ${resultPath}`,
       logPath,
-      tail: truncate(tail, 3000)
+      tail: truncate(tail, 3000),
+      tokens: provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined,
+      providerLimit: classifyProviderLimit(tail)
     };
   }
 
-  let parsed: AgentResult;
-  try {
-    parsed = JSON.parse(await readFile(resultPath, "utf8")) as AgentResult;
-  } catch (error) {
-    return {
-      ok: false,
-      error: `result is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-      logPath,
-      tail: truncate(tail, 2000)
-    };
-  }
-
+  const tokens = parsed.tokens ?? provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined;
   return {
     ...parsed,
     ok: parsed.ok === true && parsed.blocked !== true,
     blocked: parsed.blocked === true,
     exitCode: exit.code,
     logPath,
-    tail: truncate(tail, 3000)
+    tail: truncate(tail, 3000),
+    tokens,
+    providerLimit:
+      parsed.providerLimit ?? classifyProviderLimit(`${parsed.error ?? ""}\n${parsed.blocker ?? ""}\n${tail}`)
   };
 }
 
@@ -199,6 +244,10 @@ export async function runWorker(options: {
   const template = await loadPrompt(profile, "worker");
   const workflowRules = formatWorkflowRules(profile, { branch });
   const prTemplate = await loadPrTemplateText(profile);
+  const resultInstruction =
+    (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`;
   const prompt = render(template, {
     projectName: projectName(profile),
     stack: profile.stack || profile.ziki.platform,
@@ -229,6 +278,7 @@ export async function runWorker(options: {
     commitTypes: profile.workflow.commitTypes.join(", "),
     prTemplate,
     prFieldMap: formatPrFieldMap(),
+    resultInstruction,
     worktree,
     branch,
     resultPath,
@@ -264,7 +314,10 @@ export async function runDiscovery(options: {
     memory: memoryText,
     checks: checksText(profile),
     resultPath,
-    logPath
+    logPath,
+    resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`
   });
   return runAgent({
     profile,
@@ -314,7 +367,10 @@ export async function runReview(options: {
     prUrl,
     headSha,
     resultPath,
-    logPath
+    logPath,
+    resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`
   });
   return runAgent({ profile, profilePaths, role: "review", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
@@ -348,7 +404,10 @@ export async function runConfirm(options: {
     workflowRules: formatWorkflowRules(profile),
     protectedFiles: formatProtectedFiles(profile),
     resultPath,
-    logPath
+    logPath,
+    resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`
   });
   return runAgent({ profile, profilePaths, role: "confirm", prompt, cwd: repoDir, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
@@ -382,7 +441,10 @@ export async function runTriage(options: {
     workflowRules: formatWorkflowRules(profile),
     protectedFiles: formatProtectedFiles(profile),
     resultPath,
-    logPath
+    logPath,
+    resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`
   });
   return runAgent({
     profile,
@@ -421,7 +483,10 @@ export async function runOwner(options: {
     memory: memoryText,
     checks: checksText(profile),
     resultPath,
-    logPath
+    logPath,
+    resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`
   });
   return runAgent({
     profile,
