@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import type { ProfileConfig, ProfilePaths, RunSummary, State, StopReason } from "./types.js";
 import { inboxUrl } from "./urls.js";
+import { emptyUsage } from "./usage.js";
 
 export function buildRunSummary(options: {
   state: State;
@@ -45,6 +46,7 @@ export function buildRunSummary(options: {
     needsYou: open.length,
     needsYouLink: inboxUrl(profile),
     issues: touched,
+    tokens: state.run.tokens ?? emptyUsage(),
     lastActivityAt
   };
 }
@@ -71,6 +73,10 @@ export function formatRunSummary(summary: RunSummary, options: { files?: boolean
   lines.push(`Discoveries:   ${summary.discoveries}`);
   lines.push(`Aux:           ${summary.aux}`);
   lines.push(`Failures:      ${summary.failures}`);
+  const tokens = summary.tokens ?? { input: 0, output: 0, total: 0 };
+  lines.push(
+    `Tokens:        ${tokens.total.toLocaleString()} (${tokens.input.toLocaleString()} in / ${tokens.output.toLocaleString()} out)${tokens.estimated ? " estimated" : ""}${tokens.costUsd !== undefined ? ` · $${tokens.costUsd.toFixed(4)}` : ""}`
+  );
   lines.push(`Interrupted:   ${summary.interrupted}`);
 
   const deliveries = summary.issues.filter((issue) => issue.status === "delivered");

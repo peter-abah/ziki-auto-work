@@ -231,7 +231,7 @@ test("providers build the right commands", () => {
     const input = { prompt: "PROMPT", cwd: "/work", resultPath: "/result.json", model: "model-x" };
     const opencode = getProvider("opencode", fixtureProfile()).build(input);
     assert.equal(opencode.command, "opencode");
-    assert.deepEqual(opencode.args.slice(0, 5), ["run", "--auto", "--format", "default", "--dir"]);
+    assert.deepEqual(opencode.args.slice(0, 5), ["run", "--auto", "--format", "json", "--dir"]);
     assert.ok(opencode.args.includes("/work"));
     assert.ok(opencode.args.includes("PROMPT"));
     const claude = getProvider("claude", fixtureProfile({ executor: { provider: "claude" } })).build(input);
@@ -269,6 +269,9 @@ test("run limits and concurrency have working defaults", () => {
     assert.equal(DEFAULT_LIMITS.maxConcurrentReviews, 1);
     assert.equal(DEFAULT_LIMITS.maxConcurrentAux, 2);
     assert.equal(DEFAULT_LIMITS.maxConcurrentAgents, 4);
+    assert.equal(DEFAULT_LIMITS.maxTokensPerRun, null);
+    assert.equal(DEFAULT_LIMITS.tokenWarnPercent, 80);
+    assert.equal(DEFAULT_LIMITS.providerRetryMinutes, 15);
     assert.equal(defaultConfig().doctor?.minFreeGb, 3);
 });
 test("validateConfig allows working-only profiles and warns", () => {

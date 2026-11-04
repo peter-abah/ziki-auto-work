@@ -253,6 +253,11 @@ Tell the user:
 - **Gemini CLI**: `-m` takes a free-text model; `--yolo` is used in auto mode.
 - **custom**: set `executor.command` and `executor.args` with `{{prompt}}`,
   `{{cwd}}`, `{{resultPath}}`, and `{{model}}`.
+- **config-defined**: add a `providers` entry and reference its id from
+  `executor.provider`; `resultMode: "stdout"` is available for CLIs that cannot
+  write the result file.
+- **experimental shortlist**: Aider, Goose, Copilot CLI, Cursor Agent, Qwen Code,
+  Amp. Verify flags with `auto-work providers --check`.
 
 ## Windows
 

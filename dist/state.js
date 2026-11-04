@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { mutexFor } from "./mutex.js";
+import { emptyUsage } from "./usage.js";
 export function emptyState() {
     return {
         version: 1,
@@ -30,7 +31,8 @@ export function emptyState() {
             mergeReviews: 0,
             discoveries: 0,
             aux: 0,
-            failures: 0
+            failures: 0,
+            tokens: emptyUsage()
         },
         lastCycle: null,
         lastRun: null,
@@ -45,7 +47,8 @@ export async function loadState(profilePaths) {
         return emptyState();
     try {
         const parsed = JSON.parse(await readFile(profilePaths.stateFile, "utf8"));
-        return { ...emptyState(), ...parsed };
+        const base = emptyState();
+        return { ...base, ...parsed, run: { ...base.run, ...(parsed.run ?? {}) } };
     }
     catch {
         return emptyState();

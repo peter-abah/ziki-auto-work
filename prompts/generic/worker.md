@@ -75,7 +75,7 @@ You are a senior engineer working autonomously on **{{projectName}}**
 
 ## What to write
 
-Write **valid JSON** to `{{resultPath}}`:
+{{resultInstruction}}
 
 ```json
 {
@@ -113,5 +113,5 @@ If blocked:
 }
 ```
 
-The result file is the only thing the orchestrator reads. Write it even when
+The JSON result is the only thing the orchestrator reads. Produce it even when
 you fail. Do not wrap it in Markdown.

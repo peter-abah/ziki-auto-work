@@ -1,4 +1,4 @@
-export type ProviderName = "opencode" | "claude" | "codex" | "gemini" | "custom";
+export type ProviderName = string;
 export type Role = "worker" | "review" | "triage" | "confirm" | "discovery" | "owner";
 export type EscalationType =
   | "question"
@@ -48,12 +48,40 @@ export interface AgentsConfig {
   managers: string[];
 }
 
+export interface ProviderUsageConfig {
+  estimate?: boolean;
+  regex?: {
+    input?: string;
+    output?: string;
+    total?: string;
+    cost?: string;
+  };
+}
+
+export interface ProviderSpec {
+  id: string;
+  label?: string;
+  command: string;
+  args: string[];
+  promptMode?: "arg" | "stdin";
+  resultMode?: "file" | "stdout";
+  autoArgs?: string[];
+  safeArgs?: string[];
+  modelArgs?: string[];
+  models?: string[];
+  doctorArgs?: string[];
+  usage?: ProviderUsageConfig;
+  env?: Record<string, string>;
+  experimental?: boolean;
+}
+
 export interface ExecutorConfig {
   provider: ProviderName;
   model?: string | null;
   models?: Partial<Record<Role, string | null>>;
   extraArgs?: string[];
   env?: Record<string, string>;
+  usage?: ProviderUsageConfig;
   timeoutMs?: number;
   permissionMode?: "auto" | "safe";
   /** Only for provider "custom". */
@@ -113,6 +141,9 @@ export interface LimitsConfig {
   maxConcurrentAux?: number;
   maxConcurrentDiscovery?: number;
   maxConcurrentAgents?: number;
+  maxTokensPerRun?: number | null;
+  tokenWarnPercent?: number;
+  providerRetryMinutes?: number;
 }
 
 export interface RunLimitConfig {
@@ -122,7 +153,27 @@ export interface RunLimitConfig {
   maxDeliveriesTotal: number | null;
 }
 
-export type StopReason = "max-runtime" | "max-cycles" | "until" | "max-deliveries" | "stop" | "error" | null;
+export type StopReason =
+  | "max-runtime"
+  | "max-cycles"
+  | "until"
+  | "max-deliveries"
+  | "token-limit"
+  | "provider-limit"
+  | "stop"
+  | "error"
+  | null;
+
+export interface TokenUsage {
+  input: number;
+  output: number;
+  total: number;
+  cached?: number;
+  costUsd?: number;
+  estimated?: boolean;
+}
+
+export type ProviderLimit = "quota" | "rate-limit" | "context" | null;
 
 export interface RunState {
   startedAt: string | null;
@@ -134,6 +185,7 @@ export interface RunState {
   discoveries: number;
   aux: number;
   failures: number;
+  tokens: TokenUsage;
 }
 
 export interface RunSummary {
@@ -154,6 +206,7 @@ export interface RunSummary {
   needsYouLink: string | null;
   issues: Array<{ number: number | string; title?: string | null; status: string; pr?: string | null }>;
   lastActivityAt: string | null;
+  tokens: TokenUsage;
 }
 
 export interface LastCycleSummary {
@@ -186,6 +239,7 @@ export interface ProfileConfig {
   platformMatch: PlatformMatchConfig;
   prompts: PromptsConfig;
   pr: PrConfig;
+  providers?: Record<string, ProviderSpec>;
   discovery: DiscoveryConfig;
   workflow: WorkflowConfig;
   limits: LimitsConfig;
@@ -203,6 +257,7 @@ export interface Config {
   activeProfile: string;
   defaults?: Partial<ProfileConfig>;
   profiles: Record<string, ProfileConfig>;
+  providers?: Record<string, ProviderSpec>;
   doctor?: DoctorConfig;
 }
 
@@ -456,6 +511,7 @@ export interface TaskState {
   deliveredAt?: string;
   lastHeartbeatAt?: string;
   lastError?: string | null;
+  tokens?: TokenUsage;
   escalationId?: string | null;
   escalationAnswer?: string | null;
   escalationResolvedAt?: string | null;
@@ -566,6 +622,8 @@ export interface AgentResult {
   headSha?: string;
   duplicateOfId?: string | number | null;
   actions?: string[];
+  tokens?: TokenUsage;
+  providerLimit?: ProviderLimit;
 }
 
 export interface CheckResult {
@@ -591,6 +649,8 @@ export interface ProviderCommand {
 
 export interface ProviderAdapter {
   name: ProviderName;
+  resultMode?: "file" | "stdout";
+  parseUsage?: (text: string) => TokenUsage | null;
   build(input: {
     prompt: string;
     cwd: string;

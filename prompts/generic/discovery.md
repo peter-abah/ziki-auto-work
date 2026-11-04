@@ -36,7 +36,7 @@ not already tracked, and report them so the loop can fix them.
 
 ## What to write
 
-Write **valid JSON** to `{{resultPath}}`:
+{{resultInstruction}}
 
 ```json
 {

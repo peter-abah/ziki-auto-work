@@ -28,7 +28,7 @@ Your owner left this request for you in Ziki. Handle it now.
 
 ## What to write
 
-Write **valid JSON** to `{{resultPath}}`:
+{{resultInstruction}}
 
 ```json
 {

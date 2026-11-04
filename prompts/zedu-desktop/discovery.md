@@ -46,7 +46,7 @@ web app (`zeduchat/zedu-fe`) and work correctly on every desktop platform.
 
 ## What to write
 
-Write **valid JSON** to `{{resultPath}}`:
+{{resultInstruction}}
 
 ```json
 {

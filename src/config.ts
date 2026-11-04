@@ -15,8 +15,9 @@ import type {
   WorkflowConfig
 } from "./types.js";
 import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
+import { PROVIDER_IDS } from "./providers/index.js";
 
-export const PROVIDERS: ProviderName[] = ["opencode", "claude", "codex", "gemini", "custom"];
+export const PROVIDERS: ProviderName[] = PROVIDER_IDS;
 
 export const DEFAULT_LIMITS: LimitsConfig = {
   maxDeliveriesPerDay: 10,
@@ -35,7 +36,10 @@ export const DEFAULT_LIMITS: LimitsConfig = {
   maxConcurrentReviews: 1,
   maxConcurrentAux: 2,
   maxConcurrentDiscovery: 1,
-  maxConcurrentAgents: 4
+  maxConcurrentAgents: 4,
+  maxTokensPerRun: null,
+  tokenWarnPercent: 80,
+  providerRetryMinutes: 15
 };
 
 export const DEFAULT_RUN_LIMITS = {
@@ -193,6 +197,19 @@ export function validateConfig(config: Config): ValidationResult {
     errors.push(`activeProfile "${config.activeProfile}" does not exist in profiles`);
   }
 
+  for (const [name, raw] of Object.entries(config.providers ?? {})) {
+    const prefix = `providers.${name}`;
+    if (!raw || typeof raw !== "object") {
+      errors.push(`${prefix} must be an object`);
+      continue;
+    }
+    requireString(raw.command, `${prefix}.command`, errors);
+    if (!Array.isArray(raw.args)) errors.push(`${prefix}.args must be an array`);
+    if (raw.resultMode !== undefined && !["file", "stdout"].includes(raw.resultMode)) {
+      errors.push(`${prefix}.resultMode must be "file" or "stdout"`);
+    }
+  }
+
   for (const [name, rawProfile] of Object.entries(config.profiles ?? {})) {
     const prefix = `profiles.${name}`;
     const profile = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
@@ -220,8 +237,13 @@ export function validateConfig(config: Config): ValidationResult {
     if (Array.isArray(workers) && workers.length === 0 && Array.isArray(managers) && managers.length > 0) {
       warnings.push(`${prefix}.agents.workers is empty; manager keys will also do working tasks`);
     }
-    if (!PROVIDERS.includes(profile?.executor?.provider)) {
-      errors.push(`${prefix}.executor.provider must be one of ${PROVIDERS.join(", ")}`);
+    const providerIds = new Set([
+      ...PROVIDERS,
+      ...Object.keys(config.providers ?? {}),
+      ...Object.keys(profile?.providers ?? {})
+    ]);
+    if (!providerIds.has(profile?.executor?.provider)) {
+      errors.push(`${prefix}.executor.provider must be one of ${[...providerIds].join(", ")}`);
     }
     if (profile?.executor?.provider === "custom") {
       requireString(profile?.executor?.command, `${prefix}.executor.command`, errors);
@@ -326,6 +348,7 @@ export async function loadProfile(profileName?: string): Promise<LoadedProfile> 
   const profile = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
   profile.limits = { ...DEFAULT_LIMITS, ...(profile.limits ?? {}) };
   profile.workflow = { ...DEFAULT_WORKFLOW, ...(profile.workflow ?? {}) };
+  profile.providers = { ...(config.providers ?? {}), ...(profile.providers ?? {}) };
   profile.repo = { ...profile.repo, envFiles: profile.repo?.envFiles ?? DEFAULT_ENV_FILES };
   profile.executor = { ...profile.executor, timeoutMs: profile.executor?.timeoutMs ?? 2_700_000, permissionMode: profile.executor?.permissionMode ?? "auto" };
   const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });

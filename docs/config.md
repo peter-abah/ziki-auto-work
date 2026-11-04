@@ -11,6 +11,15 @@ The config is a **workspace** with one or more **profiles** (config version 3).
     "limits": { "maxActiveClaims": 2 },
     "pollSeconds": 120
   },
+  "providers": {
+    "my-tool": {
+      "id": "my-tool",
+      "command": "my-tool",
+      "args": ["run", "--prompt", "{{prompt}}"],
+      "promptMode": "arg",
+      "resultMode": "file"
+    }
+  },
   "profiles": {
     "web": {
       "ziki": {
@@ -85,7 +94,10 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "maxConcurrentReviews": 1,
         "maxConcurrentAux": 2,
         "maxConcurrentDiscovery": 1,
-        "maxConcurrentAgents": 4
+        "maxConcurrentAgents": 4,
+        "maxTokensPerRun": null,
+        "tokenWarnPercent": 80,
+        "providerRetryMinutes": 15
       },
       "pollSeconds": 120,
       "memoryRefreshMinutes": 30,
@@ -145,7 +157,7 @@ and deliver. If `workers` is empty, manager keys are used for working tasks.
 
 ## executor
 
-- `provider`: `opencode`, `claude`, `codex`, `gemini`, `custom`.
+- `provider`: `opencode`, `claude`, `codex`, `gemini`, `custom`, an experimental shortlist id, or a key in `providers`.
 - `model`: default model, or `null` for provider default.
 - `models`: per-role overrides (`worker`, `review`, `triage`, `confirm`,
   `discovery`, `owner`).
@@ -153,6 +165,7 @@ and deliver. If `workers` is empty, manager keys are used for working tasks.
 - `permissionMode`: `auto` (bypass flags) or `safe` (least-privilege; may block).
 - `extraArgs`: provider-specific flags.
 - `env`: extra environment variables.
+- `usage`: optional token parsing (`regex` and/or `estimate`).
 - `command`, `args`, `promptMode`: custom provider only.
 
 ## checks
@@ -187,6 +200,18 @@ Issues already tagged with the platform are included regardless.
 
 `enabled`, optional `parityFile`, `maxIdeasPerRun`, `maxCyclesBeforeRun`.
 
+## providers
+
+`providers` is a workspace-level map of custom provider specs. `executor.provider`
+may reference any built-in (`opencode`, `claude`, `codex`, `gemini`, `custom`)
+or a key in this map. Specs support `command`, `args` with `{{prompt}}` /
+`{{cwd}}` / `{{resultPath}}` / `{{model}}`, `promptMode`, `resultMode`
+(`file` or `stdout`), `autoArgs`/`safeArgs`, `modelArgs`, `doctorArgs`,
+`usage`, and `env`.
+
+Built-in experimental shortlist: `aider`, `goose`, `copilot`, `cursor-agent`,
+`qwen`, `amp`. Verify their flags with `auto-work providers --check`.
+
 ## workflow
 
 - `maxFiles`: changed-file cap enforced before commit.
@@ -210,6 +235,12 @@ Run limits:
 - `maxCycles`: stop after N cycles; `null` disables.
 - `stopAt`: ISO timestamp deadline; `null` disables.
 - `maxDeliveriesTotal`: stop after N deliveries in this run; `null` disables.
+
+Token limits:
+
+- `maxTokensPerRun`: stop after the current task when reached; `null` disables.
+- `tokenWarnPercent`: warning threshold (default 80).
+- `providerRetryMinutes`: backoff for transient provider rate limits (default 15).
 
 These can be overridden per start with `--max-runtime`, `--max-cycles`,
 `--until`, `--max-deliveries`, or `--forever`.
