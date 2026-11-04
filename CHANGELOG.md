@@ -59,5 +59,5 @@
 - Clean and abrupt run summaries: `LAST-RUN.json`, `LAST-RUN.md`, and
   `auto-work report` defaulting to the last run.
 - Packaging: `dist/` is committed and `prepare` is removed, so
-  `npm i -g github:peter-abah/ziki-auto-work` no longer needs devDependencies.
+  `npm i -g github:peter-abah/ziki-auto-work --install-links` no longer needs devDependencies.
   `prepack` still builds for publishing, and CI checks that `dist/` is current.

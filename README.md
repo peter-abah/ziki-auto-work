@@ -62,7 +62,15 @@ config, and finishes with a dry run. It does **not** start the loop.
 3. **Install globally** (primary path for the long-running loop):
 
    ```bash
-   npm i -g github:peter-abah/ziki-auto-work
+   npm i -g github:peter-abah/ziki-auto-work --install-links
+   ```
+
+   `--install-links` avoids an npm 10 global-Git-install bug where npm can
+   symlink to an incomplete cache directory. If your npm ignores the flag, use
+   the archive instead:
+
+   ```bash
+   npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/main.tar.gz
    ```
 
 4. **Set it up from Ziki**:
@@ -324,7 +332,7 @@ Use PowerShell. Paths resolve to `%APPDATA%\auto-work` (config and keys) and
 `chmod`; the installer writes the shim for you. For example:
 
 ```powershell
-npm i -g github:peter-abah/ziki-auto-work
+npm i -g github:peter-abah/ziki-auto-work --install-links
 auto-work init --keys-file .\keys.env
 auto-work doctor
 auto-work run --once --dry-run
@@ -364,7 +372,7 @@ npm run verify     # build + fail if dist/ is stale
 Node 20+. TypeScript is dev-only; the runtime dependency is `cross-spawn` for
 reliable Windows process launching.
 
-`dist/` is committed so `npm i -g github:peter-abah/ziki-auto-work` works
+`dist/` is committed so `npm i -g github:peter-abah/ziki-auto-work --install-links` works
 without devDependencies. After changing `src/`, run `npm run build` and commit
 the updated `dist/`; CI fails if `dist/` is stale.
 

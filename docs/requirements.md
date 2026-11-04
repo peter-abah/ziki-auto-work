@@ -51,7 +51,9 @@ systemctl --user enable --now auto-work-<profile>.service
 brew install node git gh
 gh auth login
 # desktop notifications use the built-in osascript
-npm i -g github:peter-abah/ziki-auto-work
+npm i -g github:peter-abah/ziki-auto-work --install-links
+# npm 10 global-Git fallback:
+# npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/main.tar.gz
 ```
 
 Optional launchd service: `auto-work install --service` writes
@@ -62,7 +64,7 @@ Optional launchd service: `auto-work install --service` writes
 ```powershell
 winget install OpenJS.NodeJS.LTS Git.Git GitHub.cli
 gh auth login
-npm i -g github:peter-abah/ziki-auto-work
+npm i -g github:peter-abah/ziki-auto-work --install-links
 ```
 
 Paths resolve to `%APPDATA%\auto-work` (config and keys) and

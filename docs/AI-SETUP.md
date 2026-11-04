@@ -35,9 +35,13 @@ Per-platform commands are in [`requirements.md`](./requirements.md).
 ## 1. Install and detect
 
 ```bash
-npm i -g github:peter-abah/ziki-auto-work
+npm i -g github:peter-abah/ziki-auto-work --install-links
 auto-work detect --json
 ```
+
+`--install-links` avoids an npm 10 global-Git-install bug. If it is ignored,
+install the archive instead:
+`npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/main.tar.gz`.
 
 If the user prefers a one-off, replace `auto-work` with
 `npx github:peter-abah/ziki-auto-work`.
@@ -247,7 +251,7 @@ Tell the user:
 
 ## Windows
 
-Use `install.ps1` or `npm i -g github:peter-abah/ziki-auto-work`. Paths resolve
+Use `install.ps1` or `npm i -g github:peter-abah/ziki-auto-work --install-links`. Paths resolve
 to `%APPDATA%\auto-work` (config, keys) and `%LOCALAPPDATA%\auto-work` (state,
 cache, shim). There is no `chmod`; the installer writes the shim. The service
 command uses Task Scheduler when available and falls back to a detached process.
