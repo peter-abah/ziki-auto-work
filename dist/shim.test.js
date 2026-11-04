@@ -9,7 +9,11 @@ test("chooseShimPath prefers an existing PATH directory", async () => {
     try {
         const local = path.join(home, ".local/bin");
         await mkdir(local, { recursive: true });
-        const plan = chooseShimPath({ platform: "linux", home, pathValue: `${local}:${path.join(home, "bin")}` });
+        const plan = chooseShimPath({
+            platform: "linux",
+            home,
+            pathValue: `${local}${path.delimiter}${path.join(home, "bin")}`
+        });
         assert.equal(plan?.dir, local);
         assert.equal(plan?.onPath, true);
         assert.equal(plan?.path, path.join(local, "auto-work"));
@@ -29,7 +33,7 @@ test("chooseShimPath uses the Windows npm dir", () => {
     assert.equal(plan?.path, path.join(root, "npm", "auto-work.cmd"));
     assert.equal(plan?.onPath, true);
 });
-test("installShim creates a symlink to the package bin", async () => {
+test("installShim creates a symlink to the package bin", { skip: process.platform === "win32" }, async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "auto-work-install-"));
     try {
         const packageRoot = path.join(home, "package");
@@ -41,7 +45,7 @@ test("installShim creates a symlink to the package bin", async () => {
             packageRoot,
             home,
             platform: "linux",
-            pathValue: `${local}:${process.env.PATH ?? ""}`
+            pathValue: `${local}${path.delimiter}${process.env.PATH ?? ""}`
         });
         assert.ok(result);
         assert.equal(await readlink(result.plan.path), path.join(packageRoot, "bin", "auto-work.mjs"));
