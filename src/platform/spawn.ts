@@ -1,5 +1,6 @@
 import spawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
+import { killProcessTree } from "./process.js";
 
 export interface RunResult {
   ok: boolean;
@@ -27,7 +28,8 @@ export function runCommand(command: string, args: string[], options: RunOptions 
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32"
     });
 
     const finish = (code: number, error?: Error) => {
@@ -44,11 +46,7 @@ export function runCommand(command: string, args: string[], options: RunOptions 
     };
 
     timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // already gone
-      }
+      killProcessTree(child.pid);
       finish(-1, new Error(`timed out after ${Math.round((options.timeoutMs ?? 120000) / 1000)}s`));
     }, options.timeoutMs ?? 120000);
 

@@ -78,9 +78,9 @@ Usage:
   auto-work models [--provider <p>] [--profile <name>] [--json]
   auto-work providers [--check]
   auto-work profiles
-  auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
+  auto-work start [--profile <name>] [--foreground] [--verbose] [--once] [--dry-run] [--all]
                   [--max-runtime 2h] [--max-cycles N] [--until ISO] [--max-deliveries N] [--forever]
-  auto-work run [--profile <name>] [--once] [--dry-run]
+  auto-work run [--profile <name>] [--verbose] [--once] [--dry-run]
   auto-work stop [--profile <name>] [--all]
   auto-work pause [--profile <name>]
   auto-work resume [--profile <name>]
@@ -308,7 +308,6 @@ function checkPreset(name: string): CheckSpec[] {
         command: "flutter",
         args: ["test", "--reporter", "json"],
         reporter: "json",
-        baseline: true,
         timeoutMs: 1_800_000
       }
     ];
@@ -330,13 +329,13 @@ function checkPreset(name: string): CheckSpec[] {
   if (name === "go") {
     return [
       { name: "build", command: "go", args: ["build", "./..."], timeoutMs: 900_000 },
-      { name: "test", command: "go", args: ["test", "./..."], baseline: true, timeoutMs: 1_800_000 }
+      { name: "test", command: "go", args: ["test", "./..."], timeoutMs: 1_800_000 }
     ];
   }
   if (name === "rust") {
     return [
       { name: "build", command: "cargo", args: ["build"], timeoutMs: 1_800_000 },
-      { name: "test", command: "cargo", args: ["test"], baseline: true, timeoutMs: 1_800_000 }
+      { name: "test", command: "cargo", args: ["test"], timeoutMs: 1_800_000 }
     ];
   }
   return [];
@@ -1026,7 +1025,7 @@ async function start(flags: Flags): Promise<void> {
   const dryRun = Boolean(flags["dry-run"]);
   if (flags.foreground || once || dryRun) {
     const { runLoop } = await import("./orchestrator.js");
-    const code = await runLoop({ profileName, foreground: true, once, dryRun, limits });
+    const code = await runLoop({ profileName, foreground: true, verbose: Boolean(flags.verbose), once, dryRun, limits });
     process.exitCode = code;
     return;
   }
@@ -1076,13 +1075,20 @@ function statusLine(name: string, result: Awaited<ReturnType<typeof statusServic
   const inflight = status.inFlight?.total ?? 0;
   const queue = status.queue ? Object.values(status.queue as Record<string, number>).reduce((sum, value) => sum + Number(value || 0), 0) : 0;
   const last = status.lastCycleMs != null ? formatDuration(status.lastCycleMs) : "-";
+  const current = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined)?.[0];
+  const phase = current
+    ? ` | ${current.key} ${current.kind} ${formatDuration(Number(current.ageMs ?? 0))}`
+    : status.phase
+      ? ` | ${status.phase}${status.activity ? ` ${status.activity}` : ""}`
+      : "";
+  const network = status.run?.networkErrors ? ` | net err ${status.run.networkErrors}` : "";
   const tokenText = status.tokens
     ? ` | tokens ${formatTokens(status.tokens.total)}${status.tokens.limit ? `/${formatTokens(status.tokens.limit)} (${status.tokens.percent ?? 0}%)` : ""}`
     : "";
   const lastRun = status.lastRun
     ? ` | last run: ${status.lastRun.cycles}c/${status.lastRun.deliveries}d${status.lastRun.clean ? "" : " (incomplete)"}`
     : "";
-  return `${name} | ${state} | ${spent}/${limit} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}`;
+  return `${name} | ${state}${phase} | ${spent}/${limit}${network} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}`;
 }
 
 async function status(flags: Flags): Promise<void> {
@@ -1157,7 +1163,7 @@ function printDetailedStatusWithFlags(
   }
   if (status.lastRun) {
     console.log(
-      `  last run: ${status.lastRun.cycles} cycles · ${status.lastRun.deliveries} deliveries · ${status.lastRun.failures} failures · ${status.lastRun.clean ? "clean" : "incomplete"}`
+      `  last run: ${status.lastRun.cycles} cycles · ${status.lastRun.deliveries} deliveries · ${status.lastRun.failures} failures · ${status.lastRun.networkErrors ?? 0} network errors · ${status.lastRun.clean ? "clean" : "incomplete"}`
     );
   }
   const escalations = (status.escalations as Array<Record<string, unknown>> | undefined) ?? [];

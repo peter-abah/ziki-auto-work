@@ -39,7 +39,6 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "defaultBranch": "main",
         "teamLead": "@lead",
         "protectedFiles": [".github/**", "AGENTS.md", ".env", ".env.*"],
-        "baselineFile": "src/main.ts",
         "envFiles": [".env", ".env.local"],
         "requiredEnv": ["API_URL", "API_TOKEN"]
       },
@@ -84,6 +83,8 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "maxAuxPerCycle": 4,
         "maxActiveClaims": 2,
         "maxAttemptsPerTask": 3,
+        "maxNetworkRetries": 5,
+        "networkRetryMinutes": 1,
         "maxCyclesBeforeDiscovery": 6,
         "maxOpenEscalations": 5,
         "maxRuntimeMinutes": 120,
@@ -138,7 +139,6 @@ and check presets (`Flutter`, `Next.js`, …).
 - `defaultBranch`: used to check whether a merge is in the default branch.
 - `teamLead`: PR template handle.
 - `protectedFiles`: glob patterns; matched against changed paths and basenames.
-- `baselineFile`: file passed to a `filesOnly` baseline check (optional).
 - `envFiles`: files copied from the clone into every ticket/review worktree
   (default `[".env", ".env.local"]`). They stay protected and are never committed.
 - `requiredEnv`: env keys `doctor` requires in those files; values are never printed.
@@ -170,18 +170,18 @@ and deliver. If `workers` is empty, manager keys are used for working tasks.
 
 ## checks
 
-Each check:
+`checks[]` is guidance for the agent, not an orchestrator gate. The worker runs
+the commands and reports the evidence; the orchestrator does not execute them
+and does not block delivery on repository state.
 
-- `name`: label.
+- `name`: label shown to the agent.
 - `command`: executable or a key from `toolchain`.
 - `args`: arguments.
-- `filesOnly`: append changed files.
-- `include`: extensions for `filesOnly` (e.g. `[".dart"]`).
-- `reporter`: `json` (Flutter-style test events) or `text`.
-- `baseline`: compare failures to the base-branch baseline.
-- `timeoutMs`.
-- `required`: default true; optional checks do not fail the run.
-- `env`: extra environment variables.
+- `filesOnly`, `include`, `reporter`, `baseline`, `timeoutMs`, `required`,
+  `env`: accepted for backward compatibility but ignored by the orchestrator.
+
+The agent receives the resolved command lines through the `{{checks}}` prompt
+placeholder. Ziki peer review and CI remain the quality gates.
 
 ## prompts and pr
 

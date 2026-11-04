@@ -4,7 +4,6 @@ export declare function resolveCommand(profile: ProfileConfig, command: string):
 export declare function parseTestFailures(output: string): string[];
 export declare function runChecks(profile: ProfileConfig, worktree: string, options: {
     changedFiles: string[];
-    baselineFailures?: Record<string, string[]>;
     logger?: Logger;
 }): Promise<CheckRunResult>;
 export declare const DEFAULT_PROTECTED: string[];

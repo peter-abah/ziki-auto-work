@@ -11,6 +11,8 @@ export const DEFAULT_LIMITS = {
     maxAuxPerCycle: 4,
     maxActiveClaims: 2,
     maxAttemptsPerTask: 3,
+    maxNetworkRetries: 5,
+    networkRetryMinutes: 1,
     maxCyclesBeforeDiscovery: 6,
     maxOpenEscalations: 5,
     maxRuntimeMinutes: 120,

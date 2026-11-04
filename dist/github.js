@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolvePrTemplate } from "./config.js";
 import { runCommand } from "./platform/spawn.js";
 import { envFilesFor } from "./env.js";
+import { isTransientNetworkText } from "./network.js";
 export function slugify(text, max = 40) {
     const slug = String(text || "")
         .toLowerCase()
@@ -48,17 +49,30 @@ export class GitHub {
         this.repoDir = path.join(options.reposDir, "repo");
         this.logger = options.logger ?? null;
     }
+    async retryCommand(operation) {
+        let last = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            last = await operation();
+            if (last.ok || !isTransientNetworkText(`${last.stderr}\n${last.stdout}`))
+                return last;
+            if (attempt < 2)
+                await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+        }
+        return last;
+    }
     async git(args, options = {}) {
-        return runCommand(this.profile.toolchain.git || "git", args, {
+        const run = () => runCommand(this.profile.toolchain.git || "git", args, {
             cwd: options.cwd ?? this.repoDir,
             timeoutMs: options.timeoutMs ?? 120_000
         });
+        return options.retry ? this.retryCommand(run) : run();
     }
     async gh(args, options = {}) {
-        return runCommand(this.profile.toolchain.gh || "gh", args, {
+        const run = () => runCommand(this.profile.toolchain.gh || "gh", args, {
             cwd: options.cwd ?? this.repoDir,
             timeoutMs: options.timeoutMs ?? 120_000
         });
+        return options.retry ? this.retryCommand(run) : run();
     }
     async ensureRepo() {
         const { url, upstream, base } = this.profile.repo;
@@ -83,8 +97,8 @@ export class GitHub {
                 await this.git(["remote", "set-url", "upstream", upstream]);
         }
         this.logger?.info("Fetching origin and upstream");
-        await this.git(["fetch", "--prune", "origin"], { timeoutMs: 300_000 });
-        await this.git(["fetch", "--prune", "upstream"], { timeoutMs: 300_000 });
+        await this.git(["fetch", "--prune", "origin"], { timeoutMs: 300_000, retry: true });
+        await this.git(["fetch", "--prune", "upstream"], { timeoutMs: 300_000, retry: true });
         const baseCheck = await this.git(["rev-parse", "--verify", `upstream/${base}`]);
         if (!baseCheck.ok)
             throw new Error(`Base branch upstream/${base} not found. Check ${upstream}.`);
@@ -137,7 +151,10 @@ export class GitHub {
         if (existsSync(dir))
             await this.removeWorktree(dir, true).catch(() => { });
         const ref = `refs/auto-work/pr-${prNumber}`;
-        const fetch = await this.git(["fetch", "upstream", `pull/${prNumber}/head:${ref}`], { timeoutMs: 300_000 });
+        const fetch = await this.git(["fetch", "upstream", `pull/${prNumber}/head:${ref}`], {
+            timeoutMs: 300_000,
+            retry: true
+        });
         if (!fetch.ok)
             throw new Error(fetch.stderr || "could not fetch PR head");
         await this.git(["worktree", "add", "--detach", dir, ref]);
@@ -206,7 +223,11 @@ export class GitHub {
         return { committed: true, sha: await this.headSha(worktree) };
     }
     async pushBranch(worktree, branch) {
-        const result = await this.git(["push", "-u", "origin", branch], { cwd: worktree, timeoutMs: 300_000 });
+        const result = await this.git(["push", "-u", "origin", branch], {
+            cwd: worktree,
+            timeoutMs: 300_000,
+            retry: true
+        });
         if (!result.ok)
             throw new Error(result.stderr || result.stdout || "git push failed");
     }
@@ -222,7 +243,7 @@ export class GitHub {
             "open",
             "--json",
             "number,url,title,state,headRefName"
-        ]);
+        ], { retry: true });
         if (!result.ok)
             return null;
         const list = JSON.parse(result.stdout || "[]");
@@ -258,7 +279,7 @@ export class GitHub {
             url,
             "--json",
             "number,url,state,mergedAt,mergeCommit,headRefOid,baseRefName,mergeable,isDraft,statusCheckRollup"
-        ]);
+        ], { retry: true });
         if (!result.ok)
             throw new Error(result.stderr || result.stdout || "gh pr view failed");
         const data = JSON.parse(result.stdout);
@@ -285,9 +306,9 @@ export class GitHub {
         return this.gh(["auth", "status"]);
     }
     async remoteAccess(url) {
-        return runCommand(this.profile.toolchain.git || "git", ["ls-remote", "--exit-code", url, "HEAD"], {
+        return this.retryCommand(() => runCommand(this.profile.toolchain.git || "git", ["ls-remote", "--exit-code", url, "HEAD"], {
             timeoutMs: 60_000
-        });
+        }));
     }
 }
 export const GENERIC_PR_TEMPLATE = `## Ticket
