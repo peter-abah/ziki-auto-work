@@ -52,7 +52,7 @@ test("command mode runs the configured command with AW_TITLE and AW_BODY", async
     const script = path.join(dir, "write-result.cjs");
     try {
         await writeFile(script, `require("fs").writeFileSync(${JSON.stringify(target)}, process.env.AW_TITLE + "|" + process.env.AW_BODY);\n`, "utf8");
-        const command = `"${process.execPath}" "${script}"`;
+        const command = `node "${script}"`;
         const result = await notifyProfile(profile({ hitl: { enabled: true, defaultType: "question", notify: "command", notifyCommand: command } }), "Title", "Body");
         assert.equal(result.ok, true);
         assert.equal(await readFile(target, "utf8"), "Title|Body");
