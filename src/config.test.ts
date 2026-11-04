@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProfileConfig, WorkFeed } from "./types.js";
-import { DEFAULT_LIMITS, deepMerge, defaultConfig, resolveModel, validateConfig } from "./config.js";
+import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, deepMerge, defaultConfig, resolveModel, validateConfig } from "./config.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { parseTestFailures, protectedFiles, scanSecrets } from "./checks.js";
@@ -38,6 +38,7 @@ function fixtureProfile(overrides: Partial<ProfileConfig> = {}): ProfileConfig {
     prompts: { dir: "prompts/generic" },
     pr: { templateFile: "prompts/generic/pr.md", teamLead: "@lead" },
     discovery: { enabled: false },
+    workflow: { ...DEFAULT_WORKFLOW },
     limits: { ...DEFAULT_LIMITS },
     pollSeconds: 120,
     memoryRefreshMinutes: 30,
@@ -316,4 +317,20 @@ test("deepMerge keeps limit defaults when a profile overrides one field", () => 
   };
   assert.equal(merged.limits.maxDeliveriesPerDay, 3);
   assert.equal(merged.limits.maxRuntimeMinutes, 120);
+});
+
+test("workflow defaults are present and validated", () => {
+  assert.deepEqual(defaultConfig().defaults?.workflow, DEFAULT_WORKFLOW);
+  const profile = fixtureProfile({ workflow: { ...DEFAULT_WORKFLOW, maxFiles: 0 } });
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("workflow.maxFiles")));
+});
+
+test("workflow is optional in raw configs and defaults are filled by loadProfile", () => {
+  const profile = fixtureProfile();
+  delete (profile as Partial<ProfileConfig>).workflow;
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, true);
+  assert.ok(result.warnings.some((warning) => warning.includes("workflow")));
 });

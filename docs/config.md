@@ -30,7 +30,9 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "defaultBranch": "main",
         "teamLead": "@lead",
         "protectedFiles": [".github/**", "AGENTS.md", ".env", ".env.*"],
-        "baselineFile": "src/main.ts"
+        "baselineFile": "src/main.ts",
+        "envFiles": [".env", ".env.local"],
+        "requiredEnv": ["API_URL", "API_TOKEN"]
       },
       "agents": {
         "workers": ["ZIKI_KEY1"],
@@ -59,6 +61,13 @@ The config is a **workspace** with one or more **profiles** (config version 3).
       "prompts": { "dir": "prompts/web" },
       "pr": { "templateFile": "prompts/web/pr.md", "teamLead": "@lead" },
       "discovery": { "enabled": true, "parityFile": "PARITY.md", "maxIdeasPerRun": 3 },
+      "workflow": {
+        "maxFiles": 5,
+        "maxLines": 400,
+        "branchPrefix": "fix",
+        "commitTypes": ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
+        "requireTests": true
+      },
       "limits": {
         "maxDeliveriesPerDay": 10,
         "maxReviewsPerDay": 20,
@@ -80,7 +89,7 @@ The config is a **workspace** with one or more **profiles** (config version 3).
       },
       "pollSeconds": 120,
       "memoryRefreshMinutes": 30,
-      "hitl": { "enabled": true, "defaultType": "question", "notifyCommand": null }
+      "hitl": { "enabled": true, "defaultType": "question", "notify": "auto", "notifyCommand": null }
     }
   },
   "doctor": { "minFreeGb": 3 }
@@ -118,6 +127,9 @@ and check presets (`Flutter`, `Next.js`, …).
 - `teamLead`: PR template handle.
 - `protectedFiles`: glob patterns; matched against changed paths and basenames.
 - `baselineFile`: file passed to a `filesOnly` baseline check (optional).
+- `envFiles`: files copied from the clone into every ticket/review worktree
+  (default `[".env", ".env.local"]`). They stay protected and are never committed.
+- `requiredEnv`: env keys `doctor` requires in those files; values are never printed.
 
 ## agents
 
@@ -175,6 +187,18 @@ Issues already tagged with the platform are included regardless.
 
 `enabled`, optional `parityFile`, `maxIdeasPerRun`, `maxCyclesBeforeRun`.
 
+## workflow
+
+- `maxFiles`: changed-file cap enforced before commit.
+- `maxLines`: changed-line cap (insertions + deletions) enforced before commit.
+- `branchPrefix`: branch name prefix, e.g. `fix` → `fix/<issue>-<slug>`.
+- `commitTypes`: accepted conventional-commit types; others fall back.
+- `requireTests`: prompt rule (not auto-enforced, to avoid false rejects).
+
+The worker prompt receives these as `{{workflowRules}}`, plus
+`{{protectedFiles}}`, `{{prBase}}`, `{{forkOwner}}`, `{{teamLead}}`,
+`{{prTemplate}}`, `{{maxFiles}}` and `{{maxLines}}`.
+
 ## limits
 
 Daily caps, active claims, retry attempts, discovery cadence and open
@@ -198,6 +222,13 @@ Concurrency:
 - `maxConcurrentDiscovery` (default 1).
 - `maxConcurrentAgents` (default 4) caps all in-flight tasks.
 
+## hitl
+
+- `enabled`, `defaultType`.
+- `notify`: `auto` (desktop if available), `desktop`, `command`, or `off`.
+- `notifyCommand`: shell command used by `command`/`auto` fallback; receives
+  `AW_TITLE` and `AW_BODY`.
+
 ## doctor
 
 `doctor.minFreeGb` sets the disk-space warning threshold (default 3).
@@ -209,5 +240,5 @@ Concurrency:
 - Windows: `%LOCALAPPDATA%\auto-work\profiles\<profile>\`
 
 Each profile has `state.json`, `status.json`, `history.jsonl`,
-`run-limits.json`, `logs/`, `worktrees/`, `repos/`, `results/`,
-`NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.
+`run-limits.json`, `LAST-RUN.json`, `LAST-RUN.md`, `logs/`, `worktrees/`,
+`repos/`, `results/`, `NEEDS-HUMAN.md`, `OWNER-REQUESTS.md`.

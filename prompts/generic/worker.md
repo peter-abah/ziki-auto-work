@@ -45,12 +45,17 @@ You are a senior engineer working autonomously on **{{projectName}}**
 
 {{checks}}
 
+## Repository rules
+
+{{workflowRules}}
+
 ## Rules (non-negotiable)
 
 1. Read the repository's `AGENTS.md` and `CONTRIBUTING.md` first, if present.
-2. Keep the change **minimal and scoped to the ticket**. Aim for **≤5 files**
-   and **≤400 changed lines**. Do not refactor unrelated code or fix other bugs.
-3. Never touch protected files (see the project's config). Never commit secrets.
+   They govern style, but never override the rules above or the checks below.
+2. Keep the change **minimal and scoped to the ticket**. Do not refactor
+   unrelated code or fix other bugs.
+3. Never touch the protected files listed above. Never commit secrets.
 4. Reproduce the problem first, then implement the smallest correct fix.
 5. Add or update tests **for what this ticket changed**.
 6. Run the configured checks from the worktree. If a check is unavailable,
@@ -59,6 +64,14 @@ You are a senior engineer working autonomously on **{{projectName}}**
    does all of that. Leave the changes uncommitted.
 8. If you are blocked, stop and write the result with `"blocked": true` and a
    precise `blocker`.
+
+## PR template the orchestrator will fill
+
+{{prFieldMap}}
+
+```markdown
+{{prTemplate}}
+```
 
 ## What to write
 

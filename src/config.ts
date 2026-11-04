@@ -11,7 +11,8 @@ import type {
   LoadedProfile,
   ProviderName,
   Role,
-  RunLimitConfig
+  RunLimitConfig,
+  WorkflowConfig
 } from "./types.js";
 import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
 
@@ -44,6 +45,16 @@ export const DEFAULT_RUN_LIMITS = {
   maxDeliveriesTotal: null
 };
 
+export const DEFAULT_WORKFLOW: WorkflowConfig = {
+  maxFiles: 5,
+  maxLines: 400,
+  branchPrefix: "fix",
+  commitTypes: ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
+  requireTests: true
+};
+
+export const DEFAULT_ENV_FILES = [".env", ".env.local"];
+
 export function defaultConfig(): Config {
   return {
     version: 3,
@@ -56,9 +67,10 @@ export function defaultConfig(): Config {
         permissionMode: "auto"
       },
       limits: { ...DEFAULT_LIMITS },
+      workflow: { ...DEFAULT_WORKFLOW },
       pollSeconds: 120,
       memoryRefreshMinutes: 30,
-      hitl: { enabled: true, defaultType: "question", notifyCommand: null },
+      hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null },
       platformMatch: {},
       discovery: { enabled: false, maxIdeasPerRun: 3 },
       checks: [],
@@ -224,6 +236,29 @@ export function validateConfig(config: Config): ValidationResult {
     if (!profile?.limits || typeof profile.limits !== "object") {
       errors.push(`${prefix}.limits is required`);
     }
+    const workflow = profile?.workflow;
+    if (!workflow || typeof workflow !== "object") {
+      warnings.push(`${prefix}.workflow is missing; defaults will be used`);
+    } else {
+      if (!Number.isInteger(workflow.maxFiles) || workflow.maxFiles < 1) {
+        errors.push(`${prefix}.workflow.maxFiles must be a positive integer`);
+      }
+      if (!Number.isInteger(workflow.maxLines) || workflow.maxLines < 1) {
+        errors.push(`${prefix}.workflow.maxLines must be a positive integer`);
+      }
+      if (typeof workflow.branchPrefix !== "string" || !workflow.branchPrefix.trim()) {
+        errors.push(`${prefix}.workflow.branchPrefix is required`);
+      }
+      if (!Array.isArray(workflow.commitTypes) || !workflow.commitTypes.length) {
+        errors.push(`${prefix}.workflow.commitTypes must be a non-empty array`);
+      }
+    }
+    if (profile?.repo?.envFiles !== undefined && !Array.isArray(profile.repo.envFiles)) {
+      errors.push(`${prefix}.repo.envFiles must be an array`);
+    }
+    if (profile?.repo?.requiredEnv !== undefined && !Array.isArray(profile.repo.requiredEnv)) {
+      errors.push(`${prefix}.repo.requiredEnv must be an array`);
+    }
     if (typeof profile?.pollSeconds !== "number" || profile.pollSeconds < 10) {
       errors.push(`${prefix}.pollSeconds must be at least 10`);
     }
@@ -290,6 +325,8 @@ export async function loadProfile(profileName?: string): Promise<LoadedProfile> 
   }
   const profile = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
   profile.limits = { ...DEFAULT_LIMITS, ...(profile.limits ?? {}) };
+  profile.workflow = { ...DEFAULT_WORKFLOW, ...(profile.workflow ?? {}) };
+  profile.repo = { ...profile.repo, envFiles: profile.repo?.envFiles ?? DEFAULT_ENV_FILES };
   profile.executor = { ...profile.executor, timeoutMs: profile.executor?.timeoutMs ?? 2_700_000, permissionMode: profile.executor?.permissionMode ?? "auto" };
   const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });
   if (!validation.ok) {

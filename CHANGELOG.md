@@ -41,3 +41,20 @@
   `doctor --json`.
 - No versioned releases: `package.json` is `0.0.0` and the changelog is
   unreleased.
+- `init --discover` for Ziki-first setup: project/platform from keys, GitHub
+  repo search, fork detection/creation, branch detection, clone and stack
+  detection. `--dry-run` is read-only.
+- Config-driven `workflow` rules (max files/lines, branch prefix, commit types,
+  tests required) injected into prompts and enforced by the orchestrator.
+  Protected files, PR target/head, team lead and the PR template are surfaced
+  to the agent.
+- `executor.env` is applied to agents and checks; toolchain directories are
+  prepended to `PATH`; `repo.envFiles` and `repo.requiredEnv` are supported.
+- Env/tool/auth failures are classified as blockers instead of silent retries;
+  escalation-cap and waiting-claim handling fixed.
+- `needsYou` status summary, `status --line`, `status --watch`, and zero-config
+  desktop notifications on count changes.
+- Plain `auto-work` sets up if needed, starts in the foreground, or shows status
+  when a loop is already running.
+- Clean and abrupt run summaries: `LAST-RUN.json`, `LAST-RUN.md`, and
+  `auto-work report` defaulting to the last run.

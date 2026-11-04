@@ -32,7 +32,24 @@
     "hitl": {
       "enabled": true,
       "defaultType": "question",
-      "notifyCommand": null
+      "notifyCommand": null,
+      "notify": "auto"
+    },
+    "workflow": {
+      "maxFiles": 5,
+      "maxLines": 400,
+      "branchPrefix": "fix",
+      "commitTypes": [
+        "fix",
+        "feat",
+        "test",
+        "refactor",
+        "chore",
+        "docs",
+        "perf",
+        "security"
+      ],
+      "requireTests": true
     }
   },
   "profiles": {
@@ -69,7 +86,12 @@
           "*.p8",
           "*.jks",
           "*.keystore"
-        ]
+        ],
+        "envFiles": [
+          ".env",
+          ".env.local"
+        ],
+        "requiredEnv": []
       },
       "agents": {
         "workers": [

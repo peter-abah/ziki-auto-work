@@ -109,7 +109,9 @@ export function profilePaths(profileName: string): ProfilePaths {
     memoryFile: path.join(base, "memory-context.json"),
     desktopCacheFile: path.join(base, "platform-cache.json"),
     runLimitsFile: path.join(base, "run-limits.json"),
-    historyFile: path.join(base, "history.jsonl")
+    historyFile: path.join(base, "history.jsonl"),
+    lastRunFile: path.join(base, "LAST-RUN.json"),
+    lastRunMdFile: path.join(base, "LAST-RUN.md")
   };
 }
 

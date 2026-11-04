@@ -12,8 +12,12 @@ export function ideaUrl(profile: ProfileConfig, idea: { number: number | string 
   return `${baseUrl(profile)}/${profile.ziki.projectSlug}/ideas/${idea.number}`;
 }
 
+export function inboxUrl(profile: ProfileConfig): string {
+  return `${baseUrl(profile)}/inbox`;
+}
+
 export function escalationUrl(profile: ProfileConfig, issueNumber: number | string | null): string {
-  return issueNumber ? issueUrl(profile, { number: issueNumber }) : `${baseUrl(profile)}/inbox`;
+  return issueNumber ? issueUrl(profile, { number: issueNumber }) : inboxUrl(profile);
 }
 
 export function issueLabel(issue: Issue | { number: number | string; title: string }): string {

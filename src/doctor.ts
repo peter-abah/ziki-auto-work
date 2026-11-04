@@ -2,7 +2,9 @@ import { existsSync } from "node:fs";
 import { readFile, readdir, statfs } from "node:fs/promises";
 import path from "node:path";
 import type { ProfileConfig } from "./types.js";
-import { loadConfig, loadProfile, resolveModel, validateConfig } from "./config.js";
+import { loadConfig, loadProfile, parseEnvFile, resolveModel, validateConfig } from "./config.js";
+import { envFilesFor } from "./env.js";
+import { desktopNotifierAvailable } from "./notify.js";
 import { getProvider } from "./providers/index.js";
 import { GitHub } from "./github.js";
 import { isAlive as isAlivePid, readPid } from "./state.js";
@@ -160,14 +162,43 @@ export async function runDoctor(options: { profileName?: string } = {}): Promise
     add(`check tool ${command}`, result.ok, result.ok ? result.stdout.split("\n")[0] || "ok" : result.stderr, false);
   }
 
+  let repoDir: string | null = null;
   try {
     const github = new GitHub({ profile, profileName, reposDir: jp.reposDir });
-    const repoDir = await github.ensureRepo();
+    repoDir = await github.ensureRepo();
     add("repo clone", true, repoDir);
     const base = await github.git(["rev-parse", "--verify", `upstream/${profile.repo.base}`]);
     add(`base upstream/${profile.repo.base}`, base.ok, base.stdout.slice(0, 12) || base.stderr);
   } catch (error) {
     add("repo", false, error instanceof Error ? error.message : String(error));
+  }
+
+  if (repoDir) {
+    const names = envFilesFor(profile);
+    const present: string[] = [];
+    const values: Record<string, string> = {};
+    for (const name of names) {
+      const file = path.join(repoDir, name);
+      if (!existsSync(file)) continue;
+      present.push(name);
+      Object.assign(values, parseEnvFile(await readFile(file, "utf8").catch(() => "")));
+    }
+    if (present.length) {
+      add("env file", true, present.join(", "), false);
+    } else {
+      const example = existsSync(path.join(repoDir, ".env.example"));
+      add(
+        "env file",
+        false,
+        example ? "no .env; .env.example is present but not loaded" : "no configured env file",
+        false
+      );
+    }
+    const required = profile.repo.requiredEnv ?? [];
+    if (required.length) {
+      const missing = required.filter((name) => !values[name] || !String(values[name]).trim());
+      add("required env", missing.length === 0, missing.length ? `missing: ${missing.join(", ")}` : required.join(", "));
+    }
   }
 
   try {
@@ -195,6 +226,21 @@ export async function runDoctor(options: { profileName?: string } = {}): Promise
         : ["schtasks", ["/Query", "/?"]];
   const service = await runCommand(serviceCommand[0] as string, serviceCommand[1] as string[], { timeoutMs: 15_000 });
   add("service manager", service.ok, service.ok ? "available" : "optional; detached process will be used", false);
+
+  const notifyMode = profile.hitl.notify ?? "auto";
+  if (notifyMode === "off") {
+    add("notifications", true, "disabled", false);
+  } else if (notifyMode === "command") {
+    add("notifications", Boolean(profile.hitl.notifyCommand), profile.hitl.notifyCommand ? "command configured" : "command mode without notifyCommand", false);
+  } else {
+    const available = await desktopNotifierAvailable();
+    add(
+      "notifications",
+      available || notifyMode === "auto",
+      available ? "desktop notifier available" : "no desktop notifier; use status --line or notify: command",
+      false
+    );
+  }
 
   if (existsSync(jp.lockFile)) {
     const raw = await readFile(jp.lockFile, "utf8").catch(() => "");

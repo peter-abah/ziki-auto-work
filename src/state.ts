@@ -23,8 +23,19 @@ export function emptyState(): State {
     baselineSha: null,
     baselineAt: null,
     lastError: null,
-    run: { startedAt: null, limits: null, stopReason: null, deliveries: 0 },
+    run: {
+      startedAt: null,
+      limits: null,
+      stopReason: null,
+      deliveries: 0,
+      reviews: 0,
+      mergeReviews: 0,
+      discoveries: 0,
+      aux: 0,
+      failures: 0
+    },
     lastCycle: null,
+    lastRun: null,
     activePids: []
   };
 }

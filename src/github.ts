@@ -4,6 +4,7 @@ import path from "node:path";
 import type { Issue, ProfileConfig } from "./types.js";
 import { resolvePrTemplate } from "./config.js";
 import { runCommand } from "./platform/spawn.js";
+import { envFilesFor } from "./env.js";
 
 export function slugify(text: string, max = 40): string {
   const slug = String(text || "")
@@ -15,8 +16,9 @@ export function slugify(text: string, max = 40): string {
   return slug || "task";
 }
 
-export function branchName(issue: { number: number | string }, title: string): string {
-  return `fix/${issue.number}-${slugify(title)}`;
+export function branchName(issue: { number: number | string }, title: string, prefix = "fix"): string {
+  const clean = String(prefix || "fix").replace(/\/+$/, "");
+  return `${clean}/${issue.number}-${slugify(title)}`;
 }
 
 export function summarizeChecks(rollup: Array<Record<string, unknown>>): "passing" | "failing" | "pending" | "none" {
@@ -118,9 +120,11 @@ export class GitHub {
   }
 
   async copyEnvTo(worktree: string): Promise<void> {
-    const source = path.join(this.repoDir, ".env");
-    const target = path.join(worktree, ".env");
-    if (existsSync(source) && !existsSync(target)) await copyFile(source, target);
+    for (const name of envFilesFor(this.profile)) {
+      const source = path.join(this.repoDir, name);
+      const target = path.join(worktree, name);
+      if (existsSync(source) && !existsSync(target)) await copyFile(source, target);
+    }
   }
 
   async baseSha(): Promise<string> {
@@ -174,6 +178,25 @@ export class GitHub {
       stdout: ""
     }));
     return [...new Set([...tracked.stdout.split("\n"), ...untracked.stdout.split("\n")].filter(Boolean))];
+  }
+
+  async diffStats(worktree: string): Promise<{ files: number; insertions: number; deletions: number; total: number }> {
+    const out = await this.git(["diff", "--cached", "--numstat", `upstream/${this.profile.repo.base}`], { cwd: worktree });
+    let insertions = 0;
+    let deletions = 0;
+    let files = 0;
+    for (const line of out.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const [added, removed] = line.split("\t");
+      if (added === undefined || removed === undefined) continue;
+      const add = Number(added);
+      const del = Number(removed);
+      if (!Number.isFinite(add) || !Number.isFinite(del)) continue;
+      insertions += add;
+      deletions += del;
+      files += 1;
+    }
+    return { files, insertions, deletions, total: insertions + deletions };
   }
 
   async stagedChangedFiles(worktree: string): Promise<string[]> {
@@ -296,7 +319,7 @@ export class GitHub {
   }
 }
 
-const GENERIC_PR_TEMPLATE = `## Ticket
+export const GENERIC_PR_TEMPLATE = `## Ticket
 
 {{ticket}}
 

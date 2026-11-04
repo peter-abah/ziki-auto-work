@@ -3,9 +3,10 @@ import path from "node:path";
 import type { CheckResult, CheckRunResult, CheckSpec, ProfileConfig } from "./types.js";
 import { expandHome } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
+import { buildCheckEnv } from "./env.js";
 import type { Logger } from "./log.js";
 
-function resolveCommand(profile: ProfileConfig, command: string): string {
+export function resolveCommand(profile: ProfileConfig, command: string): string {
   const mapped = profile.toolchain[command];
   if (mapped) {
     const expanded = expandHome(mapped);
@@ -82,7 +83,7 @@ export async function runChecks(
     const result = await runCommand(command, args, {
       cwd: worktree,
       timeoutMs: spec.timeoutMs ?? 20 * 60 * 1000,
-      env: spec.env
+      env: buildCheckEnv(profile, spec.env)
     });
 
     let failures: string[] | undefined;
@@ -121,7 +122,7 @@ export async function runChecks(
   return { ok, results };
 }
 
-const DEFAULT_PROTECTED = [
+export const DEFAULT_PROTECTED = [
   ".github/**",
   "AGENTS.md",
   "CONTRIBUTING.md",

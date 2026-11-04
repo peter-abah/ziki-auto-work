@@ -63,7 +63,9 @@ import { escalate, poll, writeNeedsHuman } from "./hitl.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { runChecks, scanSecrets, protectedFiles } from "./checks.js";
 import { profilePaths, paths } from "./platform/paths.js";
-import { issueUrl } from "./urls.js";
+import { escalationUrl, inboxUrl, issueUrl } from "./urls.js";
+import { notifyProfile } from "./notify.js";
+import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 
 const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
 const TERMINAL = new Set(["resolved", "closed"]);
@@ -99,6 +101,7 @@ interface Context {
   auxThisCycle: number;
   reservedAgents: Set<string>;
   cycleStats: { deliveries: number; reviews: number; aux: number; errors: number };
+  lastNeedsYouCount: number | null;
 }
 
 function isOurAgent(ctx: Context, name: string | null | undefined): boolean {
@@ -169,16 +172,60 @@ function history(ctx: Context, entry: Omit<HistoryEntry, "at">): void {
   void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => {});
 }
 
+async function notifyNeedsYou(ctx: Context): Promise<void> {
+  const open = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open");
+  const count = open.length;
+  if (ctx.lastNeedsYouCount === count) return;
+  if (ctx.lastNeedsYouCount === null && count === 0) {
+    ctx.lastNeedsYouCount = 0;
+    return;
+  }
+  const link = inboxUrl(ctx.profile);
+  const title = count ? `auto-work: ${count} item${count === 1 ? "" : "s"} need you on Ziki` : "auto-work: Ziki is clear";
+  const body = count ? `Open Ziki to handle them: ${link}` : "Nothing is waiting on you.";
+  await notifyProfile(ctx.profile, title, body, ctx.logger);
+  ctx.lastNeedsYouCount = count;
+}
+
 function fileEvidence(files: Array<string | { path: string; lines?: string }> | undefined): Array<{ path: string; lines?: string }> {
   return (files ?? []).map((file) => (typeof file === "string" ? { path: file } : file));
 }
 
-function normalizeCommitMessage(message: string | undefined, issue: Issue): string {
-  const fallback = `fix(${issue.number}): ${issue.title}`.slice(0, 72);
+export function normalizeCommitMessage(message: string | undefined, issue: Issue, commitTypes: string[]): string {
+  const types = commitTypes.length ? commitTypes : ["fix"];
+  const fallbackType = types.includes("fix") ? "fix" : types[0]!;
+  const fallback = `${fallbackType}(${issue.number}): ${issue.title}`.slice(0, 72);
   if (!message) return fallback;
   const text = String(message).split("\n")[0]!.trim();
-  if (!/^(fix|feat|test|refactor|chore|docs|perf|security)\([^)]+\): \S/.test(text)) return fallback;
+  const pattern = new RegExp(`^(${types.map((type) => type.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\([^)]+\\): \\S`);
+  if (!pattern.test(text)) return fallback;
   return text.length > 72 ? text.slice(0, 72) : text;
+}
+
+const ENV_FAILURE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /command not found/i, label: "a required command is not on PATH" },
+  { pattern: /\bENOENT\b/i, label: "a required file or command is missing" },
+  { pattern: /missing (env|environment|variable|token|key)/i, label: "a required environment value is missing" },
+  { pattern: /environment variable .* (not set|missing)/i, label: "a required environment variable is not set" },
+  { pattern: /(401|403|unauthorized|forbidden|not authenticated|not logged in|no credentials)/i, label: "authentication or permission is missing" },
+  { pattern: /\.env/i, label: "a project .env value is missing" },
+  { pattern: /(flutter|dart|node|npm|go|cargo|gh|git):? not found/i, label: "a toolchain executable is missing" }
+];
+
+function classifyEnvironmentFailure(text: string | undefined): string | null {
+  if (!text) return null;
+  for (const entry of ENV_FAILURE_PATTERNS) {
+    if (entry.pattern.test(text)) return entry.label;
+  }
+  return null;
+}
+
+function checksFailureText(checks: CheckRunResult): string {
+  const failed = checks.results.filter((result) => !result.ok);
+  const details = failed
+    .map((result) => `${result.name}: ${result.output.split("\n").filter(Boolean).slice(-3).join(" ")}`)
+    .join("; ");
+  return truncate(`checks failed: ${details || "unknown"}`, 500);
 }
 
 function remainingMs(ctx: Context): number | null {
@@ -237,8 +284,23 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
       issue: escalation.issueNumber,
       type: escalation.type,
       body: truncate(escalation.body, 300),
-      createdAt: escalation.createdAt
+      createdAt: escalation.createdAt,
+      link: escalationUrl(ctx.profile, escalation.issueNumber)
     })),
+    needsYou: {
+      count: open.length,
+      link: open.length ? inboxUrl(ctx.profile) : inboxUrl(ctx.profile),
+      latest: open[0]
+        ? {
+            id: open[0].id,
+            issue: open[0].issueNumber,
+            type: open[0].type,
+            body: truncate(open[0].body, 300),
+            createdAt: open[0].createdAt,
+            link: escalationUrl(ctx.profile, open[0].issueNumber)
+          }
+        : null
+    },
     run: {
       limits: ctx.runLimits,
       startedAt: ctx.state.run.startedAt,
@@ -263,6 +325,7 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
       tasks: ctx.pool.list()
     },
     lastCycle: ctx.state.lastCycle,
+    lastRun: ctx.state.lastRun,
     memoryLoadedAt: ctx.memory?.loadedAt ?? null,
     repoReady: ctx.repoReady,
     lastError: ctx.state.lastError,
@@ -286,6 +349,15 @@ async function save(ctx: Context): Promise<void> {
       queue: ctx.queue?.counts ?? ctx.state.lastCycle?.queue ?? null,
       ...ctx.cycleStats
     };
+  }
+  if (ctx.state.run.startedAt && !ctx.state.lastRun?.clean) {
+    ctx.state.lastRun = buildRunSummary({
+      state: ctx.state,
+      profileName: ctx.profileName,
+      profile: ctx.profile,
+      clean: false,
+      stopReason: null
+    });
   }
   await ctx.mutex.run(async () => {
     await saveState(ctx.profilePaths, ctx.state);
@@ -373,7 +445,8 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
 
 async function heartbeatPass(ctx: Context): Promise<void> {
   const now = Date.now();
-  for (const task of activeClaims(ctx)) {
+  const live = Object.values(ctx.state.tasks).filter((task) => ["claimed", "working", "waiting_human"].includes(task.status));
+  for (const task of live) {
     if (!task.agentName || !task.id) continue;
     const last = task.lastHeartbeatAt ? new Date(task.lastHeartbeatAt).getTime() : 0;
     if (now - last < 10 * 60 * 1000) continue;
@@ -385,7 +458,7 @@ async function heartbeatPass(ctx: Context): Promise<void> {
       ctx.logger.info(`Heartbeat #${task.number}`, { agent: agent.name });
     } catch (error) {
       ctx.logger.warn(`Heartbeat failed for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
-      if ([409, 410].includes((error as { status?: number }).status ?? 0)) {
+      if ([409, 410].includes((error as { status?: number }).status ?? 0) && task.status !== "waiting_human") {
         task.status = "queued";
         task.claimId = undefined;
         task.lastError = "claim lost";
@@ -531,7 +604,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   }
 
   const worker = claim.agent;
-  const branch = branchName(issue, issue.title);
+  const branch = branchName(issue, issue.title, ctx.profile.workflow.branchPrefix);
   const dir = await prepareWorktree(ctx.github, ctx.profilePaths, issue, branch);
   setTask(ctx.state, issue, {
     status: "working",
@@ -583,8 +656,26 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   await ctx.github.git(["add", "-A"], { cwd: dir });
   const changed = await ctx.github.stagedChangedFiles(dir);
   if (!changed.length) return handleWorkFailure(ctx, issue, item, { error: "agent made no changes" }, worker, dir);
-  if (changed.length > 5) {
-    return handleWorkFailure(ctx, issue, item, { error: `change touches ${changed.length} files (max 5)` }, worker, dir);
+  if (changed.length > ctx.profile.workflow.maxFiles) {
+    return handleWorkFailure(
+      ctx,
+      issue,
+      item,
+      { error: `change touches ${changed.length} files (max ${ctx.profile.workflow.maxFiles})` },
+      worker,
+      dir
+    );
+  }
+  const diffStats = await ctx.github.diffStats(dir).catch(() => ({ files: 0, insertions: 0, deletions: 0, total: 0 }));
+  if (diffStats.total > ctx.profile.workflow.maxLines) {
+    return handleWorkFailure(
+      ctx,
+      issue,
+      item,
+      { error: `change is ${diffStats.total} lines (max ${ctx.profile.workflow.maxLines})` },
+      worker,
+      dir
+    );
   }
   const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
   if (protectedHits.length) {
@@ -610,10 +701,10 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
       issue: issue.number,
       results: checks.results.map((check) => ({ name: check.name, ok: check.ok, output: check.output }))
     });
-    return handleWorkFailure(ctx, issue, item, { error: "checks failed" }, worker, dir);
+    return handleWorkFailure(ctx, issue, item, { error: checksFailureText(checks) }, worker, dir);
   }
 
-  const message = normalizeCommitMessage(result.commitMessage, issue);
+  const message = normalizeCommitMessage(result.commitMessage, issue, ctx.profile.workflow.commitTypes);
   const commit = await ctx.github.commitAll(dir, message);
   if (!commit.committed) {
     return handleWorkFailure(ctx, issue, item, { error: "nothing to commit" }, worker, dir);
@@ -719,30 +810,53 @@ async function handleWorkFailure(
   const attempts = (task?.attempts ?? 0) + 1;
   const maxAttempts = ctx.profile.limits.maxAttemptsPerTask;
   const error = result.error ?? result.blocker ?? "unknown failure";
-  ctx.logger.warn(`#${issue.number} attempt ${attempts} failed: ${truncate(error, 300)}`);
+  ctx.state.run.failures += 1;
+  const environmentHint = classifyEnvironmentFailure(`${error}\n${result.tail ?? ""}`);
+  ctx.logger.warn(`#${issue.number} attempt ${attempts} failed: ${truncate(error, 300)}`, {
+    environmentHint: environmentHint ?? undefined
+  });
   ctx.state.lastError = { at: new Date().toISOString(), issue: issue.number, error: truncate(error, 500) };
   history(ctx, { type: "failure", issue: issue.number, detail: truncate(error, 300), data: { attempts } });
 
   await cleanupWorktree(ctx.github, dir);
 
-  if (result.blocked) {
+  if (result.blocked || environmentHint) {
+    const body = environmentHint
+      ? `#${issue.number} is blocked by the environment: ${environmentHint}. ${result.blocker ?? result.summary ?? error}`
+      : `#${issue.number} needs a human: ${result.blocker ?? result.summary ?? error}`;
     const escalation = await escalate(worker.client, ctx.profile, ctx.profilePaths, ctx.state, {
       issue,
       type: "blocker",
-      body: `#${issue.number} needs a human: ${result.blocker ?? result.summary ?? error}`,
+      body,
       agentName: worker.name,
       logger: ctx.logger,
       notifyCommand: ctx.profile.hitl.notifyCommand,
       maxOpen: ctx.profile.limits.maxOpenEscalations
     });
-    if (escalation.ok) history(ctx, { type: "escalation", issue: issue.number, detail: "blocker", data: { id: escalation.escalation?.id } });
-    if (!escalation.ok && !escalation.skipped) {
-      setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined });
+    if (escalation.ok) {
+      history(ctx, { type: "escalation", issue: issue.number, detail: environmentHint ?? "blocker", data: { id: escalation.escalation?.id } });
+      await notifyNeedsYou(ctx);
+    }
+    if (!escalation.ok) {
+      await worker.client.release(issue.id).catch(() => {});
+      setTask(ctx.state, issue, {
+        status: "queued",
+        attempts,
+        lastError: escalation.skipped ? `escalation cap reached: ${error}` : error,
+        worktree: undefined,
+        claimId: undefined
+      });
     }
   } else if (attempts >= maxAttempts) {
     setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined });
     await worker.client.release(issue.id).catch(() => {});
     await recordTaskNote(worker.client, issue, "failed", error, result.tail ?? "", ctx.state, worker.name);
+    await notifyProfile(
+      ctx.profile,
+      `auto-work: task #${issue.number} failed`,
+      `${truncate(error, 200)}\nauto-work status --verbose`,
+      ctx.logger
+    );
   } else {
     setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined });
   }
@@ -776,7 +890,10 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
           notifyCommand: ctx.profile.hitl.notifyCommand,
           maxOpen: ctx.profile.limits.maxOpenEscalations
         });
-        if (escalation.ok) history(ctx, { type: "escalation", issue: issue.number, detail: "confirmation blocker" });
+        if (escalation.ok) {
+          history(ctx, { type: "escalation", issue: issue.number, detail: "confirmation blocker" });
+          await notifyNeedsYou(ctx);
+        }
       }
       return false;
     }
@@ -954,6 +1071,7 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
     headSha: result.headSha ?? issue.pullRequestHeadSha ?? undefined
   });
   counter(ctx).reviews += 1;
+  ctx.state.run.reviews += 1;
   ctx.cycleStats.reviews += 1;
   history(ctx, {
     type: "review",
@@ -1014,6 +1132,8 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
     description: `Reviewed #${issue.number}. Test verdicts are good to merge; PR ${issue.pullRequestUrl} reports checks ${prStatus.checks} and mergeable ${String(prStatus.mergeable)}.`
   });
   counter(ctx).reviews += 1;
+  ctx.state.run.reviews += 1;
+  ctx.state.run.mergeReviews += 1;
   ctx.cycleStats.reviews += 1;
   history(ctx, { type: "merge_review", issue: issue.number, detail: manager.name, data: { verdict: "accept" } });
   markRecent(ctx, item.key);
@@ -1057,6 +1177,7 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
     }
     if (did) {
       counter(ctx).aux += 1;
+      ctx.state.run.aux += 1;
       ctx.cycleStats.aux += 1;
       history(ctx, { type: "aux", issue: item.issueNumber, idea: item.ideaNumber, detail: item.kind });
     }
@@ -1064,6 +1185,7 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
   } catch (error) {
     ctx.logger.warn(`Aux ${item.kind} failed: ${error instanceof Error ? error.message : String(error)}`);
     counter(ctx).errors += 1;
+    ctx.state.run.failures += 1;
     ctx.cycleStats.errors += 1;
     markRecent(ctx, item.key);
     return false;
@@ -1369,6 +1491,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
       });
       const createdIdea = normalizeIdea(created);
       counter(ctx).discoveries += 1;
+      ctx.state.run.discoveries += 1;
       ctx.logger.info(`Filed idea #${createdIdea?.number ?? "?"}: ${idea.title}`);
     } catch (error) {
       const status = (error as { status?: number }).status;
@@ -1498,13 +1621,15 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
   pruneState(ctx.state);
   ctx.state.lastCycleMs = Date.now() - started;
   await save(ctx);
+  await notifyNeedsYou(ctx);
   ctx.logger.info("Cycle complete", {
     cycles: ctx.state.cycles,
     ms: ctx.state.lastCycleMs,
     queue: ctx.queue.counts,
     inFlight: ctx.pool.total(),
     deliveries: counter(ctx).deliveries,
-    reviews: counter(ctx).reviews
+    reviews: counter(ctx).reviews,
+    needsYou: Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open").length
   });
   return { ok: true };
 }
@@ -1526,6 +1651,7 @@ async function processWorkSafe(ctx: Context, item: QueueEntry, worker?: AgentCli
   } catch (error) {
     ctx.logger.error(`Delivery for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
     counter(ctx).errors += 1;
+    ctx.state.run.failures += 1;
     ctx.cycleStats.errors += 1;
     history(ctx, { type: "failure", issue: item.issueNumber, detail: error instanceof Error ? error.message : String(error) });
     markRecent(ctx, item.key);
@@ -1540,6 +1666,7 @@ async function processReviewSafe(ctx: Context, item: QueueEntry): Promise<void> 
   } catch (error) {
     ctx.logger.error(`Review for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
     counter(ctx).errors += 1;
+    ctx.state.run.failures += 1;
     ctx.cycleStats.errors += 1;
     history(ctx, { type: "failure", issue: item.issueNumber, detail: error instanceof Error ? error.message : String(error) });
     markRecent(ctx, item.key);
@@ -1662,7 +1789,8 @@ async function createContext(
     runLimits: options.runLimits,
     auxThisCycle: 0,
     reservedAgents: new Set(),
-    cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 }
+    cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 },
+    lastNeedsYouCount: null
   };
 }
 
@@ -1757,14 +1885,40 @@ export async function runLoop(options: {
   for (const task of Object.values(state.tasks)) {
     if (task.status === "working") task.status = "queued";
   }
+  if (state.run.startedAt && !state.lastRun?.clean) {
+    const previous = buildRunSummary({
+      state,
+      profileName: loaded.profileName,
+      profile: loaded.profile,
+      clean: false,
+      stopReason: "killed",
+      endedAt: state.lastRun?.lastActivityAt ?? state.lastCycleAt ?? state.run.startedAt
+    });
+    state.lastRun = previous;
+    await writeRunSummary(loaded.profilePaths, previous).catch(() => {});
+    logger.warn("Previous run did not shut down cleanly", { startedAt: previous.startedAt, deliveries: previous.deliveries });
+    console.log(formatRunSummary(previous, { files: true }));
+  }
   const storedLimits = await readRunLimitsFile(loaded.profilePaths);
   const runLimits = resolveRunLimits(loaded.profile, options.limits ?? storedLimits ?? null);
   state.run = {
     startedAt: new Date().toISOString(),
     limits: runLimits,
     stopReason: null,
-    deliveries: 0
+    deliveries: 0,
+    reviews: 0,
+    mergeReviews: 0,
+    discoveries: 0,
+    aux: 0,
+    failures: 0
   };
+  state.lastRun = buildRunSummary({
+    state,
+    profileName: loaded.profileName,
+    profile: loaded.profile,
+    clean: false,
+    stopReason: null
+  });
   state.lastCycle = null;
   await saveState(loaded.profilePaths, state);
   await writePid(loaded.profilePaths, process.pid);
@@ -1859,6 +2013,15 @@ export async function runLoop(options: {
     if (!stopReason && controller.signal.aborted) stopReason = "stop";
     ctx.state.run.stopReason = stopReason;
     ctx.state.stoppedAt = new Date().toISOString();
+    const finalSummary = buildRunSummary({
+      state: ctx.state,
+      profileName: ctx.profileName,
+      profile: ctx.profile,
+      clean: true,
+      stopReason: stopReason ?? "stop",
+      endedAt: ctx.state.stoppedAt
+    });
+    ctx.state.lastRun = finalSummary;
     const hardStop = stopReason === "stop" || stopReason === "error" || controller.signal.aborted;
     if (hardStop) {
       controller.abort();
@@ -1872,6 +2035,8 @@ export async function runLoop(options: {
     ctx.state.activePids = [];
     await save(ctx).catch(() => {});
     await writeStatus(ctx, { running: false }).catch(() => {});
+    await writeRunSummary(ctx.profilePaths, finalSummary).catch(() => {});
+    console.log(formatRunSummary(finalSummary, { files: true }));
     await releaseLock(loaded.profilePaths);
     await clearPid(loaded.profilePaths);
     logger.info("Auto-work loop stopped", { stopReason });

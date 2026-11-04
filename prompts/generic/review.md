@@ -18,6 +18,10 @@
 - Worktree at the PR head: `{{worktree}}`
 - Repo: `{{repoUrl}}`
 
+## Repository rules
+
+{{workflowRules}}
+
 ## Checks configured for this project
 
 {{checks}}

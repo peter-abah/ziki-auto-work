@@ -29,6 +29,8 @@ Per-platform commands are in [`requirements.md`](./requirements.md).
 - If the user wants full-auto flags, explain the risk first.
 - Keys come first. Do not ask for a project ID or platform before you have a
   valid key.
+- Do not assume a local repository. The user may only have Ziki keys; discover
+  or fork the repo.
 
 ## 1. Install and detect
 
@@ -92,28 +94,55 @@ the platform.
 If the key lists several projects, show them and let the user pick. The default
 is the key's own project.
 
-## 4. Stack, repo and checks
+## 4. Discover the repository
 
-Detect the stack separately from the platform:
+The user may not have a clone or fork. Do not assume one exists.
 
-- `pubspec.yaml` → Flutter → checks preset `flutter`
-- `package.json` → Node → checks preset `node`
-- `pyproject.toml` → Python → checks preset `python`
-- `go.mod` → Go → checks preset `go` (`go build ./...`, `go test ./...`)
-- `Cargo.toml` → Rust → checks preset `rust` (`cargo build`, `cargo test`)
+```bash
+auto-work init --discover --keys-file keys.env
+auto-work init --discover --keys-file keys.env --dry-run
+```
 
-Ask for:
+`--discover`:
 
-1. Repo clone URL (their fork) and upstream URL.
-2. Base branch, GitHub repo (`owner/name`), fork owner, default branch.
-3. Team lead handle (optional; needed for the PR template).
-4. Provider (`opencode`, `claude`, `codex`, `gemini`, `custom`).
-5. Model preference (optional; blank means provider default). Offer the
-   candidates from `auto-work models`. Mention that per-role models can make
-   triage/review cheaper.
-6. Checks preset or the explicit commands.
+1. Resolves the project and platform from the keys.
+2. Searches GitHub for the repository using the project slug and platform
+   (`zedu` + `desktop` → `zeduchat/zedu-desktop`).
+3. Shows candidates and asks once if ambiguous.
+4. Uses an existing fork, or asks before creating one. Non-interactive runs
+   need `--fork`.
+5. Detects the default branch, prefers `staging` as the base if it exists, and
+   clones the fork.
+6. Detects the stack from the clone and selects the checks preset.
+7. Writes the config and copies the prompts.
 
-Do not ask for values you can detect from the repo or the CLI.
+Useful overrides: `--project-slug`, `--platform`, `--github-repo`,
+`--upstream`, `--repo-url`, `--fork-owner`, `--base`, `--default-branch`,
+`--stack`, `--checks`, `--profile`, `--team-lead`, `--env-file`.
+
+If discovery cannot resolve the repo, ask for the upstream `owner/name` and
+whether the user wants a fork. Never invent a repository.
+
+Stack presets:
+
+- `pubspec.yaml` → Flutter → `flutter`
+- `package.json` → Node → `node`
+- `pyproject.toml` → Python → `python`
+- `go.mod` → Go → `go`
+- `Cargo.toml` → Rust → `rust`
+
+## 4b. Environment values
+
+Project env belongs in the clone:
+
+- `auto-work init --discover` copies `.env.example` to `.env` if needed.
+- Ask the user to fill `.env`/`.env.local`, or pass `--env-file <path>` to copy
+  a prepared file (mode 600).
+- Never put secrets in the config, prompts, or git.
+- `doctor` checks `repo.requiredEnv` keys exist without printing values.
+
+Provider auth (opencode/Claude/Codex/Gemini) is separate: each CLI uses its own
+login. `executor.env` can pass extra variables to the agent and checks.
 
 ## 5. Write the config
 
@@ -184,9 +213,10 @@ auto-work run --once --dry-run
 
 `doctor` prints the key table, checks the selected provider, `gh`
 auth/scopes, repository push permission, the Ziki project/platform, the repo
-clone, the base branch, fork access, disk space, and stale lock/PID/worktree
-state. `--json` is available for automation. The dry run builds the queue and
-performs **no Ziki or GitHub writes**.
+clone, the base branch, fork access, disk space, env files and
+`repo.requiredEnv`, desktop notifications, and stale lock/PID/worktree state.
+`--json` is available for automation. The dry run builds the queue and performs
+**no Ziki or GitHub writes**.
 
 ## 8. Report back
 
@@ -199,8 +229,9 @@ Tell the user:
 - the number of items in the dry-run queue,
 - the run limit (default 2 hours) and flags: `--max-runtime`, `--max-cycles`,
   `--until`, `--max-deliveries`, `--forever`,
+- how they will be notified (desktop notification + `status --line`),
 - that the loop is **not running**,
-- the command to start it: `auto-work start`.
+- the command to start it: `auto-work` (or `auto-work start`).
 
 ## Provider notes
 

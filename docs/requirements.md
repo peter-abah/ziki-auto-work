@@ -10,13 +10,16 @@ shows up in `auto-work doctor`.
 - Node.js **>= 20** and npm.
 - git, plus SSH or HTTPS push access to your fork.
 - `gh` (GitHub CLI) authenticated with at least the `repo` scope.
-- A Ziki account, project, and platform slug.
+- A Ziki account, project, and platform slug. No local repo or fork is
+  required up front; `init --discover` finds or creates them.
 - **At least one `working` agent key.** `manager`/`merger` keys are optional.
 - A coding CLI with provider auth: opencode, Claude Code, Codex, Gemini CLI, or a
   custom command.
 - The project toolchain used by checks (Flutter/Dart, Node, Go, Rust, Python, …).
 - Network access and roughly 3 GB of free disk.
-- Push and PR permission on the target repository.
+- Push and PR permission on the target repository (or permission to fork it).
+- Project env values in `.env`/`.env.local`, or `executor.env`/`checks[].env`.
+- Optional: `notify-send`/`osascript` for desktop notifications.
 - Optional: systemd/launchd/Task Scheduler, Docker or a VM, sudoers.
 
 ## Linux
@@ -24,7 +27,7 @@ shows up in `auto-work doctor`.
 ```bash
 # Node 20+ (NodeSource example; nvm works too)
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs git
+sudo apt-get install -y nodejs git libnotify-bin
 gh auth login
 
 # Provider (pick one)
@@ -47,6 +50,7 @@ systemctl --user enable --now auto-work-<profile>.service
 ```bash
 brew install node git gh
 gh auth login
+# desktop notifications use the built-in osascript
 npm i -g github:peter-abah/ziki-auto-work
 ```
 

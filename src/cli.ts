@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import type { CheckSpec, Config, ProfileConfig, ProviderName, RunLimitConfig } from "./types.js";
 import {
   DEFAULT_LIMITS,
+  DEFAULT_WORKFLOW,
   PROVIDERS,
   deepMerge,
   defaultConfig,
@@ -30,7 +31,7 @@ import {
   statusService,
   stopService
 } from "./service.js";
-import { loadState, readHistory } from "./state.js";
+import { loadState, readHistory, readPid } from "./state.js";
 import { clientForAgent } from "./ziki.js";
 import { escalationUrl } from "./urls.js";
 import { getProvider } from "./providers/index.js";
@@ -43,14 +44,31 @@ import {
   projectSummary
 } from "./keys.js";
 import { runUninstall } from "./uninstall.js";
+import { GitHub } from "./github.js";
+import { formatRunSummary } from "./run-report.js";
+import {
+  detectedStackAt,
+  ensureFork,
+  githubLogin,
+  inferPlatform,
+  listBranches,
+  parseRepoRef,
+  rankCandidates,
+  repoInfo,
+  repoName,
+  searchRepos
+} from "./discover.js";
 
 const REPO_URL = "https://github.com/peter-abah/ziki-auto-work";
 
 const HELP = `auto-work — autonomous Ziki work loop
 
 Usage:
+  auto-work                         # set up if needed, then run in the foreground
   auto-work install [--keys-file <path>] [--service] [--profile <name>]
   auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes] [--advanced]
+                 [--discover] [--fork] [--dry-run] [--env-file <path>]
+                 [--project-slug <slug>] [--platform <p>] [--github-repo <owner/name>] [--base <branch>]
   auto-work keys import <file>
   auto-work keys check
   auto-work uninstall [--dry-run] [--keep-data] [--yes]
@@ -63,8 +81,8 @@ Usage:
   auto-work stop [--profile <name>] [--all]
   auto-work pause [--profile <name>]
   auto-work resume [--profile <name>]
-  auto-work status [--profile <name>] [--all] [--verbose]
-  auto-work report [--profile <name>] [--since 24h] [--json]
+  auto-work status [--profile <name>] [--all] [--verbose] [--line] [--watch]
+  auto-work report [--profile <name>] [--all] [--since 24h] [--json]
   auto-work history [--profile <name>] [--limit 50]
   auto-work logs [--profile <name>] [--lines 80] [--follow]
   auto-work escalations [--profile <name>]
@@ -82,7 +100,7 @@ interface Flags {
 }
 
 function parseArgs(argv: string[]): { command: string; flags: Flags; positionals: string[] } {
-  const [command = "help", ...rest] = argv;
+  const [command = "", ...rest] = argv;
   const flags: Flags = {};
   const positionals: string[] = [];
   for (let index = 0; index < rest.length; index += 1) {
@@ -302,12 +320,7 @@ function checkPreset(name: string): CheckSpec[] {
 }
 
 function detectedStack(): string {
-  if (existsSync(path.join(process.cwd(), "pubspec.yaml"))) return "flutter";
-  if (existsSync(path.join(process.cwd(), "package.json"))) return "node";
-  if (existsSync(path.join(process.cwd(), "pyproject.toml"))) return "python";
-  if (existsSync(path.join(process.cwd(), "go.mod"))) return "go";
-  if (existsSync(path.join(process.cwd(), "Cargo.toml"))) return "rust";
-  return "generic";
+  return detectedStackAt(process.cwd());
 }
 
 async function detectedProviders(): Promise<ProviderName[]> {
@@ -353,9 +366,10 @@ function baseProfile(overrides: Partial<ProfileConfig>): ProfileConfig {
       pr: { templateFile: "prompts/generic/pr.md" },
       discovery: { enabled: false, maxIdeasPerRun: 3 },
       limits: { ...DEFAULT_LIMITS },
+      workflow: { ...DEFAULT_WORKFLOW },
       pollSeconds: 120,
       memoryRefreshMinutes: 30,
-      hitl: { enabled: true, defaultType: "question", notifyCommand: null }
+      hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null }
     } as ProfileConfig,
     { ...defaults, ...overrides }
   ) as ProfileConfig;
@@ -559,6 +573,245 @@ async function initWizard(flags: Flags): Promise<Config | null> {
   return config;
 }
 
+
+async function initDiscover(flags: Flags): Promise<void> {
+  const yes = Boolean(flags.yes);
+  const dryRun = Boolean(flags["dry-run"]);
+  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const gh = str(flags, "gh") || "gh";
+
+  let existing: Config;
+  try {
+    existing = await loadConfig();
+  } catch {
+    existing = defaultConfig();
+  }
+
+  const keysFile = str(flags, "keys-file") || process.env.AUTO_WORK_KEYS_FILE;
+  if (keysFile) {
+    const count = await importKeys(keysFile);
+    console.log(`Imported ${count} ZIKI key(s) into ${paths().envFile}`);
+  }
+  const env = await loadEnv();
+  const inspections = await inspectKeys(env, baseUrl);
+  if (!inspections.length) {
+    printKeyInstructions();
+    process.exitCode = 1;
+    return;
+  }
+  console.log("");
+  console.log("Agent keys:");
+  console.log(formatKeyTable(inspections));
+  console.log("");
+  const valid = inspections.filter((item) => item.ok);
+  if (!valid.length) throw new Error("No valid Ziki keys. Fix them with `auto-work keys check`.");
+  const roles = assignRoles(inspections);
+  if (!roles.workers.length) console.warn("warning: no working key; manager keys will also do working tasks.");
+  if (!roles.managers.length) {
+    console.warn("warning: no manager/merger key (optional; merge reviews and manager-only actions will be skipped).");
+  }
+
+  const summary = projectSummary(valid);
+  const projects = knownProjects(valid);
+  let projectId = str(flags, "project-id") || summary?.id || "";
+  let projectSlug = str(flags, "project-slug") || summary?.slug || "";
+  let projectName = str(flags, "project-name") || summary?.name || "";
+  if (!projectId || !projectSlug) {
+    if (yes) throw new Error("Could not resolve a Ziki project. Pass --project-id and --project-slug.");
+    projectId = await ask("Ziki project ID", projectId);
+    projectSlug = await ask("Ziki project slug", projectSlug || projectId);
+    projectName = await ask("Ziki project name", projectName || projectSlug);
+  } else if (projects.length > 1 && !yes) {
+    console.log("Projects available to your keys:");
+    for (const project of projects) console.log(`  ${project.slug}  ${project.name}  (${project.id})`);
+    const chosen = await ask("Project slug", projectSlug);
+    const match = projects.find((project) => project.slug === chosen || project.id === chosen);
+    if (match) {
+      projectId = match.id;
+      projectSlug = match.slug;
+      projectName = match.name;
+    }
+  }
+
+  let platforms: Awaited<ReturnType<typeof listPlatforms>> = [];
+  try {
+    platforms = await listPlatforms(baseUrl, valid[0]!.key);
+  } catch (error) {
+    console.warn(`warning: could not list Ziki platforms: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  let githubRepo = str(flags, "github-repo") || str(flags, "upstream");
+  let repoRef = parseRepoRef(githubRepo);
+  const repoUrlOverride = str(flags, "repo-url");
+  const forkOwnerFlag = str(flags, "fork-owner");
+  if (!repoRef) {
+    if (!githubRepo) {
+      const login = await githubLogin(gh);
+      let candidates = await searchRepos(projectSlug, { gh, limit: 30 });
+      const requestedPlatform = str(flags, "platform") || null;
+      candidates = rankCandidates(candidates, projectSlug, requestedPlatform);
+      if (!candidates.length) {
+        if (yes) throw new Error(`No GitHub repository found for "${projectSlug}". Pass --github-repo owner/name.`);
+        githubRepo = await ask("Upstream GitHub repo (owner/name)", "");
+        repoRef = parseRepoRef(githubRepo);
+      } else if (candidates.length === 1 || yes) {
+        repoRef = parseRepoRef(candidates[0]!.fullName);
+        if (!yes) console.log(`Repository: ${candidates[0]!.fullName}`);
+      } else {
+        console.log("Repository candidates:");
+        candidates.slice(0, 10).forEach((candidate, index) => {
+          console.log(`  ${index + 1}. ${candidate.fullName}${candidate.description ? ` — ${candidate.description}` : ""}`);
+        });
+        const chosen = await ask("Repository (number or owner/name)", candidates[0]!.fullName);
+        const index = Number(chosen);
+        const selected = Number.isInteger(index) && index >= 1 && index <= Math.min(10, candidates.length)
+          ? candidates[index - 1]!
+          : candidates.find((candidate) => candidate.fullName === chosen || candidate.fullName.endsWith(`/${chosen}`)) ?? null;
+        if (!selected) throw new Error(`Unknown repository "${chosen}"`);
+        repoRef = parseRepoRef(selected.fullName);
+      }
+    } else {
+      throw new Error(`Could not parse repository "${githubRepo}". Use owner/name or a GitHub URL.`);
+    }
+  }
+  if (!repoRef) throw new Error("A repository is required.");
+
+  const upstream = `${repoRef.owner}/${repoRef.name}`;
+  const info = await repoInfo(upstream, gh);
+  if (!info) throw new Error(`Cannot read ${upstream}. Check gh auth and the repository name.`);
+  const defaultBranch = info.defaultBranch;
+  const branches = await listBranches(upstream, gh);
+  const base = str(flags, "base") || (branches.includes("staging") ? "staging" : defaultBranch);
+
+  const user = await githubLogin(gh);
+  const repoUrlOwner = repoUrlOverride ? parseRepoRef(repoUrlOverride)?.owner : null;
+  const forkOwner = forkOwnerFlag || repoUrlOwner || user;
+  const org = forkOwner !== user ? forkOwner : undefined;
+  const createFork = Boolean(flags.fork) && !dryRun;
+  let fork = await ensureFork({ upstream, user: forkOwner, org, createFork, gh });
+  if (fork.needsFork && !dryRun) {
+    if (yes) throw new Error(`Fork ${fork.forkRepo} does not exist. Pass --fork to create it.`);
+    const answer = await ask(`Create fork ${fork.forkRepo} from ${upstream}? (y/N)`, "n");
+    if (/^y/i.test(answer)) fork = await ensureFork({ upstream, user: forkOwner, org, createFork: true, gh });
+    else throw new Error(`A fork is required. Create ${fork.forkRepo} or pass --repo-url with an existing fork.`);
+  }
+  if (repoUrlOverride) {
+    fork = { ...fork, forkGitUrl: repoUrlOverride, exists: true, needsFork: false };
+  }
+
+  let platform = str(flags, "platform") || inferPlatform(repoName(upstream)) || "";
+  const platformDefault = platforms.find((entry) => entry.slug === platform)?.slug ?? platforms[0]?.slug ?? platform ?? "desktop";
+  if (!platform) {
+    if (yes) throw new Error("Could not infer the Ziki platform. Pass --platform desktop/mobile/web.");
+    platform = await ask(`Platform slug (${platforms.map((entry) => entry.slug).join("/") || platformDefault})`, platformDefault);
+  }
+  if (platforms.length && !platforms.some((entry) => entry.slug === platform)) {
+    console.warn(`warning: platform "${platform}" is not in Ziki's platform list.`);
+  }
+
+  const stackFlag = str(flags, "stack");
+  const checksFlag = str(flags, "checks");
+  const stack = stackFlag || "generic";
+  const providerDefault = (await detectedProviders())[0] ?? "opencode";
+  const provider = (str(flags, "provider") || (yes ? providerDefault : await ask(`Provider (${PROVIDERS.join("/")})`, providerDefault))) as ProviderName;
+  if (!PROVIDERS.includes(provider)) throw new Error(`Unknown provider "${provider}"`);
+  const model = str(flags, "model") || (yes ? "" : await ask("Model (blank = provider default)", ""));
+  const teamLead = str(flags, "team-lead") || "";
+  const profileName = str(flags, "profile") || `${projectSlug}-${platform}`;
+  const promptsDir = path.join(paths().configDir, "prompts", safeName(profileName));
+  const checks = checkPreset(checksFlag || stack);
+  const parity = str(flags, "parity") || "";
+  const envFile = str(flags, "env-file");
+
+  const profile = baseProfile({
+    ziki: { baseUrl, projectId, projectSlug, platform, ...(projectName ? { projectName } : {}) },
+    stack,
+    repo: {
+      url: fork.forkGitUrl,
+      upstream: `https://github.com/${upstream}.git`,
+      base,
+      githubRepo: upstream,
+      forkOwner: fork.forkOwner,
+      defaultBranch,
+      envFiles: [".env", ".env.local"],
+      ...(teamLead ? { teamLead } : {})
+    },
+    agents: { workers: roles.workers, managers: roles.managers },
+    executor: { provider, model: model || null, timeoutMs: 2_700_000, permissionMode: "auto" },
+    checks,
+    platformMatch: { keywords: [platform] },
+    prompts: { dir: promptsDir },
+    pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
+    discovery: { enabled: Boolean(parity), ...(parity ? { parityFile: parity } : {}) }
+  });
+
+  const config: Config = {
+    version: 3,
+    activeProfile: profileName,
+    defaults: existing.defaults,
+    profiles: { ...existing.profiles, [profileName]: profile },
+    ...(existing.doctor ? { doctor: existing.doctor } : {})
+  };
+  const validation = validateConfig(config);
+  if (!validation.ok) throw new Error(`Config is invalid:\n${validation.errors.join("\n")}`);
+
+  if (dryRun) {
+    console.log("");
+    console.log(`Discovery plan for profile "${profileName}"`);
+    console.log(`  project:  ${projectSlug} (${projectId})`);
+    console.log(`  platform: ${platform}`);
+    console.log(`  upstream: ${upstream} (${defaultBranch})`);
+    console.log(`  base:     ${base}`);
+    console.log(`  fork:     ${fork.forkRepo}${fork.created ? " (created)" : fork.needsFork ? " (missing; use --fork)" : ""}`);
+    console.log(`  clone:    ${fork.forkGitUrl}`);
+    console.log(`  provider: ${provider}${model ? ` · ${model}` : ""}`);
+    console.log(`  checks:   ${checks.map((check) => check.name).join(", ") || "(none)"}`);
+    console.log("");
+    console.log("No config, fork, clone or other writes were made.");
+    return;
+  }
+
+  await copyPromptSet(profileName);
+  await saveConfig(config);
+
+  let repoDir: string | null = null;
+  try {
+    const loaded = await loadProfile(profileName);
+    const github = new GitHub({ profile: loaded.profile, profileName, reposDir: loaded.profilePaths.reposDir });
+    repoDir = await github.ensureRepo();
+  } catch (error) {
+    console.warn(`warning: could not clone yet: ${error instanceof Error ? error.message : String(error)}`);
+    console.warn("The config is written; fix access and run `auto-work doctor` to clone.");
+  }
+
+  if (repoDir && !stackFlag) {
+    const detected = detectedStackAt(repoDir);
+    if (detected !== "generic") {
+      profile.stack = detected;
+      if (!checksFlag) profile.checks = checkPreset(detected);
+      await saveConfig(config);
+      console.log(`Detected stack: ${detected}`);
+    }
+  }
+
+  if (envFile && repoDir) {
+    const text = await readFile(envFile, "utf8");
+    const target = path.join(repoDir, ".env");
+    await writeFile(target, text, { encoding: "utf8", mode: 0o600 });
+    await chmod(target, 0o600).catch(() => {});
+    console.log(`Env file copied to ${target} (mode 600, gitignored by the repo's .env rules).`);
+  }
+
+  console.log("");
+  console.log(`Configured profile "${profileName}".`);
+  console.log(`  config: ${paths().configFile}`);
+  console.log(`  repo:   ${upstream} → ${base} (fork ${fork.forkRepo})`);
+  console.log(`  ziki:   ${projectSlug}/${platform}`);
+  console.log(`  keys:   workers=${roles.workers.join(",") || "(none)"} managers=${roles.managers.join(",") || "(none)"}`);
+  if (repoDir) console.log(`  clone:  ${repoDir}`);
+  nextCommands();
+}
+
 function nextCommands(): void {
   console.log("");
   console.log("Next:");
@@ -573,7 +826,7 @@ function nextCommands(): void {
 async function init(flags: Flags): Promise<void> {
   if (flags["print-ai-prompt"]) {
     console.log(
-      `Set up auto-work in this repository. Read ${path.join(PACKAGE_ROOT, "docs/AI-SETUP.md")} and follow it exactly. Detect the environment first, ask only for what is missing, write the config, run \`auto-work config --validate\`, \`auto-work doctor\`, and \`auto-work run --once --dry-run\`. Do not start the loop.`
+      `Set up auto-work for my Ziki project. Read ${path.join(PACKAGE_ROOT, "docs/AI-SETUP.md")} and follow it exactly. I will provide agent keys. Do not assume a local repository: resolve the project and platform from Ziki, find (or fork and clone) the repository, write the config, then run \`auto-work config --validate\`, \`auto-work doctor\`, and \`auto-work run --once --dry-run\`. Do not start the loop.`
     );
     return;
   }
@@ -582,6 +835,10 @@ async function init(flags: Flags): Promise<void> {
       JSON.stringify(defaultConfig(), null, 2)
     );
     console.log(template);
+    return;
+  }
+  if (flags.discover) {
+    await initDiscover(flags);
     return;
   }
   if (flags["from-file"]) {
@@ -751,60 +1008,112 @@ async function resume(flags: Flags): Promise<void> {
   console.log("Resumed.");
 }
 
+function statusLine(name: string, result: Awaited<ReturnType<typeof statusService>>): string {
+  const status = (result.status ?? {}) as Record<string, any>;
+  const state = result.running
+    ? `running${result.paused ? " [paused]" : ""}`
+    : `stopped${status.run?.stopReason ? ` (${status.run.stopReason})` : ""}`;
+  const spent = status.run?.elapsedMs != null ? formatDuration(status.run.elapsedMs) : "-";
+  const limit =
+    status.run?.limits?.maxRuntimeMinutes != null
+      ? formatDuration(status.run.limits.maxRuntimeMinutes * 60 * 1000)
+      : "none";
+  const needs = status.needsYou?.count ?? (status.escalations as unknown[] | undefined)?.length ?? 0;
+  const inflight = status.inFlight?.total ?? 0;
+  const queue = status.queue ? Object.values(status.queue as Record<string, number>).reduce((sum, value) => sum + Number(value || 0), 0) : 0;
+  const last = status.lastCycleMs != null ? formatDuration(status.lastCycleMs) : "-";
+  const lastRun = status.lastRun
+    ? ` | last run: ${status.lastRun.cycles}c/${status.lastRun.deliveries}d${status.lastRun.clean ? "" : " (incomplete)"}`
+    : "";
+  return `${name} | ${state} | ${spent}/${limit} | Ziki needs you: ${needs} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}`;
+}
+
 async function status(flags: Flags): Promise<void> {
   const config = await loadConfig();
   const names = flags.all ? Object.keys(config.profiles) : [await resolveProfileName(flags)];
+  const compact = Boolean(flags.line || flags.watch);
+  if (flags.watch) {
+    const interval = Math.max(5, Number(str(flags, "interval") ?? 30));
+    for (;;) {
+      const lines: string[] = [];
+      for (const name of names.filter(Boolean)) {
+        lines.push(statusLine(name, await statusService(name)));
+      }
+      if (process.stdout.isTTY) process.stdout.write(`\r${lines.join(" | ")}\x1b[K`);
+      else console.log(lines.join("\n"));
+      await new Promise((resolve) => setTimeout(resolve, interval * 1000));
+    }
+  }
   for (const name of names.filter(Boolean)) {
     const result = await statusService(name);
+    if (compact) console.log(statusLine(name, result));
+    else {
+      // printDetailedStatus reads flags.verbose from the closure.
+      printDetailedStatusWithFlags(flags, name, result);
+    }
+  }
+}
+
+function printDetailedStatusWithFlags(
+  flags: Flags,
+  name: string,
+  result: Awaited<ReturnType<typeof statusService>>
+): void {
+  const verbose = Boolean(flags.verbose);
+  console.log(
+    `\n${name}: ${result.running ? `running (pid ${result.pid})` : "not running"}${result.paused ? " [paused]" : ""}`
+  );
+  if (!result.status) return;
+  const status = result.status as Record<string, any>;
+  console.log(`  cycles: ${status.cycles ?? 0}  last: ${status.lastCycleAt ?? "never"}`);
+  if (status.run) {
     console.log(
-      `\n${name}: ${result.running ? `running (pid ${result.pid})` : "not running"}${result.paused ? " [paused]" : ""}`
+      `  run: ${formatDuration(status.run.elapsedMs)} elapsed · ${formatDuration(status.run.remainingMs)} remaining` +
+        ` · limit ${status.run.limits?.maxRuntimeMinutes != null ? `${status.run.limits.maxRuntimeMinutes}m` : "none"}` +
+        ` · stop ${status.run.stopReason ?? "-"}`
     );
-    if (result.status) {
-      const status = result.status as Record<string, any>;
-      console.log(`  cycles: ${status.cycles ?? 0}  last: ${status.lastCycleAt ?? "never"}`);
-      if (status.run) {
-        console.log(
-          `  run: ${formatDuration(status.run.elapsedMs)} elapsed · ${formatDuration(status.run.remainingMs)} remaining` +
-            ` · limit ${status.run.limits?.maxRuntimeMinutes != null ? `${status.run.limits.maxRuntimeMinutes}m` : "none"}` +
-            ` · stop ${status.run.stopReason ?? "-"}`
-        );
-        if (status.run.remainingCycles !== null || status.run.remainingDeliveries !== null) {
-          console.log(
-            `  remaining: cycles ${status.run.remainingCycles ?? "∞"} · deliveries ${status.run.remainingDeliveries ?? "∞"}`
-          );
-        }
-      }
-      console.log(`  counters: ${JSON.stringify(status.counters ?? {})}`);
-      if (status.inFlight) {
-        console.log(
-          `  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`
-        );
-      }
-      if (status.lastCycle) {
-        console.log(
-          `  last cycle: ${status.lastCycle.ms}ms · deliveries ${status.lastCycle.deliveries} · reviews ${status.lastCycle.reviews} · aux ${status.lastCycle.aux}`
-        );
-      }
-      const escalations = (status.escalations as Array<Record<string, unknown>> | undefined) ?? [];
-      if (escalations.length) {
-        console.log("  needs you:");
-        for (const escalation of escalations) {
-          console.log(`    - ${escalation.type} #${escalation.issue}: ${escalation.body}`);
-        }
-      }
-      if (flags.verbose) {
-        const taskList = (status.taskList as Array<Record<string, unknown>> | undefined) ?? [];
-        console.log(`  tasks (${taskList.length}):`);
-        for (const task of taskList) {
-          console.log(
-            `    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`
-          );
-        }
-        const inFlight = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined) ?? [];
-        for (const task of inFlight) {
-          console.log(`    ~ ${task.kind} ${task.key} (${Math.round(Number(task.ageMs ?? 0) / 1000)}s)`);
-        }
-      }
+    if (status.run.remainingCycles !== null || status.run.remainingDeliveries !== null) {
+      console.log(
+        `  remaining: cycles ${status.run.remainingCycles ?? "∞"} · deliveries ${status.run.remainingDeliveries ?? "∞"}`
+      );
+    }
+  }
+  console.log(`  counters: ${JSON.stringify(status.counters ?? {})}`);
+  const needs = status.needsYou?.count ?? 0;
+  console.log(`  Ziki needs you: ${needs}${needs ? ` → ${status.needsYou?.link}` : ""}`);
+  if (status.inFlight) {
+    console.log(
+      `  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`
+    );
+  }
+  if (status.lastCycle) {
+    console.log(
+      `  last cycle: ${status.lastCycle.ms}ms · deliveries ${status.lastCycle.deliveries} · reviews ${status.lastCycle.reviews} · aux ${status.lastCycle.aux}`
+    );
+  }
+  if (status.lastRun) {
+    console.log(
+      `  last run: ${status.lastRun.cycles} cycles · ${status.lastRun.deliveries} deliveries · ${status.lastRun.failures} failures · ${status.lastRun.clean ? "clean" : "incomplete"}`
+    );
+  }
+  const escalations = (status.escalations as Array<Record<string, unknown>> | undefined) ?? [];
+  if (escalations.length) {
+    console.log("  needs you:");
+    for (const escalation of escalations) {
+      console.log(`    - ${escalation.type} #${escalation.issue}: ${escalation.body}`);
+    }
+  }
+  if (verbose) {
+    const taskList = (status.taskList as Array<Record<string, unknown>> | undefined) ?? [];
+    console.log(`  tasks (${taskList.length}):`);
+    for (const task of taskList) {
+      console.log(
+        `    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`
+      );
+    }
+    const inFlight = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined) ?? [];
+    for (const task of inFlight) {
+      console.log(`    ~ ${task.kind} ${task.key} (${Math.round(Number(task.ageMs ?? 0) / 1000)}s)`);
     }
   }
 }
@@ -819,6 +1128,26 @@ async function report(flags: Flags): Promise<void> {
   const profileName = await resolveProfileName(flags);
   const jp = profilePaths(profileName);
   const state = await loadState(jp);
+  const aggregate = Boolean(flags.all || flags.since);
+  if (!aggregate) {
+    const summary = state.lastRun;
+    if (flags.json) {
+      console.log(JSON.stringify(summary, null, 2));
+      return;
+    }
+    if (!summary) {
+      console.log("No run summary yet.");
+      return;
+    }
+    const running = Boolean(await readPid(jp));
+    const inProgress = running && !summary.clean;
+    console.log(formatRunSummary(summary, { files: true, inProgress }));
+    if (!summary.clean && !inProgress) {
+      console.log("");
+      console.log("This run did not shut down cleanly; counts reflect the last saved state.");
+    }
+    return;
+  }
   const since = parseSince(str(flags, "since"));
   const entries = await readHistory(jp, 50_000);
   const filtered = since ? entries.filter((entry) => new Date(entry.at).getTime() >= since) : entries;
@@ -850,7 +1179,7 @@ async function report(flags: Flags): Promise<void> {
     openEscalations: openEscalations.length,
     issuesTouched: [...issues],
     prsTouched: [...prs],
-    stopReason: status?.run?.stopReason ?? state.run.stopReason ?? null,
+    stopReason: status?.run?.stopReason ?? state.run.stopReason ?? state.lastRun?.stopReason ?? null,
     limits: status?.run?.limits ?? state.run.limits ?? null,
     lastCycle: status?.lastCycle ?? state.lastCycle ?? null
   };
@@ -1063,8 +1392,33 @@ async function uninstallCommand(flags: Flags): Promise<void> {
   });
 }
 
+async function defaultCommand(): Promise<{ command: string; flags: Flags }> {
+  let config;
+  try {
+    config = await loadConfig();
+  } catch {
+    return { command: "init", flags: {} };
+  }
+  const name = config.activeProfile || Object.keys(config.profiles)[0] || "";
+  if (!name) return { command: "init", flags: {} };
+  try {
+    await loadProfile(name);
+  } catch {
+    return { command: "init", flags: {} };
+  }
+  const pid = await readPid(profilePaths(name));
+  if (pid) return { command: "status", flags: { profile: name, line: true } };
+  return { command: "start", flags: { profile: name, foreground: true } };
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
-  const { command, flags, positionals } = parseArgs(argv);
+  const parsed = parseArgs(argv);
+  let { command, flags, positionals } = parsed;
+  if (!command) {
+    const routed = await defaultCommand();
+    command = routed.command;
+    flags = { ...flags, ...routed.flags };
+  }
   switch (command) {
     case "install":
       await install(flags);

@@ -15,6 +15,9 @@ Hard rules:
   (or `init --keys-file <file>`) before asking for a project or platform. Ziki
   resolves both from the key. At least one `working` agent is required;
   manager/merger keys are optional.
+- **No repo assumption.** The user may only have Ziki keys. Use
+  `auto-work init --discover` (or `--github-repo`/`--fork-owner`) to find,
+  fork and clone the repository; never invent one.
 - **Run limits.** Every `start` has a limit (default 2 hours). Offer
   `--max-runtime`, `--max-cycles`, `--until`, `--max-deliveries`, or `--forever`.
 - Prefer `auto-work init` and `auto-work config --validate` over hand-writing

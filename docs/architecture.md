@@ -9,6 +9,11 @@ src/
   orchestrator.ts    the loop, dispatch and state machine
   scheduler.ts       TaskPool with per-kind and total concurrency limits
   mutex.ts           serialized state/history writes
+  discover.ts        Ziki-first repo/fork/branch/stack discovery
+  rules.ts           workflow/protected-file/PR-template prompt context
+  env.ts             executor/check env and toolchain PATH
+  notify.ts          desktop/command notifications
+  run-report.ts      clean/abrupt run summaries
   ziki.ts            typed Ziki API client
   queue.ts           work-feed prioritisation and platform matching
   memory.ts          instructions, project notes, private notes, mistakes
@@ -62,6 +67,30 @@ cycle. Limits are chosen at `start` and recorded in `status.json` with elapsed
 and remaining time and a stop reason. Concurrency defaults to 2 deliveries,
 1 review, 2 auxiliary tasks, 1 discovery, and 4 agents total; delivery
 concurrency is also capped by `maxActiveClaims`.
+
+## Discovery and rules
+
+`init --discover` resolves the project/platform from the keys, searches GitHub
+for the repository, uses or creates a fork, detects branches, clones, and
+detects the stack. Workflow rules live in `profile.workflow`; prompts receive
+the resolved rules, protected files, PR target/head, team lead and PR template
+via placeholders, and the orchestrator enforces file/line limits.
+
+## Env
+
+Worktrees receive the configured `repo.envFiles` (`.env`, `.env.local` by
+default). Agents inherit the process env, then `executor.env`, then provider
+and per-run env. Checks merge `executor.env` and `checks[].env`. Toolchain
+directories are prepended to `PATH`. Env/auth/tool failures are classified as
+blockers instead of silent retries.
+
+## Notifications and run summary
+
+Open escalations are summarized as `needsYou` in `status.json`. The status line
+shows `Ziki needs you: N`; desktop notifications fire on count changes. Each
+run builds a `RunSummary`, updated on every save, written to `LAST-RUN.json` /
+`LAST-RUN.md` and printed on clean exit. Unclean runs are detected on the next
+start or by `auto-work report`.
 
 ## State and history
 

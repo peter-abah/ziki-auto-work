@@ -31,6 +31,16 @@ export interface RepoConfig {
   teamLead?: string;
   protectedFiles?: string[];
   baselineFile?: string;
+  envFiles?: string[];
+  requiredEnv?: string[];
+}
+
+export interface WorkflowConfig {
+  maxFiles: number;
+  maxLines: number;
+  branchPrefix: string;
+  commitTypes: string[];
+  requireTests: boolean;
 }
 
 export interface AgentsConfig {
@@ -119,6 +129,31 @@ export interface RunState {
   limits: RunLimitConfig | null;
   stopReason: StopReason;
   deliveries: number;
+  reviews: number;
+  mergeReviews: number;
+  discoveries: number;
+  aux: number;
+  failures: number;
+}
+
+export interface RunSummary {
+  profile: string;
+  startedAt: string;
+  endedAt: string | null;
+  clean: boolean;
+  stopReason: StopReason | "killed";
+  cycles: number;
+  deliveries: number;
+  reviews: number;
+  mergeReviews: number;
+  discoveries: number;
+  aux: number;
+  failures: number;
+  interrupted: number;
+  needsYou: number;
+  needsYouLink: string | null;
+  issues: Array<{ number: number | string; title?: string | null; status: string; pr?: string | null }>;
+  lastActivityAt: string | null;
 }
 
 export interface LastCycleSummary {
@@ -131,9 +166,12 @@ export interface LastCycleSummary {
   errors: number;
 }
 
+export type NotifyMode = "auto" | "desktop" | "command" | "off";
+
 export interface HitlConfig {
   enabled: boolean;
   defaultType: EscalationType;
+  notify?: NotifyMode;
   notifyCommand?: string | null;
 }
 
@@ -149,6 +187,7 @@ export interface ProfileConfig {
   prompts: PromptsConfig;
   pr: PrConfig;
   discovery: DiscoveryConfig;
+  workflow: WorkflowConfig;
   limits: LimitsConfig;
   pollSeconds: number;
   memoryRefreshMinutes: number;
@@ -206,6 +245,8 @@ export interface ProfilePaths {
   desktopCacheFile: string;
   runLimitsFile: string;
   historyFile: string;
+  lastRunFile: string;
+  lastRunMdFile: string;
 }
 
 export interface AgentKey {
@@ -466,6 +507,7 @@ export interface State {
   lastError: unknown;
   run: RunState;
   lastCycle: LastCycleSummary | null;
+  lastRun: RunSummary | null;
   activePids: number[];
 }
 

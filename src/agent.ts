@@ -8,6 +8,14 @@ import { getProvider } from "./providers/index.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { spawnCommand } from "./platform/spawn.js";
 import { issueUrl, ideaUrl } from "./urls.js";
+import { resolveCommand } from "./checks.js";
+import { buildAgentEnv } from "./env.js";
+import {
+  formatPrFieldMap,
+  formatProtectedFiles,
+  formatWorkflowRules,
+  loadPrTemplateText
+} from "./rules.js";
 import { truncate } from "./log.js";
 import type { Logger } from "./log.js";
 
@@ -118,8 +126,7 @@ export async function runAgent(options: {
   const child = spawnCommand(command.command, command.args, {
     cwd,
     env: {
-      ...command.env,
-      ...options.extraEnv,
+      ...buildAgentEnv(profile, command.env, options.extraEnv),
       AW_RESULT_PATH: resultPath,
       AW_ROLE: role,
       AW_PROFILE: profile.ziki.projectSlug
@@ -196,7 +203,10 @@ export async function runAgent(options: {
 export function checksText(profile: ProfileConfig): string {
   if (!profile.checks.length) return "(no checks configured)";
   return profile.checks
-    .map((check) => `- ${check.name}: \`${check.command} ${check.args.join(" ")}\``)
+    .map((check) => {
+      const command = resolveCommand(profile, check.command);
+      return `- ${check.name}: \`${command} ${check.args.join(" ")}\``;
+    })
     .join("\n");
 }
 
@@ -221,10 +231,16 @@ export async function runWorker(options: {
   const { profile, profilePaths, issue, memoryText, worktree, branch, base, logger } = options;
   const { resultPath, logPath } = resultPaths(profilePaths, "worker", issue.number);
   const template = await loadPrompt(profile, "worker");
+  const workflowRules = formatWorkflowRules(profile, { branch });
+  const prTemplate = await loadPrTemplateText(profile);
   const prompt = render(template, {
     projectName: projectName(profile),
     stack: profile.stack || profile.ziki.platform,
     repoUrl: profile.repo.githubRepo,
+    githubRepo: profile.repo.githubRepo,
+    forkOwner: profile.repo.forkOwner,
+    prBase: profile.repo.base,
+    teamLead: profile.pr.teamLead || profile.repo.teamLead || "",
     base,
     platform: profile.ziki.platform,
     issueNumber: issue.number,
@@ -239,6 +255,14 @@ export async function runWorker(options: {
     previousError: options.previousError || "(none)",
     memory: memoryText,
     checks: checksText(profile),
+    workflowRules,
+    protectedFiles: formatProtectedFiles(profile),
+    maxFiles: profile.workflow.maxFiles,
+    maxLines: profile.workflow.maxLines,
+    branchPrefix: profile.workflow.branchPrefix,
+    commitTypes: profile.workflow.commitTypes.join(", "),
+    prTemplate,
+    prFieldMap: formatPrFieldMap(),
     worktree,
     branch,
     resultPath,
@@ -318,6 +342,8 @@ export async function runReview(options: {
     issueDescription: issue.description || "",
     memory: memoryText,
     checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile),
+    protectedFiles: formatProtectedFiles(profile),
     worktree,
     prUrl,
     headSha,
@@ -353,6 +379,8 @@ export async function runConfirm(options: {
     issueDescription: issue.description || "",
     memory: memoryText,
     checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile),
+    protectedFiles: formatProtectedFiles(profile),
     resultPath,
     logPath
   });
@@ -385,6 +413,8 @@ export async function runTriage(options: {
     ideaDescription: idea.description || "",
     memory: memoryText,
     checks: checksText(profile),
+    workflowRules: formatWorkflowRules(profile),
+    protectedFiles: formatProtectedFiles(profile),
     resultPath,
     logPath
   });

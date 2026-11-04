@@ -21,6 +21,8 @@ CLI**, or any custom command. It runs on **Linux, macOS, and Windows**.
 - The project toolchain your checks need (for example Flutter/Dart, Node, Go,
   or Rust).
 - Network access and roughly 3 GB of free disk.
+- Project env values in `.env`/`.env.local` (or `executor.env`/`checks[].env`).
+- Optional: `notify-send` (Linux) / `osascript` (macOS) for desktop notifications.
 - Permission to push branches and open PRs on the target repository.
 - Optional: systemd/launchd/Task Scheduler for a managed service, Docker or a
   VM for isolation, and a scoped sudoers entry.
@@ -29,17 +31,20 @@ Per-platform setup commands are in [`docs/requirements.md`](./docs/requirements.
 
 ## Let your AI set it up
 
-Paste this into your AI assistant from the repository you want to work on:
+You only need your Ziki agent keys. Paste this into any AI assistant:
 
 ```text
 Read https://github.com/peter-abah/ziki-auto-work/blob/main/docs/AI-SETUP.md
-and set up ziki-auto-work for this repository. Ask only for what you cannot
-detect. Do not start the loop.
+and set up ziki-auto-work for my Ziki project. I will provide agent keys.
+Do not assume a local repository: resolve the project and platform from Ziki,
+find (or fork and clone) the repository, write the config, then run
+`auto-work config --validate`, `auto-work doctor`, and
+`auto-work run --once --dry-run`. Do not start the loop.
 ```
 
 The AI detects the environment, imports and validates your Ziki keys, resolves
-the project and platform from Ziki, writes the config, and finishes with a dry
-run. It does **not** start the loop.
+the project and platform from Ziki, finds or forks the repository, writes the
+config, and finishes with a dry run. It does **not** start the loop.
 
 ## Manual quickstart
 
@@ -60,30 +65,28 @@ run. It does **not** start the loop.
    npm i -g github:peter-abah/ziki-auto-work
    ```
 
-4. **Set it up**:
+4. **Set it up from Ziki**:
 
    ```bash
-   auto-work init --keys-file keys.env
+   auto-work init --discover --keys-file keys.env
    ```
 
-   `init` validates every key, shows the agent/level/project table, assigns
-   workers and managers, and reads the project and platform from Ziki.
+   `init` validates every key, resolves the project and platform from Ziki,
+   searches GitHub for the repository, uses or creates your fork (with one
+   confirmation), detects the base branch, clones the repo, and detects the
+   stack. If the repo is ambiguous it asks once.
 
-5. **Check and dry-run**:
+5. **Check and run**:
 
    ```bash
    auto-work doctor
    auto-work run --once --dry-run
-   ```
-
-6. **Start** (only when you are ready):
-
-   ```bash
-   auto-work start
+   auto-work            # sets up if needed, then runs in the foreground
    ```
 
 The keys are stored in the config directory's `env` file with mode 600. They are
-never written to the config, prompts, or git.
+never written to the config, prompts, or git. Project env values go in the
+clone's `.env`/`.env.local`; use `--env-file` to copy a prepared file.
 
 ### One-off with npx
 
@@ -141,8 +144,8 @@ The loop finishes the current cycle, then stops with a reason
 ## Status, report and history
 
 ```bash
-auto-work status [--all] [--verbose]
-auto-work report [--profile <name>] [--since 24h] [--json]
+auto-work status [--all] [--verbose] [--line] [--watch]
+auto-work report [--profile <name>] [--all] [--since 24h] [--json]
 auto-work history [--profile <name>] [--limit 50]
 ```
 
@@ -225,17 +228,38 @@ cost notes.
 ## Human-in-the-loop (non-blocking)
 
 When the agent needs you it files a typed Ziki escalation (`question`,
-`work_authorization`, `blocker`, `scope_change`, `human_approval`). You get an
-in-app notification; answer in Ziki. The task goes `waiting_human`, the loop
-continues with other work, and resumes automatically when you answer. Claim
-clocks pause while waiting.
+`work_authorization`, `blocker`, `scope_change`, `human_approval`). Ziki holds
+the details. The task goes `waiting_human`, the loop continues with other work,
+and resumes automatically when you answer.
 
-Open items are mirrored to `NEEDS-HUMAN.md` and:
+Auto-work also tells you directly:
+
+- the foreground status line always shows `Ziki needs you: N`
+- a desktop notification fires when the count goes from 0 to N, and again when
+  it returns to 0
+- no tokens or webhooks are needed; `hitl.notify` can be `auto`, `desktop`,
+  `command`, or `off`
+- `NEEDS-HUMAN.md` mirrors the open items
 
 ```bash
-auto-work escalations
-auto-work status
+auto-work status --line     # one line, tmux/script friendly
+auto-work status --watch    # refresh every 30s
+auto-work escalations       # detailed list; exits 1 when something is open
+auto-work report            # last run summary, including an abrupt end
 ```
+
+If you run headless, use `auto-work status --line` or configure
+`hitl.notify: "command"` with a local script.
+
+## Run summary
+
+When a run ends — limit reached, `stop`, SIGINT/SIGTERM, or a crash — auto-work
+prints a short summary: duration, stop reason, cycles, deliveries, reviews,
+discoveries, aux, failures, interrupted tasks, and `Ziki needs you: N`.
+
+It writes `LAST-RUN.json` and `LAST-RUN.md` to the profile state directory. If
+the process was killed abruptly, the next start (or `auto-work report`) shows
+the last saved state and marks the run incomplete.
 
 ## Checks and safety
 
@@ -243,8 +267,8 @@ auto-work status
   `baseline`, timeouts, required/optional.
 - Pre-existing test failures are baselined once per base SHA; only **new**
   failures block delivery.
-- One ticket per branch/PR; `fix/<number>-<slug>`; ≤5 files.
-- Protected files and secrets are rejected before commit.
+- Workflow rules come from `workflow`: max files, max lines, branch prefix, commit types, tests required. One ticket per branch/PR.
+- Protected files, max files/lines and secrets are rejected before commit.
 - Daily caps, `maxActiveClaims`, `pause`/`resume`, and a `STOP` kill switch.
 - State writes are serialized; in-flight work is tracked so duplicate picks do
   not start.
@@ -252,6 +276,8 @@ auto-work status
   PRs that already exist are reconciled instead of re-running the worker.
 - `stop` aborts in-flight tasks and kills child process trees.
 - The loop **never merges**. A manager/merger agent does that on GitHub.
+- Project env comes from `.env`/`.env.local` copied into each worktree, plus
+  `executor.env` and `checks[].env`. `doctor` validates `repo.requiredEnv`.
 
 Full-auto flags (`--auto`, `--dangerously-skip-permissions`,
 `--dangerously-bypass-approvals-and-sandbox`, `--yolo`) grant broad tool access.
@@ -261,7 +287,9 @@ Read [`docs/safety.md`](./docs/safety.md) before running unattended.
 
 ```bash
 auto-work install [--keys-file <path>] [--service] [--profile <name>]
+auto-work                         # set up if needed, then run in the foreground
 auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes]
+               [--discover] [--fork] [--dry-run] [--env-file <path>]
 auto-work keys import <file>
 auto-work keys check
 auto-work uninstall [--dry-run] [--keep-data] [--yes]
@@ -273,8 +301,8 @@ auto-work start [--profile <name>] [--foreground] [--once] [--dry-run] [--all]
                 [--max-runtime 2h] [--max-cycles N] [--until ISO] [--max-deliveries N] [--forever]
 auto-work run [--profile <name>] [--once] [--dry-run]
 auto-work stop | pause | resume
-auto-work status [--all] [--verbose]
-auto-work report [--profile <name>] [--since 24h] [--json]
+auto-work status [--all] [--verbose] [--line] [--watch]
+auto-work report [--profile <name>] [--all] [--since 24h] [--json]
 auto-work history [--profile <name>] [--limit 50]
 auto-work logs [--profile <name>] [--lines 80] [--follow]
 auto-work escalations | memory | prompts
