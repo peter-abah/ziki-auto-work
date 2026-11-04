@@ -68,7 +68,7 @@ test("command mode runs the configured command with AW_TITLE and AW_BODY", async
       "Title",
       "Body"
     );
-    assert.equal(result.ok, true);
+    assert.equal(result.ok, true, result.detail);
     assert.equal(await readFile(target, "utf8"), "Title|Body");
   } finally {
     await rm(dir, { recursive: true, force: true });
