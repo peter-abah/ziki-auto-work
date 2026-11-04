@@ -135,8 +135,17 @@ export async function listBranches(fullName, gh = "gh", runner = runCommand) {
     return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 export async function gitProtocol(gh = "gh", runner = runCommand) {
-    const result = await runner(gh, ["config", "get", "git_protocol"], { timeoutMs: 20_000 });
-    return result.ok && result.stdout.trim() === "ssh" ? "ssh" : "https";
+    const attempts = [
+        ["config", "get", "git_protocol", "-h", "github.com"],
+        ["config", "get", "git_protocol"]
+    ];
+    for (const args of attempts) {
+        const result = await runner(gh, args, { timeoutMs: 20_000 });
+        const value = result.ok ? result.stdout.trim() : "";
+        if (value)
+            return value === "ssh" ? "ssh" : "https";
+    }
+    return "https";
 }
 export function pickCloneUrl(info, protocol = "https") {
     if (protocol === "ssh" && info.sshUrl)

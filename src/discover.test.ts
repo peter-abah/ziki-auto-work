@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   detectedStackAt,
+  gitProtocol,
   inferPlatform,
   parseRepoRef,
   pickCloneUrl,
@@ -69,4 +70,23 @@ test("detectedStackAt detects common project files", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("gitProtocol reads the github.com host setting before the global value", async () => {
+  const calls: string[][] = [];
+  const runner = async (_cmd: string, args: string[]) => {
+    calls.push(args);
+    if (args.includes("-h")) return { ok: true, code: 0, stdout: "ssh\n", stderr: "", command: "" };
+    return { ok: true, code: 0, stdout: "https\n", stderr: "", command: "" };
+  };
+  assert.equal(await gitProtocol("gh", runner as any), "ssh");
+  assert.ok(calls[0]!.includes("github.com"));
+});
+
+test("gitProtocol falls back to the global value", async () => {
+  const runner = async (_cmd: string, args: string[]) => {
+    if (args.includes("-h")) return { ok: false, code: 1, stdout: "", stderr: "no host", command: "" };
+    return { ok: true, code: 0, stdout: "ssh\n", stderr: "", command: "" };
+  };
+  assert.equal(await gitProtocol("gh", runner as any), "ssh");
 });

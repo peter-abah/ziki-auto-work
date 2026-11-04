@@ -166,8 +166,16 @@ export async function listBranches(fullName: string, gh = "gh", runner: Runner =
 }
 
 export async function gitProtocol(gh = "gh", runner: Runner = runCommand): Promise<"ssh" | "https"> {
-  const result = await runner(gh, ["config", "get", "git_protocol"], { timeoutMs: 20_000 });
-  return result.ok && result.stdout.trim() === "ssh" ? "ssh" : "https";
+  const attempts = [
+    ["config", "get", "git_protocol", "-h", "github.com"],
+    ["config", "get", "git_protocol"]
+  ];
+  for (const args of attempts) {
+    const result = await runner(gh, args, { timeoutMs: 20_000 });
+    const value = result.ok ? result.stdout.trim() : "";
+    if (value) return value === "ssh" ? "ssh" : "https";
+  }
+  return "https";
 }
 
 export function pickCloneUrl(info: RepoInfo, protocol: "ssh" | "https" = "https"): string {

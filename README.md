@@ -12,6 +12,7 @@ CLI**, or any custom command. It runs on **Linux, macOS, and Windows**.
 
 - Linux, macOS, Windows, or WSL.
 - Node.js **>= 20**, npm, git, and `gh` with `gh auth login` (`repo` scope).
+- The npm global bin directory (or `~/.local/bin`) on `PATH`; `doctor` warns if it is missing.
 - SSH or HTTPS push access to your fork.
 - A Ziki account with a project and a platform (`desktop`, `mobile`, `web`, …).
 - **At least one `working` agent key.** A `manager` or `merger` agent is
@@ -26,6 +27,7 @@ CLI**, or any custom command. It runs on **Linux, macOS, and Windows**.
 - Permission to push branches and open PRs on the target repository.
 - Optional: systemd/launchd/Task Scheduler for a managed service, Docker or a
   VM for isolation, and a scoped sudoers entry.
+- Windows: long paths enabled for deep repositories (`git config --system core.longpaths true`).
 
 Per-platform setup commands are in [`docs/requirements.md`](./docs/requirements.md).
 
@@ -342,12 +344,14 @@ Use PowerShell. Paths resolve to `%APPDATA%\auto-work` (config and keys) and
 
 ```powershell
 npm i -g github:peter-abah/ziki-auto-work --install-links
+# If the npm bin dir is not on PATH, add %APPDATA%\npm and/or
+# %LOCALAPPDATA%\auto-work\bin to your user PATH.
 auto-work init --keys-file .\keys.env
 auto-work doctor
 auto-work run --once --dry-run
 ```
 
-The service command uses Task Scheduler when available and falls back to a
+`install.ps1` is included in the package for clone/local installs. The service command uses Task Scheduler when available and falls back to a
 detached process. Run an elevated terminal only if you explicitly need it.
 
 ## Uninstall

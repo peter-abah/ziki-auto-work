@@ -256,11 +256,15 @@ Tell the user:
 
 ## Windows
 
-Use `install.ps1` or `npm i -g github:peter-abah/ziki-auto-work --install-links`. Paths resolve
-to `%APPDATA%\auto-work` (config, keys) and `%LOCALAPPDATA%\auto-work` (state,
-cache, shim). There is no `chmod`; the installer writes the shim. The service
-command uses Task Scheduler when available and falls back to a detached process.
-Run an elevated terminal only if the user explicitly needs it.
+Use the packaged `install.ps1` or
+`npm i -g github:peter-abah/ziki-auto-work --install-links`. Paths resolve to
+`%APPDATA%\auto-work` (config, keys) and `%LOCALAPPDATA%\auto-work` (state,
+cache, shim). There is no `chmod`; the installer writes the shim. If
+`%APPDATA%\npm` or `%LOCALAPPDATA%\auto-work\bin` is not on `PATH`, add it and
+open a new terminal. For deep repositories, enable
+`git config --system core.longpaths true`. The service command uses Task
+Scheduler when available and falls back to a detached process. Run an elevated
+terminal only if the user explicitly needs it.
 
 ## If something fails
 

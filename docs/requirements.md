@@ -37,6 +37,14 @@ npm i -g @openai/codex
 npm i -g @google/gemini-cli
 ```
 
+If `auto-work` is not found after install, add the npm global bin (or the local
+shim directory) to `PATH`:
+
+```bash
+export PATH="$(npm prefix -g)/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 Optional service:
 
 ```bash
@@ -57,7 +65,16 @@ npm i -g github:peter-abah/ziki-auto-work --install-links
 ```
 
 Optional launchd service: `auto-work install --service` writes
-`~/Library/LaunchAgents/io.autowork.<profile>.plist`.
+`~/Library/LaunchAgents/io.autowork.<profile>.plist`. The plist includes an
+explicit `PATH` (Homebrew + system dirs) so `gh`, `git` and provider CLIs are
+found.
+
+If `auto-work` is not found after install:
+
+```bash
+export PATH="$(npm prefix -g)/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ## Windows (PowerShell)
 
@@ -69,8 +86,11 @@ npm i -g github:peter-abah/ziki-auto-work --install-links
 
 Paths resolve to `%APPDATA%\auto-work` (config and keys) and
 `%LOCALAPPDATA%\auto-work` (state, cache, shim). There is no `chmod`; the
-installer writes the shim. The service uses Task Scheduler when available and
-falls back to a detached process.
+installer writes the shim. If `%APPDATA%\npm` or
+`%LOCALAPPDATA%\auto-work\bin` is not on `PATH`, add it and open a new terminal.
+For deep repositories, enable `git config --system core.longpaths true` (admin)
+or `git config core.longpaths true` in the clone. The service uses Task
+Scheduler when available and falls back to a detached process.
 
 ## WSL
 

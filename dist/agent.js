@@ -1,4 +1,3 @@
-import { spawn as nodeSpawn } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -6,51 +5,13 @@ import { resolveModel, resolvePromptDir } from "./config.js";
 import { getProvider } from "./providers/index.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { spawnCommand } from "./platform/spawn.js";
+import { killProcessTree } from "./platform/process.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { resolveCommand } from "./checks.js";
 import { buildAgentEnv } from "./env.js";
 import { formatPrFieldMap, formatProtectedFiles, formatWorkflowRules, loadPrTemplateText } from "./rules.js";
 import { truncate } from "./log.js";
 const activeChildren = new Set();
-export function killProcessTree(pid) {
-    if (!pid)
-        return;
-    if (process.platform === "win32") {
-        try {
-            const child = nodeSpawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", detached: true });
-            child.unref();
-        }
-        catch {
-            // already gone
-        }
-        return;
-    }
-    try {
-        process.kill(-pid, "SIGTERM");
-    }
-    catch {
-        try {
-            process.kill(pid, "SIGTERM");
-        }
-        catch {
-            // already gone
-        }
-    }
-    const timer = setTimeout(() => {
-        try {
-            process.kill(-pid, "SIGKILL");
-        }
-        catch {
-            try {
-                process.kill(pid, "SIGKILL");
-            }
-            catch {
-                // already gone
-            }
-        }
-    }, 3000);
-    timer.unref?.();
-}
 export function killActiveAgents() {
     for (const child of activeChildren) {
         killProcessTree(child.pid);
