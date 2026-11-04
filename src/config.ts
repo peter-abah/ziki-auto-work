@@ -10,6 +10,7 @@ import type {
   LimitsConfig,
   LoadedProfile,
   ProviderName,
+  PushMode,
   Role,
   RunLimitConfig,
   WorkflowConfig
@@ -35,6 +36,7 @@ export const DEFAULT_LIMITS: LimitsConfig = {
   stopAt: null,
   maxDeliveriesTotal: null,
   maxConcurrentDeliveries: 2,
+  maxConcurrentFollowUps: 1,
   maxConcurrentReviews: 1,
   maxConcurrentAux: 2,
   maxConcurrentDiscovery: 1,
@@ -49,6 +51,14 @@ export const DEFAULT_RUN_LIMITS = {
   maxCycles: null,
   stopAt: null,
   maxDeliveriesTotal: null
+};
+
+export const DEFAULT_PR_TRACKING = {
+  enabled: true,
+  pollMinutes: 10,
+  maxFollowUps: 10,
+  fixFailingChecks: true,
+  fixReviewComments: true
 };
 
 export const DEFAULT_WORKFLOW: WorkflowConfig = {
@@ -81,7 +91,8 @@ export function defaultConfig(): Config {
       discovery: { enabled: false, maxIdeasPerRun: 3 },
       checks: [],
       prompts: { dir: "prompts/generic" },
-      pr: { templateFile: "prompts/generic/pr.md" }
+      pr: { templateFile: "prompts/generic/pr.md" },
+      prTracking: { ...DEFAULT_PR_TRACKING }
     },
     profiles: {},
     doctor: { minFreeGb: 3 }
@@ -185,6 +196,23 @@ function validateCheck(check: CheckSpec, index: number, errors: string[]): void 
   if (!Array.isArray(check?.args)) errors.push(`checks[${index}].args must be an array`);
 }
 
+function githubOwner(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const text = value.trim().replace(/\.git$/, "");
+  const match = text.match(/github\.com[:/]([^/]+)\/([^/]+)$/i);
+  if (match) return match[1]!.toLowerCase();
+  const plain = text.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  return plain ? plain[1]!.toLowerCase() : null;
+}
+
+export function inferPushMode(forkOwner: string, upstreamOwner: string, user?: string | null): PushMode {
+  const fork = forkOwner.trim().toLowerCase();
+  const upstream = upstreamOwner.trim().toLowerCase();
+  if (fork && fork === upstream) return "upstream";
+  if (user && fork && fork === user.trim().toLowerCase()) return "personal-fork";
+  return "team-fork";
+}
+
 export function validateConfig(config: Config): ValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -225,6 +253,28 @@ export function validateConfig(config: Config): ValidationResult {
     requireString(profile?.repo?.githubRepo, `${prefix}.repo.githubRepo`, errors);
     requireString(profile?.repo?.forkOwner, `${prefix}.repo.forkOwner`, errors);
     requireString(profile?.repo?.defaultBranch, `${prefix}.repo.defaultBranch`, errors);
+    if (profile?.repo?.pushMode !== undefined && !["personal-fork", "team-fork", "upstream"].includes(profile.repo.pushMode)) {
+      errors.push(`${prefix}.repo.pushMode must be "personal-fork", "team-fork" or "upstream"`);
+    } else if (profile?.repo?.forkOwner && profile?.repo?.githubRepo) {
+      const upstreamOwner = githubOwner(profile.repo.githubRepo);
+      const forkOwner = profile.repo.forkOwner.trim().toLowerCase();
+      const urlOwner = githubOwner(profile.repo.url);
+      if (upstreamOwner && forkOwner === upstreamOwner && !profile.repo.pushMode) {
+        warnings.push(`${prefix}.repo.forkOwner is the upstream owner; set repo.pushMode to "upstream" explicitly`);
+      }
+      if (profile.repo.pushMode === "upstream" && upstreamOwner && forkOwner !== upstreamOwner) {
+        errors.push(`${prefix}.repo.forkOwner must equal the upstream owner when pushMode is "upstream"`);
+      }
+      if (profile.repo.pushMode && profile.repo.pushMode !== "upstream" && upstreamOwner && forkOwner === upstreamOwner) {
+        errors.push(`${prefix}.repo.forkOwner equals the upstream owner; use pushMode "upstream"`);
+      }
+      if (urlOwner && forkOwner && profile.repo.pushMode !== "upstream" && urlOwner !== forkOwner) {
+        errors.push(`${prefix}.repo.url owner "${urlOwner}" does not match repo.forkOwner "${forkOwner}"`);
+      }
+      if (urlOwner && upstreamOwner && profile.repo.pushMode === "upstream" && urlOwner !== upstreamOwner) {
+        errors.push(`${prefix}.repo.url owner "${urlOwner}" does not match the upstream owner "${upstreamOwner}"`);
+      }
+    }
     if (!profile?.repo?.teamLead) warnings.push(`${prefix}.repo.teamLead is empty; the PR template may need it`);
     const workers = profile?.agents?.workers;
     const managers = profile?.agents?.managers;
@@ -257,6 +307,16 @@ export function validateConfig(config: Config): ValidationResult {
     }
     requireString(profile?.prompts?.dir, `${prefix}.prompts.dir`, errors);
     requireString(profile?.pr?.templateFile, `${prefix}.pr.templateFile`, errors);
+    if (profile?.prTracking !== undefined) {
+      const tracking = profile.prTracking;
+      if (typeof tracking.enabled !== "boolean") errors.push(`${prefix}.prTracking.enabled must be a boolean`);
+      if (!Number.isFinite(tracking.pollMinutes) || tracking.pollMinutes < 1) {
+        errors.push(`${prefix}.prTracking.pollMinutes must be at least 1`);
+      }
+      if (!Number.isInteger(tracking.maxFollowUps) || tracking.maxFollowUps < 0) {
+        errors.push(`${prefix}.prTracking.maxFollowUps must be a non-negative integer`);
+      }
+    }
     if (!profile?.limits || typeof profile.limits !== "object") {
       errors.push(`${prefix}.limits is required`);
     }
@@ -309,6 +369,7 @@ export function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunL
 
 export function resolveModel(profile: ProfileConfig, role: Role): string | null {
   const models = profile.executor.models ?? {};
+  if (role === "followup") return models.followup ?? models.worker ?? profile.executor.model ?? null;
   return models[role] ?? profile.executor.model ?? null;
 }
 

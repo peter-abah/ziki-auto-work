@@ -36,6 +36,7 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "base": "staging",
         "githubRepo": "owner/web",
         "forkOwner": "my-fork",
+        "pushMode": "personal-fork",
         "defaultBranch": "main",
         "teamLead": "@lead",
         "protectedFiles": [".github/**", "AGENTS.md", ".env", ".env.*"],
@@ -68,6 +69,13 @@ The config is a **workspace** with one or more **profiles** (config version 3).
       "platformMatch": { "keywords": ["web", "next", "browser"] },
       "prompts": { "dir": "prompts/web" },
       "pr": { "templateFile": "prompts/web/pr.md", "teamLead": "@lead" },
+      "prTracking": {
+        "enabled": true,
+        "pollMinutes": 10,
+        "maxFollowUps": 10,
+        "fixFailingChecks": true,
+        "fixReviewComments": true
+      },
       "discovery": { "enabled": true, "parityFile": "PARITY.md", "maxIdeasPerRun": 3 },
       "workflow": {
         "maxFiles": 5,
@@ -92,6 +100,7 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "stopAt": null,
         "maxDeliveriesTotal": null,
         "maxConcurrentDeliveries": 2,
+        "maxConcurrentFollowUps": 1,
         "maxConcurrentReviews": 1,
         "maxConcurrentAux": 2,
         "maxConcurrentDiscovery": 1,
@@ -136,6 +145,8 @@ and check presets (`Flutter`, `Next.js`, …).
 - `base`: branch PRs target.
 - `githubRepo`: `owner/name` for `gh`.
 - `forkOwner`: fork org/user for `gh pr create --head`.
+- `pushMode`: `personal-fork`, `team-fork`, or `upstream`. `upstream` pushes
+  directly to the canonical repo and uses `forkOwner` = upstream owner.
 - `defaultBranch`: used to check whether a merge is in the default branch.
 - `teamLead`: PR template handle.
 - `protectedFiles`: glob patterns; matched against changed paths and basenames.
@@ -185,11 +196,25 @@ placeholder. Ziki peer review and CI remain the quality gates.
 
 ## prompts and pr
 
-`prompts.dir` is the per-profile prompt folder. `pr.templateFile` is the PR body
-template. Both are relative to the package root or absolute. The engine fills
-placeholders such as `{{projectName}}`, `{{stack}}`, `{{checks}}`,
-`{{issueUrl}}`, `{{worktree}}`, `{{memory}}`, `{{previousError}}`,
-`{{issueContext}}`, `{{ticket}}`, `{{teamLead}}`.
+`prompts.dir` is the per-profile prompt folder. The worker writes the final PR
+body in `prBody`, using the target repo’s template when present; `pr.templateFile`
+is only a fallback. Both paths are relative to the package root or absolute.
+The engine fills placeholders such as `{{projectName}}`, `{{stack}}`,
+`{{checks}}`, `{{issueUrl}}`, `{{worktree}}`, `{{memory}}`,
+`{{previousError}}`, `{{issueContext}}`, `{{prContext}}`, `{{ticket}}`,
+`{{teamLead}}`.
+
+## prTracking
+
+- `enabled`: track delivered PRs and follow up on feedback.
+- `pollMinutes`: how often to check each PR.
+- `maxFollowUps`: maximum follow-up pushes per PR before escalation.
+- `fixFailingChecks`: let the follow-up worker address failing checks.
+- `fixReviewComments`: let it address review comments/changes requested.
+
+Follow-up uses the existing branch/worktree, pushes to the same PR, and never
+opens a second PR. It does not merge; Ziki and GitHub merge gates remain
+external.
 
 ## platformMatch
 

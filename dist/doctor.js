@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { readFile, readdir, statfs } from "node:fs/promises";
+import { constants, existsSync } from "node:fs";
+import { access, readFile, readdir, realpath, statfs } from "node:fs/promises";
 import path from "node:path";
 import { loadConfig, loadProfile, parseEnvFile, resolveModel, validateConfig } from "./config.js";
 import { envFilesFor } from "./env.js";
@@ -7,7 +7,7 @@ import { desktopNotifierAvailable } from "./notify.js";
 import { getProvider } from "./providers/index.js";
 import { GitHub } from "./github.js";
 import { isAlive as isAlivePid, readPid } from "./state.js";
-import { expandHome, paths } from "./platform/paths.js";
+import { PACKAGE_ROOT, expandHome, paths } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
 function pathHas(dir, pathValue = process.env.PATH || "") {
     if (!dir)
@@ -18,6 +18,27 @@ function pathHas(dir, pathValue = process.env.PATH || "") {
         .filter(Boolean)
         .some((entry) => (process.platform === "win32" ? entry.toLowerCase() : entry) === wanted);
 }
+function repoKey(value) {
+    if (!value)
+        return null;
+    const text = value.trim().replace(/\.git$/, "");
+    const match = text.match(/github\.com[:/]([^/]+)\/([^/]+)$/i);
+    if (match)
+        return `${match[1].toLowerCase()}/${match[2].toLowerCase()}`;
+    return null;
+}
+async function isExecutable(file) {
+    try {
+        await access(file, constants.X_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function binaryName() {
+    return process.platform === "win32" ? "auto-work.cmd" : "auto-work";
+}
 export async function runDoctor(options = {}) {
     const checks = [];
     const add = (name, ok, detail, critical = true) => {
@@ -25,15 +46,35 @@ export async function runDoctor(options = {}) {
     };
     const nodeMajor = Number(process.versions.node.split(".")[0]);
     add("node", nodeMajor >= 20, `v${process.versions.node}`);
+    const localCheckout = existsSync(path.join(PACKAGE_ROOT, ".git"));
     const cmdCheck = process.platform === "win32"
         ? await runCommand("where", ["auto-work"], { timeoutMs: 10_000 })
         : await runCommand("/bin/sh", ["-c", "command -v auto-work"], { timeoutMs: 10_000 });
-    add("auto-work on PATH", cmdCheck.ok, cmdCheck.ok ? cmdCheck.stdout.trim() : "not on PATH", false);
+    add("auto-work on PATH", cmdCheck.ok, cmdCheck.ok ? cmdCheck.stdout.trim() : "not on PATH (run the install step or add the global bin dir)", !localCheckout);
     const prefix = await runCommand("npm", ["prefix", "-g"], { timeoutMs: 20_000 });
     const globalBin = prefix.ok ? (process.platform === "win32" ? prefix.stdout.trim() : path.join(prefix.stdout.trim(), "bin")) : null;
-    add("npm global bin", pathHas(globalBin), globalBin ? `${globalBin}${pathHas(globalBin) ? " (on PATH)" : " (not on PATH)"}` : "could not read npm prefix", false);
-    const shimDir = path.dirname(paths().bin);
-    add("auto-work shim", pathHas(shimDir), `${shimDir}${pathHas(shimDir) ? " (on PATH)" : " (not on PATH)"}`, false);
+    const globalBinary = globalBin ? path.join(globalBin, binaryName()) : null;
+    const globalBinaryExists = Boolean(globalBinary && existsSync(globalBinary));
+    add("npm global bin", globalBinaryExists, globalBin
+        ? `${globalBin} ${pathHas(globalBin) ? "(on PATH)" : "(not on PATH)"} · ${binaryName()} ${globalBinaryExists ? "present" : "missing"}`
+        : "could not read npm prefix", false);
+    const root = await runCommand("npm", ["root", "-g"], { timeoutMs: 20_000 });
+    if (root.ok) {
+        const installedUnderGlobal = !path.relative(root.stdout.trim(), PACKAGE_ROOT).startsWith("..");
+        add("install prefix", installedUnderGlobal, installedUnderGlobal ? PACKAGE_ROOT : `package is ${PACKAGE_ROOT}, npm global root is ${root.stdout.trim()}`, false);
+    }
+    const shimPath = paths().bin;
+    const shimExists = existsSync(shimPath);
+    const shimExecutable = shimExists ? await isExecutable(shimPath) : false;
+    let shimTarget = "";
+    if (shimExists && process.platform !== "win32") {
+        shimTarget = await realpath(shimPath).catch(() => "");
+    }
+    const expectedTarget = path.join(PACKAGE_ROOT, "bin/auto-work.mjs");
+    const shimPointsHere = process.platform === "win32" || !shimTarget || shimTarget === expectedTarget;
+    add("auto-work shim", shimExists && shimExecutable && shimPointsHere, shimExists
+        ? `${shimPath}${shimExecutable ? " (executable)" : " (not executable)"}${shimTarget ? ` → ${shimTarget}` : ""}`
+        : `${shimPath} (missing)`, false);
     let config;
     try {
         config = await loadConfig();
@@ -138,6 +179,12 @@ export async function runDoctor(options = {}) {
         const github = new GitHub({ profile, profileName, reposDir: jp.reposDir });
         repoDir = await github.ensureRepo();
         add("repo clone", true, repoDir);
+        const origin = await github.git(["remote", "get-url", "origin"], { cwd: repoDir }).catch(() => null);
+        const configured = repoKey(profile.repo.url);
+        const actual = repoKey(origin?.stdout);
+        add("repo origin", Boolean(configured && actual && configured === actual), origin?.stdout.trim()
+            ? `${origin.stdout.trim()}${configured === actual ? "" : ` (config expects ${profile.repo.url})`}`
+            : "no origin remote", true);
         const base = await github.git(["rev-parse", "--verify", `upstream/${profile.repo.base}`]);
         add(`base upstream/${profile.repo.base}`, base.ok, base.stdout.slice(0, 12) || base.stderr);
         if (process.platform === "win32") {

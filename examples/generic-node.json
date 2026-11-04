@@ -24,6 +24,7 @@
       "stopAt": null,
       "maxDeliveriesTotal": null,
       "maxConcurrentDeliveries": 2,
+      "maxConcurrentFollowUps": 1,
       "maxConcurrentReviews": 1,
       "maxConcurrentAux": 2,
       "maxConcurrentDiscovery": 1,
@@ -132,6 +133,13 @@
       },
       "pr": {
         "templateFile": "prompts/generic/pr.md"
+      },
+      "prTracking": {
+        "enabled": true,
+        "pollMinutes": 10,
+        "maxFollowUps": 10,
+        "fixFailingChecks": true,
+        "fixReviewComments": true
       },
       "discovery": {
         "enabled": false,

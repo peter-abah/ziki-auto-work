@@ -132,17 +132,20 @@ const SECRET_PATTERNS = [
     /BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY/,
     /\bpassword\s*[:=]\s*["'][^"']{4,}["']/i
 ];
+export function scanSecretsText(text) {
+    const hits = [];
+    for (const pattern of SECRET_PATTERNS) {
+        const match = text.match(pattern);
+        if (match?.[0])
+            hits.push(match[0].slice(0, 80));
+    }
+    return hits;
+}
 export function scanSecrets(diff) {
     const added = diff
         .split("\n")
         .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
         .join("\n");
-    const hits = [];
-    for (const pattern of SECRET_PATTERNS) {
-        const match = added.match(pattern);
-        if (match?.[0])
-            hits.push(match[0].slice(0, 80));
-    }
-    return hits;
+    return scanSecretsText(added);
 }
 //# sourceMappingURL=checks.js.map

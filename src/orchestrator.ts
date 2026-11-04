@@ -20,7 +20,7 @@ import type {
   WorkFeed,
   WorkItem
 } from "./types.js";
-import { loadProfile, resolveParityFile, resolveRunLimits } from "./config.js";
+import { DEFAULT_PR_TRACKING, loadProfile, resolveParityFile, resolveRunLimits } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
 import type { Logger } from "./log.js";
 import {
@@ -44,12 +44,16 @@ import { TaskPool } from "./scheduler.js";
 import type { TaskKind } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
 import type { ZikiClient } from "./ziki.js";
-import { GitHub, branchName, buildPrBody, slugify } from "./github.js";
+import { GitHub, branchName, slugify } from "./github.js";
+import type { PrComment } from "./github.js";
+import { formatPrContext } from "./pr-context.js";
+import { preparePrBody } from "./pr-body.js";
 import { prepareWorktree, prepareReviewWorktree, cleanupWorktree } from "./worktree.js";
 import {
   runWorker,
   runDiscovery,
   runReview,
+  runFollowUp,
   runConfirm,
   runTriage,
   runOwner,
@@ -144,6 +148,271 @@ function renderLive(ctx: Context): { line: string; key: string } {
     line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${tokenText}`,
     key: `${ctx.phase}|${first?.key ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
   };
+}
+
+function prTracking(profile: ProfileConfig) {
+  return { ...DEFAULT_PR_TRACKING, ...(profile.prTracking ?? {}) };
+}
+
+function prTaskKey(task: TaskState): string {
+  return `pr:${task.prUrl ?? task.number ?? "unknown"}`;
+}
+
+function isoMax(values: Array<string | null | undefined>): string | null {
+  const found = values.filter((value): value is string => Boolean(value)).sort();
+  return found.at(-1) ?? null;
+}
+
+function actionablePrComment(comment: PrComment): boolean {
+  if (!comment.body.trim()) return false;
+  if (/\[bot\]$/i.test(comment.author)) return false;
+  const text = comment.body.trim().toLowerCase();
+  if (/^(lgtm|looks good|approved|ship it|nice|thanks|thank you)\b/.test(text)) return false;
+  if (comment.kind === "review" && (comment.path || comment.line)) return true;
+  return /\b(fix|please|should|could you|can you|need|change|remove|add|update|missing|broken|wrong|fail|error|conflict|rebase|test|why)\b/.test(text);
+}
+
+function actionablePrComments(task: TaskState, comments: PrComment[]): PrComment[] {
+  const cutoff = task.prLastHandledCommentAt ? Date.parse(task.prLastHandledCommentAt) : 0;
+  return comments.filter((comment) => {
+    if (!actionablePrComment(comment)) return false;
+    const at = Date.parse(comment.createdAt ?? "") || 0;
+    return at > (Number.isFinite(cutoff) ? cutoff : 0);
+  });
+}
+
+function prFollowUpDue(ctx: Context, task: TaskState, now = Date.now()): boolean {
+  const tracking = prTracking(ctx.profile);
+  if (!tracking.enabled) return false;
+  if (task.status !== "delivered" || !task.prUrl) return false;
+  if (ctx.pool.has(prTaskKey(task))) return false;
+  if (task.prLastCheckedAt) {
+    const last = Date.parse(task.prLastCheckedAt);
+    if (Number.isFinite(last) && now - last < tracking.pollMinutes * 60_000) return false;
+  }
+  return true;
+}
+
+async function escalatePrFollowUp(ctx: Context, issue: Issue, task: TaskState, reason: string): Promise<void> {
+  const agent = (task.agentName ? clientByName(ctx, task.agentName) : null) ?? pickWorker(ctx) ?? ctx.primary;
+  task.lastError = reason;
+  const result = await escalate(agent.client, ctx.profile, ctx.profilePaths, ctx.state, {
+    issue,
+    type: "blocker",
+    body: `PR follow-up for #${issue.number} needs a human: ${reason}\n\nPR: ${task.prUrl ?? "(none)"}\nAttempts: ${task.followUpAttempts ?? 0}`,
+    agentName: agent.name,
+    logger: ctx.logger,
+    maxOpen: ctx.profile.limits.maxOpenEscalations
+  });
+  task.status = result.ok ? "waiting_human" : "failed";
+  if (!result.ok) task.lastError = `${reason} (escalation failed: ${result.error ?? "unknown"})`;
+}
+
+async function processPrFollowUpSafe(ctx: Context, task: TaskState): Promise<void> {
+  try {
+    await processPrFollowUp(ctx, task);
+  } catch (error) {
+    task.lastError = error instanceof Error ? error.message : String(error);
+    task.prLastCheckedAt = new Date().toISOString();
+    ctx.logger.error(`PR follow-up for #${task.number} crashed: ${task.lastError}`);
+    history(ctx, { type: "failure", issue: typeof task.number === "number" ? task.number : null, detail: `PR follow-up: ${task.lastError}` });
+    await save(ctx).catch(() => {});
+  }
+}
+
+async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
+  if (!task.prUrl || !task.branch) {
+    task.prLastCheckedAt = new Date().toISOString();
+    task.lastError = "delivered PR is missing a branch; cannot follow up";
+    await save(ctx);
+    return;
+  }
+  const data = await ctx.primary.client.getIssue(String(task.number ?? ""));
+  const issue = normalizeIssue(data);
+  if (!issue) {
+    task.prLastCheckedAt = new Date().toISOString();
+    task.lastError = "could not load the issue for PR follow-up";
+    await save(ctx);
+    return;
+  }
+  const status = await ctx.github.prStatus(task.prUrl);
+  task.prNumber = status.number ?? task.prNumber;
+  task.prState = status.merged ? "merged" : status.state;
+  task.prChecks = status.checks;
+  task.prMergeable = status.mergeable;
+  task.prReviewDecision = status.reviewDecision;
+  task.prLastCheckedAt = new Date().toISOString();
+  task.headSha = status.headSha ?? task.headSha;
+
+  if (status.merged || status.state === "CLOSED") {
+    task.status = status.merged ? "done" : "skipped";
+    task.reason = status.merged ? `PR merged into ${status.mergedInto ?? "base"}` : "PR closed without merge";
+    history(ctx, { type: status.merged ? "delivery" : "failure", issue: issue.number, detail: task.reason, data: { pr: task.prUrl } });
+    await save(ctx);
+    return;
+  }
+
+  const reviewComments = (await ctx.github.prReviewComments(task.prUrl).catch(() => []))
+    .map((comment) => ({ ...comment, kind: "review" as const }));
+  const allComments = new Map<string, PrComment>();
+  for (const comment of [...status.comments, ...reviewComments]) allComments.set(comment.id, comment);
+  const comments = actionablePrComments(task, [...allComments.values()]);
+  const tracking = prTracking(ctx.profile);
+  const failing = tracking.fixFailingChecks && status.checks === "failing";
+  const newComments = tracking.fixReviewComments && comments.length > 0;
+  const changesRequested =
+    tracking.fixReviewComments &&
+    status.reviewDecision === "CHANGES_REQUESTED" &&
+    status.reviewDecision !== task.prLastHandledReviewDecision;
+  const conflict = status.mergeable === false;
+  if (!failing && !newComments && !changesRequested && !conflict) {
+    await save(ctx);
+    return;
+  }
+
+  const maxAttempts = tracking.maxFollowUps;
+  if ((task.followUpAttempts ?? 0) >= maxAttempts) {
+    await escalatePrFollowUp(ctx, issue, task, `follow-up limit reached (${maxAttempts})`);
+    await save(ctx);
+    return;
+  }
+  if (!task.worktree || !existsSync(task.worktree)) {
+    await escalatePrFollowUp(ctx, issue, task, "the delivered worktree is missing; cannot push follow-up commits");
+    await save(ctx);
+    return;
+  }
+  const agent = (task.agentName ? clientByName(ctx, task.agentName) : null) ?? pickWorker(ctx);
+  if (!agent) {
+    await escalatePrFollowUp(ctx, issue, task, "no worker agent available for PR follow-up");
+    await save(ctx);
+    return;
+  }
+
+  const checkLogs = failing ? await ctx.github.failedCheckLogs(status).catch(() => []) : [];
+  const prContext = formatPrContext(status, [...allComments.values()].filter((comment) => comment.kind === "review"), checkLogs);
+  const previousError = task.lastError ?? "";
+  const attempt = (task.followUpAttempts ?? 0) + 1;
+  task.followUpAttempts = attempt;
+  task.lastFollowUpAt = new Date().toISOString();
+  task.lastError = null;
+  await save(ctx);
+
+  const heartbeat = setInterval(() => {
+    agent.client.heartbeat(issue.id).catch(() => {});
+  }, 10 * 60 * 1000);
+  let result;
+  try {
+    result = await runFollowUp({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      memoryText: ctx.memoryText,
+      worktree: task.worktree,
+      branch: task.branch,
+      base: ctx.profile.repo.base,
+      prUrl: task.prUrl,
+      prContext,
+      attempt,
+      maxAttempts,
+      previousError,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    });
+  } finally {
+    clearInterval(heartbeat);
+  }
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    await save(ctx);
+    return;
+  }
+  if (!result.ok) {
+    const reason = result.error ?? result.blocker ?? result.summary ?? "follow-up agent failed";
+    task.lastError = reason;
+    if (result.blocked || attempt >= maxAttempts) {
+      await escalatePrFollowUp(ctx, issue, task, reason);
+    }
+    await save(ctx);
+    return;
+  }
+
+  await ctx.github.git(["add", "-A"], { cwd: task.worktree });
+  const changed = await ctx.github.stagedChangedFiles(task.worktree, "HEAD");
+  if (!changed.length) {
+    const reason = "follow-up produced no changes";
+    task.lastError = reason;
+    if (attempt >= maxAttempts) await escalatePrFollowUp(ctx, issue, task, reason);
+    await save(ctx);
+    return;
+  }
+  if (changed.length > ctx.profile.workflow.maxFiles) {
+    await escalatePrFollowUp(ctx, issue, task, `follow-up touches ${changed.length} files (max ${ctx.profile.workflow.maxFiles})`);
+    await save(ctx);
+    return;
+  }
+  const diffStats = await ctx.github.diffStats(task.worktree, "HEAD").catch(() => ({ files: 0, insertions: 0, deletions: 0, total: 0 }));
+  if (diffStats.total > ctx.profile.workflow.maxLines) {
+    await escalatePrFollowUp(ctx, issue, task, `follow-up is ${diffStats.total} lines (max ${ctx.profile.workflow.maxLines})`);
+    await save(ctx);
+    return;
+  }
+  const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
+  if (protectedHits.length) {
+    await escalatePrFollowUp(ctx, issue, task, `protected files changed: ${protectedHits.join(", ")}`);
+    await save(ctx);
+    return;
+  }
+  const diff = await ctx.github.git(["diff", "--cached", "HEAD"], { cwd: task.worktree })
+    .then((output) => output.stdout)
+    .catch(() => "");
+  const secretHits = scanSecrets(diff);
+  if (secretHits.length) {
+    await escalatePrFollowUp(ctx, issue, task, `possible secret in follow-up: ${secretHits[0]}`);
+    await save(ctx);
+    return;
+  }
+
+  const message = normalizeCommitMessage(result.commitMessage, issue, ctx.profile.workflow.commitTypes);
+  const commit = await ctx.github.commitAll(task.worktree, message);
+  if (!commit.committed) {
+    await escalatePrFollowUp(ctx, issue, task, "nothing to commit after follow-up");
+    await save(ctx);
+    return;
+  }
+  await ctx.github.pushBranch(task.worktree, task.branch, { force: status.mergeable === false });
+  if (result.prBody) {
+    const prepared = await preparePrBody({
+      profile: ctx.profile,
+      issue,
+      result,
+      fallback: {
+        issue,
+        summary: result.summary ?? `Follow-up for #${issue.number}`,
+        description: result.description ?? "",
+        testResults: result.testResults ?? "",
+        checks: result.checks ?? []
+      }
+    }).catch(() => null);
+    if (prepared?.source === "agent") await ctx.github.updatePrBody(task.prUrl, prepared.body).catch(() => {});
+  }
+  task.status = "delivered";
+  task.headSha = await ctx.github.headSha(task.worktree).catch(() => commit.sha);
+  task.prLastHandledHeadSha = status.headSha;
+  task.prLastHandledCommentAt =
+    isoMax(comments.map((comment) => comment.createdAt)) ??
+    (comments.length ? new Date().toISOString() : task.prLastHandledCommentAt ?? null);
+  task.prLastHandledReviewDecision = status.reviewDecision ?? task.prLastHandledReviewDecision ?? null;
+  task.prLastCheckedAt = new Date().toISOString();
+  task.deliveredAt = new Date().toISOString();
+  task.lastError = null;
+  history(ctx, {
+    type: "delivery",
+    issue: issue.number,
+    detail: `follow-up ${attempt} ${agent.name}`,
+    data: { pr: task.prUrl, files: changed.length, headSha: task.headSha }
+  });
+  ctx.logger.info(`PR follow-up for #${issue.number} pushed`, { attempt, files: changed.length, pr: task.prUrl });
+  await save(ctx);
 }
 
 async function requeueCrashedTask(ctx: Context, item: QueueEntry, error: unknown): Promise<boolean> {
@@ -391,6 +660,13 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
       title: task.title,
       status: task.status,
       pr: task.prUrl ?? null,
+      prState: task.prState ?? null,
+      prChecks: task.prChecks ?? null,
+      prMergeable: task.prMergeable ?? null,
+      reviewDecision: task.prReviewDecision ?? null,
+      followUpAttempts: task.followUpAttempts ?? 0,
+      lastFollowUpAt: task.lastFollowUpAt ?? null,
+      prLastCheckedAt: task.prLastCheckedAt ?? null,
       agent: task.agentName ?? null,
       tokens: task.tokens?.total ?? null,
       lastError: task.lastError ?? null,
@@ -444,6 +720,7 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
     inFlight: {
       total: ctx.pool.total(),
       deliveries: ctx.pool.count("delivery"),
+      followUps: ctx.pool.count("followup"),
       reviews: ctx.pool.count("review"),
       aux: ctx.pool.count("aux"),
       discovery: ctx.pool.count("discovery"),
@@ -746,7 +1023,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   await save(ctx);
 
   const comments = (issue.comments ?? [])
-    .slice(-10)
+    .slice(-20)
     .map((comment) => `- ${comment.authorName ?? comment.by ?? "someone"}: ${comment.body}`)
     .join("\n");
   const issueContext =
@@ -770,6 +1047,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
       base: ctx.profile.repo.base,
       previousError: ctx.state.tasks[taskKey(issue)]?.lastError ?? "",
       issueContext,
+      attempt: ctx.state.tasks[taskKey(issue)]?.attempts ?? 1,
       logger: ctx.logger,
       ...agentHooks(ctx)
     });
@@ -836,19 +1114,28 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   }
 
   await ctx.github.pushBranch(dir, branch);
-  const body = await buildPrBody(ctx.profile, {
+  const preparedBody = await preparePrBody({
+    profile: ctx.profile,
     issue,
-    summary: result.summary ?? `Fix #${issue.number}`,
-    description: result.description ?? "",
-    testResults: result.testResults ?? result.checks?.join("\n") ?? "(not recorded by agent)",
-    testedAgainst: result.testedAgainst,
-    howToTest: result.howToTest,
-    whatToExpect: result.whatToExpect,
-    screenshots: (result.screenshots ?? []).filter((screenshot) => /^https?:\/\//.test(screenshot)),
-    checks: result.checks ?? [],
-    risks: result.risks,
-    notes: result.notes
+    result,
+    fallback: {
+      issue,
+      summary: result.summary ?? `Fix #${issue.number}`,
+      description: result.description ?? "",
+      testResults: result.testResults ?? result.checks?.join("\n") ?? "(not recorded by agent)",
+      testedAgainst: result.testedAgainst,
+      howToTest: result.howToTest,
+      whatToExpect: result.whatToExpect,
+      screenshots: (result.screenshots ?? []).filter((screenshot) => /^https?:\/\//.test(screenshot)),
+      checks: result.checks ?? [],
+      risks: result.risks,
+      notes: result.notes
+    }
   });
+  if (preparedBody.source === "fallback") {
+    ctx.logger.warn(`Agent PR body missing or invalid (${preparedBody.reason ?? "unknown"}); using fallback`);
+  }
+  const body = preparedBody.body;
   const pr = await ctx.github.createPr(branch, message, body);
   const headSha = await ctx.github.headSha(dir);
 
@@ -1168,6 +1455,15 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
     return;
   }
 
+  const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  const reviewComments = (await ctx.github.prReviewComments(issue.pullRequestUrl).catch(() => []))
+    .map((comment) => ({ ...comment, kind: "review" as const }));
+  const checkLogs = status ? await ctx.github.failedCheckLogs(status).catch(() => []) : [];
+  const prContext = status ? formatPrContext(status, reviewComments, checkLogs) : "(PR status unavailable)";
+  const issueContext = (issue.comments ?? [])
+    .slice(-10)
+    .map((comment) => `- ${comment.authorName ?? comment.by ?? "someone"}: ${comment.body}`)
+    .join("\n") || "(none)";
   const dir = await prepareReviewWorktree(ctx.github, ctx.profilePaths, prNumber);
   let result;
   try {
@@ -1179,6 +1475,8 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
       worktree: dir,
       prUrl: issue.pullRequestUrl,
       headSha: issue.pullRequestHeadSha ?? "",
+      prContext,
+      issueContext,
       logger: ctx.logger,
       ...agentHooks(ctx)
     });
@@ -1287,6 +1585,9 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
       case "report_pr_status":
         did = await processPrReport(ctx, item);
         break;
+      case "report_deployment":
+        did = await processDeploymentReport(ctx, item);
+        break;
       case "review_bid":
         did = await processBidVote(ctx, item);
         break;
@@ -1306,7 +1607,7 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
         did = await processConfirm(ctx, item);
         break;
       default:
-        ctx.logger.debug(`Unhandled aux kind "${item.kind}"; marking recent`);
+        ctx.logger.warn(`Unhandled Ziki work kind "${item.kind}" for #${item.issueNumber ?? item.ideaNumber ?? "?"}; skipping`);
         markRecent(ctx, item.key);
         did = false;
     }
@@ -1349,6 +1650,38 @@ async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean>
     return false;
   }
   await reportPrStatusWith(ctx, reporter, issue, status);
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processDeploymentReport(ctx: Context, item: QueueEntry): Promise<boolean> {
+  const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
+  const issue = normalizeIssue(data);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const text = `${item.title ?? ""}\n${item.detail ?? ""}`;
+  const match = text.match(/\b(dev|development|staging|stage|prod|production)\b/i);
+  const environment = match
+    ? ({ dev: "dev", development: "dev", staging: "staging", stage: "staging", prod: "prod", production: "prod" } as const)[
+        match[1]!.toLowerCase() as "dev" | "development" | "staging" | "stage" | "prod" | "production"
+      ]
+    : null;
+  if (!environment) {
+    ctx.logger.warn(`Deployment report for #${issue.number} has no environment; skipping`);
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const reporter = pickManager(ctx) ?? pickWorker(ctx);
+  if (!reporter) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await reporter.client.reportDeployment(issue.id, {
+    environment,
+    note: `Reported from Ziki work item: ${item.title ?? "deployment"}`
+  });
   markRecent(ctx, item.key);
   return true;
 }
@@ -1595,8 +1928,12 @@ async function discoveryPass(ctx: Context): Promise<void> {
 
   const existing = (ctx.platform.issues ?? [])
     .filter((issue) => ["open", "in_progress", "done", "merge"].includes(issue.status))
-    .slice(0, 60)
-    .map((issue) => `#${issue.number} ${issue.title}`)
+    .slice(0, 100)
+    .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
+    .join("\n");
+  const existingIdeas = (ctx.platform.ideas ?? [])
+    .slice(0, 100)
+    .map((idea) => `#${idea.number} ${idea.title} [${idea.status}]`)
     .join("\n");
 
   const parityFile = resolveParityFile(ctx.profile);
@@ -1610,6 +1947,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
       repoDir: dir,
       parity,
       existingIssues: existing,
+      existingIdeas,
       maxIdeas: ctx.profile.discovery.maxIdeasPerRun ?? 3,
       logger: ctx.logger,
       ...agentHooks(ctx)
@@ -1838,6 +2176,12 @@ function dispatch(ctx: Context): void {
     if (owner) pool.reserve(owner.key, "owner", () => processOwnerItem(ctx, owner));
   }
 
+  while (pool.canStart("followup")) {
+    const task = Object.values(ctx.state.tasks).find((entry) => prFollowUpDue(ctx, entry));
+    if (!task) break;
+    pool.reserve(prTaskKey(task), "followup", () => processPrFollowUpSafe(ctx, task));
+  }
+
   const maxDeliveries = Math.max(0, Math.min(limits.maxConcurrentDeliveries ?? 2, limits.maxActiveClaims));
   while (pool.canStart("delivery") && pool.count("delivery") < maxDeliveries) {
     if (activeClaims(ctx).length + pool.count("delivery") >= limits.maxActiveClaims) break;
@@ -1933,6 +2277,7 @@ async function createContext(
     dryRun: options.dryRun,
     pool: new TaskPool({
       delivery: profile.limits.maxConcurrentDeliveries ?? 2,
+      followup: profile.limits.maxConcurrentFollowUps ?? 1,
       review: profile.limits.maxConcurrentReviews ?? 1,
       aux: profile.limits.maxConcurrentAux ?? 2,
       discovery: profile.limits.maxConcurrentDiscovery ?? 1,

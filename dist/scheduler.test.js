@@ -18,7 +18,7 @@ function gated() {
     };
 }
 test("TaskPool enforces per-kind and total agent limits", async () => {
-    const pool = new TaskPool({ delivery: 2, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+    const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
     const gates = [gated(), gated(), gated(), gated(), gated()];
     assert.equal(pool.reserve("d1", "delivery", gates[0].run), true);
     assert.equal(pool.reserve("d2", "delivery", gates[1].run), true);
@@ -36,7 +36,7 @@ test("TaskPool enforces per-kind and total agent limits", async () => {
     assert.equal(pool.total(), 0);
 });
 test("TaskPool rejects duplicate in-flight keys", () => {
-    const pool = new TaskPool({ delivery: 2, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+    const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
     const gate = gated();
     assert.equal(pool.reserve("same", "delivery", gate.run), true);
     assert.equal(pool.reserve("same", "delivery", gate.run), false);
@@ -44,7 +44,7 @@ test("TaskPool rejects duplicate in-flight keys", () => {
     gate.release();
 });
 test("scheduler starts two deliveries and one review concurrently", async () => {
-    const pool = new TaskPool({ delivery: 2, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+    const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
     const started = [];
     const gates = [];
     const task = (key) => () => new Promise((resolve) => {
@@ -62,7 +62,7 @@ test("scheduler starts two deliveries and one review concurrently", async () => 
     await pool.drain(1000);
 });
 test("TaskPool.list reports in-flight kind and age for status", async () => {
-    const pool = new TaskPool({ delivery: 2, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+    const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
     const gate = gated();
     pool.reserve("issue-9", "delivery", gate.run);
     const list = pool.list();

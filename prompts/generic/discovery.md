@@ -19,9 +19,13 @@ not already tracked, and report them so the loop can fix them.
 
 {{memory}}
 
-## Existing issues (do not duplicate these)
+## Existing issues and ideas (do not duplicate these)
 
 {{existingIssues}}
+
+### Existing ideas
+
+{{existingIdeas}}
 
 ## What to do
 

@@ -1,4 +1,4 @@
-import type { Config, ProfileConfig, ProfilePaths, LimitsConfig, LoadedProfile, ProviderName, Role, RunLimitConfig, WorkflowConfig } from "./types.js";
+import type { Config, ProfileConfig, ProfilePaths, LimitsConfig, LoadedProfile, ProviderName, PushMode, Role, RunLimitConfig, WorkflowConfig } from "./types.js";
 import { expandHome } from "./platform/paths.js";
 export declare const PROVIDERS: ProviderName[];
 export declare const DEFAULT_LIMITS: LimitsConfig;
@@ -7,6 +7,13 @@ export declare const DEFAULT_RUN_LIMITS: {
     maxCycles: null;
     stopAt: null;
     maxDeliveriesTotal: null;
+};
+export declare const DEFAULT_PR_TRACKING: {
+    enabled: boolean;
+    pollMinutes: number;
+    maxFollowUps: number;
+    fixFailingChecks: boolean;
+    fixReviewComments: boolean;
 };
 export declare const DEFAULT_WORKFLOW: WorkflowConfig;
 export declare const DEFAULT_ENV_FILES: string[];
@@ -23,6 +30,7 @@ export interface ValidationResult {
     errors: string[];
     warnings: string[];
 }
+export declare function inferPushMode(forkOwner: string, upstreamOwner: string, user?: string | null): PushMode;
 export declare function validateConfig(config: Config): ValidationResult;
 export declare function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig;
 export declare function resolveModel(profile: ProfileConfig, role: Role): string | null;

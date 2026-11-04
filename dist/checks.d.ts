@@ -8,4 +8,5 @@ export declare function runChecks(profile: ProfileConfig, worktree: string, opti
 }): Promise<CheckRunResult>;
 export declare const DEFAULT_PROTECTED: string[];
 export declare function protectedFiles(files: string[], patterns?: string[]): string[];
+export declare function scanSecretsText(text: string): string[];
 export declare function scanSecrets(diff: string): string[];

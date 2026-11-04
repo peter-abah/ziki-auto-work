@@ -155,15 +155,19 @@ const SECRET_PATTERNS = [
   /\bpassword\s*[:=]\s*["'][^"']{4,}["']/i
 ];
 
+export function scanSecretsText(text: string): string[] {
+  const hits: string[] = [];
+  for (const pattern of SECRET_PATTERNS) {
+    const match = text.match(pattern);
+    if (match?.[0]) hits.push(match[0].slice(0, 80));
+  }
+  return hits;
+}
+
 export function scanSecrets(diff: string): string[] {
   const added = diff
     .split("\n")
     .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
     .join("\n");
-  const hits: string[] = [];
-  for (const pattern of SECRET_PATTERNS) {
-    const match = added.match(pattern);
-    if (match?.[0]) hits.push(match[0].slice(0, 80));
-  }
-  return hits;
+  return scanSecretsText(added);
 }

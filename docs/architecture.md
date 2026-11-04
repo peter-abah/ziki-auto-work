@@ -23,6 +23,9 @@ src/
   agent.ts           provider-agnostic executor + result contract
   providers/         opencode, claude, codex, gemini, custom
   checks.ts          check guidance, secrets, protected files
+  pr-body.ts         agent PR body validation and fallback
+  pr-context.ts      PR state/comments/check-log rendering
+  shim.ts            global CLI shim selection/installation
   doctor.ts          environment validation
   service.ts         systemd/launchd/Task Scheduler/detached process
   uninstall.ts       service, shim, config and state cleanup
@@ -45,12 +48,14 @@ src/
    `inFlightKeys` prevents duplicate picks.
 9. `delivery` — confirm/bid/award/accept, implement, agent checks, push, PR,
    deliver.
-10. `review` — test verdicts and manager merge reviews.
-11. `aux` — PR reports, bid votes, awards, comment upvotes, categorisation,
-    idea triage, confirmations.
-12. `discovery` — every N cycles, file evidence-backed ideas.
-13. `cleanup` — remove old worktrees.
-14. save state, then sleep or wait for an in-flight task.
+10. `follow-up` — observe delivered PRs, address review comments and failing
+    checks on the same branch, and push to the same PR.
+11. `review` — test verdicts and manager merge reviews.
+12. `aux` — PR reports/deployments, bid votes, awards, comment upvotes,
+    categorisation, idea triage, confirmations.
+13. `discovery` — every N cycles, file evidence-backed ideas.
+14. `cleanup` — remove old worktrees.
+15. save state, then sleep or wait for an in-flight task.
 
 ## Roles
 

@@ -337,3 +337,35 @@ test("workflow is optional in raw configs and defaults are filled by loadProfile
   assert.equal(result.ok, true);
   assert.ok(result.warnings.some((warning) => warning.includes("workflow")));
 });
+
+test("validateConfig rejects a fork owner that does not match the clone URL", () => {
+  const profile = fixtureProfile({
+    repo: { ...fixtureProfile().repo, forkOwner: "someone-else" }
+  });
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("does not match repo.forkOwner")));
+});
+
+test("validateConfig accepts an explicit upstream push mode", () => {
+  const base = fixtureProfile();
+  const profile = fixtureProfile({
+    repo: {
+      ...base.repo,
+      url: "git@github.com:owner/demo.git",
+      forkOwner: "owner",
+      pushMode: "upstream"
+    }
+  });
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, true, result.errors.join("; "));
+});
+
+test("validateConfig rejects upstream mode with a fork owner", () => {
+  const profile = fixtureProfile({
+    repo: { ...fixtureProfile().repo, url: "git@github.com:owner/demo.git", forkOwner: "fork", pushMode: "upstream" }
+  });
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("must equal the upstream owner")));
+});

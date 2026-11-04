@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, PROVIDERS, deepMerge, defaultConfig, loadConfig, loadEnv, loadProfile, parseEnvFile, resolveModel, resolveRunLimits, sampleConfigPath, saveConfig, saveEnv, validateConfig } from "./config.js";
+import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, PROVIDERS, deepMerge, defaultConfig, inferPushMode, loadConfig, loadEnv, loadProfile, parseEnvFile, resolveModel, resolveRunLimits, sampleConfigPath, saveConfig, saveEnv, validateConfig } from "./config.js";
 import { PACKAGE_ROOT, paths, profilePaths, safeName } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
 import { runDoctor, formatDoctor } from "./doctor.js";
@@ -25,7 +25,8 @@ Usage:
   auto-work                         # set up if needed, then run in the foreground
   auto-work install [--keys-file <path>] [--service] [--profile <name>]
   auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes] [--advanced]
-                 [--discover] [--fork] [--dry-run] [--env-file <path>]
+                 [--discover] [--fork] [--fork-owner <owner>] [--repo-url <url>] [--personal-fork] [--no-fork]
+                 [--dry-run] [--env-file <path>]
                  [--project-slug <slug>] [--platform <p>] [--github-repo <owner/name>] [--base <branch>]
   auto-work keys import <file>
   auto-work keys check
@@ -333,6 +334,7 @@ function baseProfile(overrides) {
         platformMatch: {},
         prompts: { dir: "prompts/generic" },
         pr: { templateFile: "prompts/generic/pr.md" },
+        prTracking: { enabled: true, pollMinutes: 10, maxFollowUps: 10, fixFailingChecks: true, fixReviewComments: true },
         discovery: { enabled: false, maxIdeasPerRun: 3 },
         limits: { ...DEFAULT_LIMITS },
         workflow: { ...DEFAULT_WORKFLOW },
@@ -480,6 +482,10 @@ async function initWizard(flags) {
     const base = str(flags, "base") || (yes ? "main" : await ask("Base branch", "main"));
     const githubRepo = str(flags, "github-repo") || (yes ? "" : await ask("GitHub repo (owner/name)", ""));
     const forkOwner = str(flags, "fork-owner") || (yes ? "" : await ask("Fork owner", ""));
+    const upstreamOwner = parseRepoRef(githubRepo)?.owner ?? parseRepoRef(upstream)?.owner ?? "";
+    const pushMode = forkOwner && upstreamOwner && forkOwner.toLowerCase() === upstreamOwner.toLowerCase()
+        ? "upstream"
+        : undefined;
     const defaultBranch = str(flags, "default-branch") || (yes ? "main" : await ask("Default branch", "main"));
     const teamLead = str(flags, "team-lead") || (yes ? "" : await ask("Team lead handle (optional)", ""));
     const providerDefault = (await detectedProviders())[0] ?? "opencode";
@@ -507,6 +513,7 @@ async function initWizard(flags) {
             base,
             githubRepo,
             forkOwner,
+            ...(pushMode ? { pushMode } : {}),
             defaultBranch,
             ...(teamLead ? { teamLead } : {})
         },
@@ -649,9 +656,25 @@ async function initDiscover(flags) {
     const base = str(flags, "base") || (branches.includes("staging") ? "staging" : defaultBranch);
     const user = await githubLogin(gh);
     const repoUrlOwner = repoUrlOverride ? parseRepoRef(repoUrlOverride)?.owner : null;
-    const forkOwner = forkOwnerFlag || repoUrlOwner || user;
-    const org = forkOwner !== user ? forkOwner : undefined;
-    const createFork = Boolean(flags.fork) && !dryRun;
+    const noFork = Boolean(flags["no-fork"]);
+    const personalFork = Boolean(flags["personal-fork"]);
+    if (noFork && personalFork)
+        throw new Error("--no-fork and --personal-fork cannot be combined");
+    let forkOwner = forkOwnerFlag || repoUrlOwner || (personalFork ? user : "");
+    if (noFork)
+        forkOwner = repoRef.owner;
+    if (!forkOwner) {
+        if (yes) {
+            throw new Error("Choose a push target: pass --fork-owner <owner> and --repo-url <url>, or --personal-fork, or --no-fork.");
+        }
+        const answer = await ask(`Fork owner (blank = personal ${user}; ${repoRef.owner} = upstream)`, "");
+        forkOwner = answer || user;
+    }
+    const pushMode = noFork ? "upstream" : inferPushMode(forkOwner, repoRef.owner, user);
+    if (pushMode === "upstream")
+        forkOwner = repoRef.owner;
+    const org = forkOwner !== user && pushMode !== "upstream" ? forkOwner : undefined;
+    const createFork = Boolean(flags.fork) && !dryRun && pushMode !== "upstream";
     let fork = await ensureFork({ upstream, user: forkOwner, org, createFork, gh });
     if (fork.needsFork && !dryRun) {
         if (yes)
@@ -698,6 +721,7 @@ async function initDiscover(flags) {
             base,
             githubRepo: upstream,
             forkOwner: fork.forkOwner,
+            pushMode,
             defaultBranch,
             envFiles: [".env", ".env.local"],
             ...(teamLead ? { teamLead } : {})
@@ -729,6 +753,7 @@ async function initDiscover(flags) {
         console.log(`  base:     ${base}`);
         console.log(`  fork:     ${fork.forkRepo}${fork.created ? " (created)" : fork.needsFork ? " (missing; use --fork)" : ""}`);
         console.log(`  clone:    ${fork.forkGitUrl}`);
+        console.log(`  push:     ${pushMode} (${fork.forkOwner})`);
         console.log(`  provider: ${provider}${model ? ` · ${model}` : ""}`);
         console.log(`  checks:   ${checks.map((check) => check.name).join(", ") || "(none)"}`);
         console.log("");
@@ -767,7 +792,7 @@ async function initDiscover(flags) {
     console.log("");
     console.log(`Configured profile "${profileName}".`);
     console.log(`  config: ${paths().configFile}`);
-    console.log(`  repo:   ${upstream} → ${base} (fork ${fork.forkRepo})`);
+    console.log(`  repo:   ${upstream} → ${base} (${pushMode}: ${fork.forkRepo})`);
     console.log(`  ziki:   ${projectSlug}/${platform}`);
     console.log(`  keys:   workers=${roles.workers.join(",") || "(none)"} managers=${roles.managers.join(",") || "(none)"}`);
     if (repoDir)
@@ -1060,7 +1085,7 @@ function printDetailedStatusWithFlags(flags, name, result) {
     const needs = status.needsYou?.count ?? 0;
     console.log(`  Ziki needs you: ${needs}${needs ? ` → ${status.needsYou?.link}` : ""}`);
     if (status.inFlight) {
-        console.log(`  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`);
+        console.log(`  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.followUps ?? 0} follow-up · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`);
     }
     if (status.lastCycle) {
         console.log(`  last cycle: ${status.lastCycle.ms}ms · deliveries ${status.lastCycle.deliveries} · reviews ${status.lastCycle.reviews} · aux ${status.lastCycle.aux}`);
@@ -1079,7 +1104,7 @@ function printDetailedStatusWithFlags(flags, name, result) {
         const taskList = status.taskList ?? [];
         console.log(`  tasks (${taskList.length}):`);
         for (const task of taskList) {
-            console.log(`    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.tokens != null ? ` · ${formatTokens(Number(task.tokens))} tokens` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`);
+            console.log(`    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.prState ? ` · ${task.prState}` : ""}${task.prChecks ? ` · checks ${task.prChecks}` : ""}${task.followUpAttempts ? ` · follow-ups ${task.followUpAttempts}` : ""}${task.tokens != null ? ` · ${formatTokens(Number(task.tokens))} tokens` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`);
         }
         const inFlight = status.inFlight?.tasks ?? [];
         for (const task of inFlight) {

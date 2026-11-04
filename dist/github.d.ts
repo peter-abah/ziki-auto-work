@@ -4,6 +4,28 @@ export declare function branchName(issue: {
     number: number | string;
 }, title: string, prefix?: string): string;
 export declare function summarizeChecks(rollup: Array<Record<string, unknown>>): "passing" | "failing" | "pending" | "none";
+export interface PrComment {
+    id: string;
+    author: string;
+    body: string;
+    path?: string;
+    line?: number | null;
+    url?: string;
+    createdAt?: string;
+    kind: "conversation" | "review";
+}
+export interface PrCheck {
+    name: string;
+    status: string;
+    conclusion: string | null;
+    url?: string;
+}
+export interface PrReview {
+    author: string;
+    state: string;
+    body: string;
+    submittedAt?: string;
+}
 export interface GitHubPrStatus {
     number?: number;
     url: string;
@@ -12,8 +34,14 @@ export interface GitHubPrStatus {
     mergedInto: string | null;
     mergeCommitSha: string | null;
     headSha: string | null;
+    headRefName: string | null;
+    baseRefName: string | null;
     checks: "passing" | "failing" | "pending" | "none";
     mergeable: boolean | null;
+    reviewDecision: string | null;
+    comments: PrComment[];
+    reviews: PrReview[];
+    checkRuns: PrCheck[];
     isDraft?: boolean;
 }
 export declare class GitHub {
@@ -50,20 +78,22 @@ export declare class GitHub {
     removeWorktree(dir: string, force?: boolean): Promise<void>;
     status(worktree: string): Promise<string>;
     changedFiles(worktree: string): Promise<string[]>;
-    diffStats(worktree: string): Promise<{
+    diffStats(worktree: string, ref?: string): Promise<{
         files: number;
         insertions: number;
         deletions: number;
         total: number;
     }>;
-    stagedChangedFiles(worktree: string): Promise<string[]>;
+    stagedChangedFiles(worktree: string, ref?: string): Promise<string[]>;
     headSha(worktree: string): Promise<string>;
     commitAll(worktree: string, message: string): Promise<{
         committed: boolean;
         sha: string;
         alreadyCommitted?: boolean;
     }>;
-    pushBranch(worktree: string, branch: string): Promise<void>;
+    pushBranch(worktree: string, branch: string, options?: {
+        force?: boolean;
+    }): Promise<void>;
     findOpenPr(branch: string): Promise<any | null>;
     createPr(branch: string, title: string, body: string): Promise<{
         url: string;
@@ -71,6 +101,21 @@ export declare class GitHub {
         branch: string;
     }>;
     prStatus(url: string): Promise<GitHubPrStatus>;
+    private prNumber;
+    prReviewComments(url: string): Promise<Array<{
+        id: string;
+        author: string;
+        body: string;
+        path?: string;
+        line?: number | null;
+        url?: string;
+        createdAt?: string;
+    }>>;
+    failedCheckLogs(status: GitHubPrStatus, maxRuns?: number): Promise<Array<{
+        name: string;
+        log: string;
+    }>>;
+    updatePrBody(url: string, body: string): Promise<void>;
     closePr(url: string, comment?: string): Promise<void>;
     authStatus(): Promise<import("./platform/spawn.js").RunResult>;
     remoteAccess(url: string): Promise<import("./platform/spawn.js").RunResult>;

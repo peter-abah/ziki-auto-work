@@ -81,5 +81,5 @@ Ziki; the loop resumes on a later cycle. The claim clocks pause while waiting.
 
 ## Review before publishing
 
-The first few PRs should be reviewed by a human. The checks and the PR template
+The first few PRs should be reviewed by a human. The agent-owned checks and PR body
 are not a substitute for review.

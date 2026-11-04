@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import type { ProfileConfig, WorkflowConfig } from "./types.js";
 import { DEFAULT_PROTECTED } from "./checks.js";
 import { GENERIC_PR_TEMPLATE } from "./github.js";
@@ -43,7 +44,18 @@ export function formatWorkflowRules(
   ].join("\n");
 }
 
-export async function loadPrTemplateText(profile: ProfileConfig): Promise<string> {
+export async function loadPrTemplateText(profile: ProfileConfig, repoDir?: string | null): Promise<string> {
+  if (repoDir) {
+    for (const relative of [".github/PULL_REQUEST_TEMPLATE.md", "PULL_REQUEST_TEMPLATE.md", "docs/PULL_REQUEST_TEMPLATE.md"]) {
+      const file = path.join(repoDir, relative);
+      if (!existsSync(file)) continue;
+      try {
+        return await readFile(file, "utf8");
+      } catch {
+        // try the next location
+      }
+    }
+  }
   const file = resolvePrTemplate(profile);
   if (existsSync(file)) {
     try {
@@ -57,7 +69,8 @@ export async function loadPrTemplateText(profile: ProfileConfig): Promise<string
 
 export function formatPrFieldMap(): string {
   return [
-    "The orchestrator fills the PR template from your JSON result:",
+    "Write the final Markdown PR body in `prBody`, following the repository template.",
+    "Use these result fields to make it complete:",
     "- `description` → What changed",
     "- `testResults` / `testedAgainst` → Test evidence",
     "- `howToTest` → How to test",
