@@ -2194,11 +2194,6 @@ export async function runLoop(options: {
         await ctx.pool.drain(120_000);
         break;
       }
-      if (stopReason === "network") {
-        logger.info("Network unavailable; stopping");
-        await ctx.pool.drain(120_000);
-        break;
-      }
       if (options.once) {
         await ctx.pool.drain(120_000);
         break;
