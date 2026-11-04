@@ -34,7 +34,7 @@ Per-platform setup commands are in [`docs/requirements.md`](./docs/requirements.
 You only need your Ziki agent keys. Paste this into any AI assistant:
 
 ```text
-Read https://github.com/peter-abah/ziki-auto-work/blob/main/docs/AI-SETUP.md
+Read https://github.com/peter-abah/ziki-auto-work/blob/dev/docs/AI-SETUP.md
 and set up ziki-auto-work for my Ziki project. I will provide agent keys.
 Do not assume a local repository: resolve the project and platform from Ziki,
 find (or fork and clone) the repository, write the config, then run
@@ -70,7 +70,7 @@ config, and finishes with a dry run. It does **not** start the loop.
    the archive instead:
 
    ```bash
-   npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/main.tar.gz
+   npm i -g https://github.com/peter-abah/ziki-auto-work/archive/refs/heads/dev.tar.gz
    ```
 
 4. **Set it up from Ziki**:
@@ -357,6 +357,16 @@ worktrees, repo clones, results), the cache, and the known legacy
 
 ```bash
 npm uninstall -g ziki-auto-work
+```
+
+## Branches
+
+- `dev` — active development and the repository default branch. All changes
+  land here.
+- `main` — stable baseline only; do not commit development work to it.
+
+```bash
+git switch dev
 ```
 
 ## Development
