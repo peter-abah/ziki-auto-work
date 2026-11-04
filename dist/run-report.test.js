@@ -47,6 +47,7 @@ function stateWithRun() {
         discoveries: 0,
         aux: 4,
         failures: 1,
+        networkErrors: 0,
         tokens: { input: 100, output: 50, total: 150 }
     };
     setTask(state, { id: "i1", number: 1, title: "One" }, { status: "delivered", prUrl: "https://github.com/o/n/pull/1" });

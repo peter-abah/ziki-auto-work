@@ -3,6 +3,7 @@ export declare function normalizeCommitMessage(message: string | undefined, issu
 export declare function runLoop(options?: {
     profileName?: string;
     foreground?: boolean;
+    verbose?: boolean;
     once?: boolean;
     dryRun?: boolean;
     limits?: Partial<RunLimitConfig> | null;

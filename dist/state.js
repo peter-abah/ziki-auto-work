@@ -18,9 +18,6 @@ export function emptyState() {
         counters: {},
         memory: { lastContextLoad: null },
         feedEtags: {},
-        baselineFailures: {},
-        baselineSha: null,
-        baselineAt: null,
         lastError: null,
         run: {
             startedAt: null,
@@ -32,6 +29,7 @@ export function emptyState() {
             discoveries: 0,
             aux: 0,
             failures: 0,
+            networkErrors: 0,
             tokens: emptyUsage()
         },
         lastCycle: null,

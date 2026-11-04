@@ -1,4 +1,5 @@
 import spawn from "cross-spawn";
+import { killProcessTree } from "./process.js";
 export function runCommand(command, args, options = {}) {
     const maxBuffer = options.maxBuffer ?? 20 * 1024 * 1024;
     return new Promise((resolve) => {
@@ -9,7 +10,8 @@ export function runCommand(command, args, options = {}) {
         const child = spawn(command, args, {
             cwd: options.cwd,
             env: { ...process.env, ...options.env },
-            stdio: ["ignore", "pipe", "pipe"]
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: process.platform !== "win32"
         });
         const finish = (code, error) => {
             if (settled)
@@ -26,12 +28,7 @@ export function runCommand(command, args, options = {}) {
             });
         };
         timer = setTimeout(() => {
-            try {
-                child.kill("SIGTERM");
-            }
-            catch {
-                // already gone
-            }
+            killProcessTree(child.pid);
             finish(-1, new Error(`timed out after ${Math.round((options.timeoutMs ?? 120000) / 1000)}s`));
         }, options.timeoutMs ?? 120000);
         child.stdout?.on("data", (chunk) => {

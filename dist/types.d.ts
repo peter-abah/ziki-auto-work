@@ -108,6 +108,8 @@ export interface LimitsConfig {
     maxAuxPerCycle: number;
     maxActiveClaims: number;
     maxAttemptsPerTask: number;
+    maxNetworkRetries: number;
+    networkRetryMinutes: number;
     maxCyclesBeforeDiscovery: number;
     maxOpenEscalations: number;
     /** Default run limit in minutes; null means no time limit. */
@@ -133,7 +135,7 @@ export interface RunLimitConfig {
     stopAt: string | null;
     maxDeliveriesTotal: number | null;
 }
-export type StopReason = "max-runtime" | "max-cycles" | "until" | "max-deliveries" | "token-limit" | "provider-limit" | "stop" | "error" | null;
+export type StopReason = "max-runtime" | "max-cycles" | "until" | "max-deliveries" | "token-limit" | "provider-limit" | "network" | "stop" | "error" | null;
 export interface TokenUsage {
     input: number;
     output: number;
@@ -153,6 +155,7 @@ export interface RunState {
     discoveries: number;
     aux: number;
     failures: number;
+    networkErrors: number;
     tokens: TokenUsage;
 }
 export interface RunSummary {
@@ -168,6 +171,7 @@ export interface RunSummary {
     discoveries: number;
     aux: number;
     failures: number;
+    networkErrors: number;
     interrupted: number;
     needsYou: number;
     needsYouLink: string | null;
@@ -511,9 +515,6 @@ export interface State {
         lastContextLoad: string | null;
     };
     feedEtags: Record<string, string>;
-    baselineFailures: Record<string, string[]>;
-    baselineSha: string | null;
-    baselineAt: string | null;
     lastError: unknown;
     run: RunState;
     lastCycle: LastCycleSummary | null;

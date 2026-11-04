@@ -14,13 +14,57 @@ import { killProcessTree } from "./platform/process.js";
 import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memory.js";
 import { escalate, poll } from "./hitl.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
-import { runChecks, scanSecrets, protectedFiles } from "./checks.js";
+import { scanSecrets, protectedFiles } from "./checks.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
+import { isTransientNetworkError } from "./network.js";
+import { formatLiveDuration, LiveStatus } from "./live-status.js";
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
 const TERMINAL = new Set(["resolved", "closed"]);
+function setPhase(ctx, phase, activity = null) {
+    if (ctx.phase === phase && ctx.activity === activity)
+        return;
+    ctx.phase = phase;
+    ctx.activity = activity;
+    ctx.phaseStartedAt = new Date().toISOString();
+    void writeStatus(ctx).catch(() => { });
+}
+function renderLive(ctx) {
+    const tasks = ctx.pool.list();
+    const first = tasks[0];
+    const activity = first
+        ? `${first.key} ${first.kind} ${formatLiveDuration(first.ageMs)}${tasks.length > 1 ? ` +${tasks.length - 1}` : ""}`
+        : ctx.activity ?? ctx.phase;
+    const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
+    const elapsed = formatLiveDuration(Date.now() - started);
+    const limit = ctx.runLimits.maxRuntimeMinutes
+        ? formatLiveDuration(ctx.runLimits.maxRuntimeMinutes * 60 * 1000)
+        : "∞";
+    const needs = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open").length;
+    const tokens = ctx.state.run.tokens;
+    const tokenText = `tokens ${formatTokens(tokens.total)}${tokens.estimated ? " est" : ""}`;
+    return {
+        line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${tokenText}`,
+        key: `${ctx.phase}|${first?.key ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
+    };
+}
+async function requeueCrashedTask(ctx, item, error) {
+    const message = truncate(error instanceof Error ? error.message : String(error), 500);
+    const task = Object.values(ctx.state.tasks).find((entry) => String(entry.number) === String(item.issueNumber));
+    if (!task || !["claimed", "working"].includes(task.status))
+        return false;
+    const maxAttempts = ctx.profile.limits.maxAttemptsPerTask ?? 3;
+    if (task.attempts >= maxAttempts) {
+        task.status = "failed";
+        task.lastError = message;
+        return false;
+    }
+    task.status = "queued";
+    task.lastError = message;
+    return true;
+}
 function isOurAgent(ctx, name) {
     if (!name)
         return false;
@@ -175,13 +219,6 @@ function classifyEnvironmentFailure(text) {
     }
     return null;
 }
-function checksFailureText(checks) {
-    const failed = checks.results.filter((result) => !result.ok);
-    const details = failed
-        .map((result) => `${result.name}: ${result.output.split("\n").filter(Boolean).slice(-3).join(" ")}`)
-        .join("; ");
-    return truncate(`checks failed: ${details || "unknown"}`, 500);
-}
 function remainingMs(ctx) {
     const limits = ctx.runLimits;
     const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
@@ -213,6 +250,9 @@ async function buildStatus(ctx, extra = {}) {
         lastCycleAt: ctx.state.lastCycleAt,
         lastCycleMs: ctx.state.lastCycleMs,
         cycles: ctx.state.cycles,
+        phase: ctx.phase,
+        phaseStartedAt: ctx.phaseStartedAt,
+        activity: ctx.activity,
         queue: ctx.queue?.counts ?? null,
         tasks: {
             total: tasks.length,
@@ -267,6 +307,8 @@ async function buildStatus(ctx, extra = {}) {
                 ? null
                 : Math.max(0, ctx.runLimits.maxDeliveriesTotal - ctx.state.run.deliveries),
             deliveries: ctx.state.run.deliveries,
+            failures: ctx.state.run.failures,
+            networkErrors: ctx.state.run.networkErrors ?? 0,
             stopReason: ctx.state.run.stopReason
         },
         tokens: {
@@ -639,18 +681,6 @@ async function processWorkItem(ctx, item, preferredWorker) {
     if (secretHits.length) {
         return handleWorkFailure(ctx, issue, item, { error: `possible secret in diff: ${secretHits[0]}` }, worker, dir);
     }
-    const checks = await runChecks(ctx.profile, dir, {
-        changedFiles: changed,
-        baselineFailures: ctx.state.baselineFailures,
-        logger: ctx.logger
-    });
-    if (!checks.ok) {
-        ctx.logger.warn("Checks failed", {
-            issue: issue.number,
-            results: checks.results.map((check) => ({ name: check.name, ok: check.ok, output: check.output }))
-        });
-        return handleWorkFailure(ctx, issue, item, { error: checksFailureText(checks) }, worker, dir);
-    }
     const message = normalizeCommitMessage(result.commitMessage, issue, ctx.profile.workflow.commitTypes);
     const commit = await ctx.github.commitAll(dir, message);
     if (!commit.committed) {
@@ -661,12 +691,12 @@ async function processWorkItem(ctx, item, preferredWorker) {
         issue,
         summary: result.summary ?? `Fix #${issue.number}`,
         description: result.description ?? "",
-        testResults: result.testResults ?? checks.results.map((check) => `${check.name}: ${check.ok ? "pass" : "fail"}`).join("\n"),
+        testResults: result.testResults ?? result.checks?.join("\n") ?? "(not recorded by agent)",
         testedAgainst: result.testedAgainst,
         howToTest: result.howToTest,
         whatToExpect: result.whatToExpect,
         screenshots: (result.screenshots ?? []).filter((screenshot) => /^https?:\/\//.test(screenshot)),
-        checks: checks.results.map((check) => `${check.name}: ${check.ok ? "pass" : "fail"}`),
+        checks: result.checks ?? [],
         risks: result.risks,
         notes: result.notes
     });
@@ -676,7 +706,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
         pullRequestUrl: pr.url,
         summary: result.summary ?? `Fix #${issue.number}`,
         description: result.description ?? result.summary ?? "",
-        testResults: result.testResults ?? checks.results.map((check) => `${check.name}: ${check.ok ? "pass" : "fail"}`).join("\n"),
+        testResults: result.testResults ?? result.checks?.join("\n") ?? "(not recorded by agent)",
         headSha
     });
     setTask(ctx.state, issue, {
@@ -1454,35 +1484,6 @@ async function discoveryPass(ctx) {
     }
     await save(ctx);
 }
-async function ensureBaseline(ctx) {
-    const baselineChecks = ctx.profile.checks.filter((check) => check.baseline);
-    if (!baselineChecks.length)
-        return;
-    const sha = await ctx.github.baseSha().catch(() => null);
-    if (ctx.state.baselineSha === sha && ctx.state.baselineAt)
-        return;
-    const dir = path.join(ctx.profilePaths.worktreesDir, "scratch-baseline");
-    await ctx.github.createScratchWorktree(dir);
-    try {
-        const changedFiles = ctx.profile.repo.baselineFile ? [ctx.profile.repo.baselineFile] : [];
-        const checks = await runChecks(ctx.profile, dir, { changedFiles, baselineFailures: {}, logger: ctx.logger });
-        for (const check of checks.results) {
-            if (!baselineChecks.some((spec) => spec.name === check.name))
-                continue;
-            const failures = check.failures ?? [];
-            const unparsed = failures.some((failure) => failure.includes("unparsed"));
-            ctx.state.baselineFailures[check.name] = unparsed ? [] : failures;
-            if (unparsed)
-                ctx.logger.warn(`Baseline check "${check.name}" failed without parsable failures; not baselining`);
-        }
-        ctx.state.baselineSha = sha;
-        ctx.state.baselineAt = new Date().toISOString();
-        ctx.logger.info("Baseline captured", { sha: sha?.slice(0, 12), checks: Object.keys(ctx.state.baselineFailures) });
-    }
-    finally {
-        await cleanupWorktree(ctx.github, dir);
-    }
-}
 async function cleanupOldWorktrees(ctx) {
     const cutoff = Date.now() - 2 * 24 * 60 * 60 * 1000;
     for (const task of Object.values(ctx.state.tasks)) {
@@ -1509,11 +1510,13 @@ async function runCycle(ctx) {
         ctx.logger.info("Paused; waiting for resume");
         return { paused: true };
     }
+    setPhase(ctx, "poll");
     await poll(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
         logger: ctx.logger,
         markInboxRead: !ctx.dryRun,
         clientForName: (name) => clientByName(ctx, name)?.client ?? null
     });
+    setPhase(ctx, "feed");
     const maxAge = ctx.profile.memoryRefreshMinutes;
     const loadedAt = ctx.memory?.loadedAt ? new Date(ctx.memory.loadedAt).getTime() : 0;
     if (!ctx.memory || Date.now() - loadedAt > maxAge * 60 * 1000) {
@@ -1544,6 +1547,7 @@ async function runCycle(ctx) {
         state: ctx.state
     });
     if (ctx.dryRun) {
+        setPhase(ctx, "dry-run");
         ctx.logger.info("Dry run: queue built; no Ziki or GitHub writes", {
             queue: ctx.queue.counts,
             owner: ctx.queue.owner.length,
@@ -1556,13 +1560,14 @@ async function runCycle(ctx) {
         await save(ctx);
         return { ok: true, dryRun: true };
     }
+    setPhase(ctx, "heartbeat");
     await heartbeatPass(ctx);
-    if (ctx.repoReady)
-        await ensureBaseline(ctx).catch((error) => ctx.logger.warn(`Baseline failed: ${error instanceof Error ? error.message : String(error)}`));
+    setPhase(ctx, "dispatch");
     dispatch(ctx);
     await cleanupOldWorktrees(ctx);
     pruneState(ctx.state);
     ctx.state.lastCycleMs = Date.now() - started;
+    setPhase(ctx, "idle");
     await save(ctx);
     await notifyNeedsYou(ctx);
     ctx.logger.info("Cycle complete", {
@@ -1592,12 +1597,27 @@ async function processWorkSafe(ctx, item, worker) {
         await processWorkItem(ctx, item, worker);
     }
     catch (error) {
-        ctx.logger.error(`Delivery for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        const network = isTransientNetworkError(error);
+        ctx.logger.error(`Delivery for #${item.issueNumber} crashed: ${message}`);
+        ctx.live?.note(`#${item.issueNumber} crashed: ${truncate(message, 120)}`);
         counter(ctx).errors += 1;
-        ctx.state.run.failures += 1;
         ctx.cycleStats.errors += 1;
-        history(ctx, { type: "failure", issue: item.issueNumber, detail: error instanceof Error ? error.message : String(error) });
-        markRecent(ctx, item.key);
+        if (network) {
+            ctx.state.run.networkErrors += 1;
+            ctx.consecutiveNetworkErrors += 1;
+        }
+        else {
+            ctx.state.run.failures += 1;
+        }
+        const requeued = await requeueCrashedTask(ctx, item, error);
+        history(ctx, {
+            type: "failure",
+            issue: item.issueNumber,
+            detail: `${network ? "network error: " : ""}${message}${requeued ? " (requeued)" : ""}`
+        });
+        if (!requeued)
+            markRecent(ctx, item.key);
         await save(ctx).catch(() => { });
     }
 }
@@ -1609,12 +1629,27 @@ async function processReviewSafe(ctx, item) {
             await processAccept(ctx, item);
     }
     catch (error) {
-        ctx.logger.error(`Review for #${item.issueNumber} crashed: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        const network = isTransientNetworkError(error);
+        ctx.logger.error(`Review for #${item.issueNumber} crashed: ${message}`);
+        ctx.live?.note(`#${item.issueNumber} review crashed: ${truncate(message, 120)}`);
         counter(ctx).errors += 1;
-        ctx.state.run.failures += 1;
         ctx.cycleStats.errors += 1;
-        history(ctx, { type: "failure", issue: item.issueNumber, detail: error instanceof Error ? error.message : String(error) });
-        markRecent(ctx, item.key);
+        if (network) {
+            ctx.state.run.networkErrors += 1;
+            ctx.consecutiveNetworkErrors += 1;
+        }
+        else {
+            ctx.state.run.failures += 1;
+        }
+        const requeued = await requeueCrashedTask(ctx, item, error);
+        history(ctx, {
+            type: "failure",
+            issue: item.issueNumber,
+            detail: `${network ? "network error: " : ""}${message}${requeued ? " (requeued)" : ""}`
+        });
+        if (!requeued)
+            markRecent(ctx, item.key);
         await save(ctx).catch(() => { });
     }
 }
@@ -1697,7 +1732,7 @@ async function createContext(loaded, state, logger, options) {
         repoReady = true;
     }
     catch (error) {
-        logger.error(`Repo not ready: ${error instanceof Error ? error.message : String(error)}`);
+        throw new Error(`Repository is not ready: ${error instanceof Error ? error.message : String(error)}`);
     }
     const memory = await loadMemoryContext(primary.client, loaded.profilePaths, {
         maxAgeMinutes: profile.memoryRefreshMinutes
@@ -1740,7 +1775,12 @@ async function createContext(loaded, state, logger, options) {
         providerLimit: null,
         providerLimitNotified: false,
         rateLimitUntil: 0,
-        rateLimitCount: 0
+        rateLimitCount: 0,
+        phase: "starting",
+        activity: null,
+        phaseStartedAt: new Date().toISOString(),
+        live: null,
+        consecutiveNetworkErrors: 0
     };
 }
 async function readRunLimitsFile(profilePaths) {
@@ -1818,7 +1858,7 @@ export async function runLoop(options = {}) {
     const logger = createLogger({
         name: `auto-work.${loaded.profileName}`,
         logDir: loaded.profilePaths.logsDir,
-        foreground: options.foreground !== false
+        foreground: options.verbose === true
     });
     const lock = await acquireLock(loaded.profilePaths);
     if (!lock.acquired) {
@@ -1860,6 +1900,7 @@ export async function runLoop(options = {}) {
         discoveries: 0,
         aux: 0,
         failures: 0,
+        networkErrors: 0,
         tokens: emptyUsage()
     };
     state.lastRun = buildRunSummary({
@@ -1877,12 +1918,21 @@ export async function runLoop(options = {}) {
         ctx = await createContext(loaded, state, logger, { dryRun: Boolean(options.dryRun), runLimits });
     }
     catch (error) {
-        logger.error(`Startup failed: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error(`Startup failed: ${message}`);
+        console.error(`Startup failed: ${message}`);
         await releaseLock(loaded.profilePaths);
         await clearPid(loaded.profilePaths);
         return 1;
     }
     await reconcileWorktreesOnStartup(ctx, stalePids).catch(() => { });
+    const live = new LiveStatus({
+        enabled: options.foreground !== false && !options.verbose,
+        render: () => renderLive(ctx)
+    });
+    ctx.live = live;
+    setPhase(ctx, "idle");
+    live.start();
     const controller = new AbortController();
     const shutdown = (signal) => {
         logger.info(`Stopping on ${signal}`);
@@ -1920,17 +1970,35 @@ export async function runLoop(options = {}) {
             }
             try {
                 await runCycle(ctx);
+                ctx.consecutiveNetworkErrors = 0;
             }
             catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                const network = isTransientNetworkError(error);
                 ctx.state.lastError = {
                     at: new Date().toISOString(),
-                    error: error instanceof Error ? error.message : String(error),
+                    error: message,
                     stack: truncate(error instanceof Error ? error.stack : "", 1500)
                 };
-                logger.error(`Cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+                logger.error(`Cycle failed: ${message}`);
+                ctx.live?.note(`cycle failed: ${truncate(message, 120)}`);
+                if (network) {
+                    ctx.state.run.networkErrors += 1;
+                    ctx.consecutiveNetworkErrors += 1;
+                }
                 await save(ctx).catch(() => { });
                 if (options.once) {
                     stopReason = "error";
+                    break;
+                }
+                const maxNetworkRetries = ctx.profile.limits.maxNetworkRetries ?? 5;
+                const networkRetryMs = (ctx.profile.limits.networkRetryMinutes ?? 1) * 60_000;
+                if (network && !controller.signal.aborted && ctx.consecutiveNetworkErrors < maxNetworkRetries) {
+                    await sleep(networkRetryMs, controller.signal);
+                    continue;
+                }
+                if (network) {
+                    stopReason = "network";
                     break;
                 }
             }
@@ -1943,6 +2011,11 @@ export async function runLoop(options = {}) {
             if (ctx.providerLimit) {
                 stopReason = "provider-limit";
                 logger.info("Provider limit reached; stopping");
+                await ctx.pool.drain(120_000);
+                break;
+            }
+            if (stopReason === "network") {
+                logger.info("Network unavailable; stopping");
                 await ctx.pool.drain(120_000);
                 break;
             }
@@ -1989,7 +2062,10 @@ export async function runLoop(options = {}) {
             endedAt: ctx.state.stoppedAt
         });
         ctx.state.lastRun = finalSummary;
-        const hardStop = stopReason === "stop" || stopReason === "error" || controller.signal.aborted;
+        const hardStop = stopReason === "stop" ||
+            stopReason === "error" ||
+            stopReason === "network" ||
+            controller.signal.aborted;
         if (hardStop) {
             controller.abort();
             killActiveAgents();
@@ -2003,6 +2079,8 @@ export async function runLoop(options = {}) {
         await save(ctx).catch(() => { });
         await writeStatus(ctx, { running: false }).catch(() => { });
         await writeRunSummary(ctx.profilePaths, finalSummary).catch(() => { });
+        live.stop();
+        ctx.live = null;
         console.log(formatRunSummary(finalSummary, { files: true }));
         await releaseLock(loaded.profilePaths);
         await clearPid(loaded.profilePaths);

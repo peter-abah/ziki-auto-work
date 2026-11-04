@@ -30,13 +30,16 @@ export declare class GitHub {
         reposDir: string;
         logger?: GitHub["logger"];
     });
+    private retryCommand;
     git(args: string[], options?: {
         cwd?: string;
         timeoutMs?: number;
+        retry?: boolean;
     }): Promise<import("./platform/spawn.js").RunResult>;
     gh(args: string[], options?: {
         cwd?: string;
         timeoutMs?: number;
+        retry?: boolean;
     }): Promise<import("./platform/spawn.js").RunResult>;
     ensureRepo(): Promise<string>;
     copyEnvTo(worktree: string): Promise<void>;

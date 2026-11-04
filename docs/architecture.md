@@ -22,7 +22,7 @@ src/
   worktree.ts        per-ticket and review worktrees
   agent.ts           provider-agnostic executor + result contract
   providers/         opencode, claude, codex, gemini, custom
-  checks.ts          generic check runner, baseline, secrets, protected files
+  checks.ts          check guidance, secrets, protected files
   doctor.ts          environment validation
   service.ts         systemd/launchd/Task Scheduler/detached process
   uninstall.ts       service, shim, config and state cleanup
@@ -39,18 +39,18 @@ src/
 4. `platform` — refresh the platform's issues and ideas (10 min cache).
 5. `queue` — filter to this profile's platform, prioritise, skip recent/blocked.
 6. `heartbeat` — keep active claims alive.
-7. `baseline` — once per base SHA, record pre-existing check failures.
-8. `owner` — handle one owner request.
-9. `dispatch` — start work in parallel: deliveries, reviews, auxiliary tasks
+7. `owner` — handle one owner request.
+8. `dispatch` — start work in parallel: deliveries, reviews, auxiliary tasks
    and discovery, subject to per-kind limits and `maxConcurrentAgents`.
    `inFlightKeys` prevents duplicate picks.
-10. `delivery` — confirm/bid/award/accept, implement, check, push, PR, deliver.
-11. `review` — test verdicts and manager merge reviews.
-12. `aux` — PR reports, bid votes, awards, comment upvotes, categorisation,
+9. `delivery` — confirm/bid/award/accept, implement, agent checks, push, PR,
+   deliver.
+10. `review` — test verdicts and manager merge reviews.
+11. `aux` — PR reports, bid votes, awards, comment upvotes, categorisation,
     idea triage, confirmations.
-13. `discovery` — every N cycles, file evidence-backed ideas.
-14. `cleanup` — remove old worktrees.
-15. save state, then sleep or wait for an in-flight task.
+12. `discovery` — every N cycles, file evidence-backed ideas.
+13. `cleanup` — remove old worktrees.
+14. save state, then sleep or wait for an in-flight task.
 
 ## Roles
 
@@ -80,7 +80,7 @@ via placeholders, and the orchestrator enforces file/line limits.
 
 Worktrees receive the configured `repo.envFiles` (`.env`, `.env.local` by
 default). Agents inherit the process env, then `executor.env`, then provider
-and per-run env. Checks merge `executor.env` and `checks[].env`. Toolchain
+and per-run env. Toolchain
 directories are prepended to `PATH`. Env/auth/tool failures are classified as
 blockers instead of silent retries.
 
@@ -109,7 +109,7 @@ reads it and decides what to do. The contract is provider-independent.
 ## State
 
 Each profile has its own state directory. `state.json` holds tasks, escalations,
-counters, feed ETags and baseline failures. `status.json` is the human-readable
+counters and feed ETags. `status.json` is the human-readable
 snapshot. Locks are per profile, so `start --all` can run multiple profiles.
 
 ## Worktrees
@@ -127,9 +127,12 @@ again until it is answered.
 
 ## Checks
 
-Checks are data. The runner resolves commands through `toolchain`, optionally
-appends changed files, parses JSON test events, and compares failures to the
-base-branch baseline. A check can be optional.
+Checks are agent-owned. `checks[]` is rendered into the worker prompt through
+`{{checks}}`; the agent runs the commands and reports evidence in the result and
+PR. The orchestrator does not run checks, does not baseline failures, and does
+not gate delivery on repository state. Ziki peer review and CI are the quality
+gates. The only orchestrator gates are protected files, max files/lines, and
+secrets.
 
 ## Ziki drift
 

@@ -42,6 +42,7 @@ export function buildRunSummary(options: {
     discoveries: state.run.discoveries,
     aux: state.run.aux,
     failures: state.run.failures,
+    networkErrors: state.run.networkErrors ?? 0,
     interrupted: clean ? 0 : tasks.filter((task) => ["claimed", "working"].includes(task.status)).length,
     needsYou: open.length,
     needsYouLink: inboxUrl(profile),
@@ -73,6 +74,7 @@ export function formatRunSummary(summary: RunSummary, options: { files?: boolean
   lines.push(`Discoveries:   ${summary.discoveries}`);
   lines.push(`Aux:           ${summary.aux}`);
   lines.push(`Failures:      ${summary.failures}`);
+  lines.push(`Network errors:${summary.networkErrors ? ` ${summary.networkErrors}` : " 0"}`);
   const tokens = summary.tokens ?? { input: 0, output: 0, total: 0 };
   lines.push(
     `Tokens:        ${tokens.total.toLocaleString()} (${tokens.input.toLocaleString()} in / ${tokens.output.toLocaleString()} out)${tokens.estimated ? " estimated" : ""}${tokens.costUsd !== undefined ? ` · $${tokens.costUsd.toFixed(4)}` : ""}`

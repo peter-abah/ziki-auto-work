@@ -62,12 +62,10 @@ export async function runChecks(
   worktree: string,
   options: {
     changedFiles: string[];
-    baselineFailures?: Record<string, string[]>;
     logger?: Logger;
   }
 ): Promise<CheckRunResult> {
   const results: CheckResult[] = [];
-  const baselineAll = options.baselineFailures ?? {};
 
   for (const spec of profile.checks) {
     const required = spec.required !== false;
@@ -87,20 +85,11 @@ export async function runChecks(
     });
 
     let failures: string[] | undefined;
-    let newFailures: string[] | undefined;
-    let ok = result.ok;
+    const ok = result.ok;
 
     if (spec.reporter === "json") {
       failures = parseTestFailures(`${result.stdout}\n${result.stderr}`);
       if (!result.ok && failures.length === 0) failures = [`${spec.name} failed (unparsed output)`];
-      const baseline = baselineAll[spec.name] ?? [];
-      newFailures = failures.filter((failure) => !baseline.includes(failure));
-      ok = result.ok || (baseline.length > 0 && newFailures.length === 0);
-    } else if (spec.baseline) {
-      failures = result.ok ? [] : [`${spec.name} failed`];
-      const baseline = baselineAll[spec.name] ?? [];
-      newFailures = failures.filter((failure) => !baseline.includes(failure));
-      ok = result.ok || (baseline.length > 0 && newFailures.length === 0);
     }
 
     results.push({
@@ -108,8 +97,7 @@ export async function runChecks(
       ok,
       required,
       output: tail(`${result.stdout}\n${result.stderr}`),
-      ...(failures ? { failures } : {}),
-      ...(newFailures ? { newFailures } : {})
+      ...(failures ? { failures } : {})
     });
 
     options.logger?.info(`Check ${spec.name}: ${ok ? "pass" : "fail"}`, {
