@@ -62,12 +62,22 @@ function isoMax(values) {
     const found = values.filter((value) => Boolean(value)).sort();
     return found.at(-1) ?? null;
 }
+function actionablePrComment(comment) {
+    if (!comment.body.trim())
+        return false;
+    if (/\[bot\]$/i.test(comment.author))
+        return false;
+    const text = comment.body.trim().toLowerCase();
+    if (/^(lgtm|looks good|approved|ship it|nice|thanks|thank you)\b/.test(text))
+        return false;
+    if (comment.kind === "review" && (comment.path || comment.line))
+        return true;
+    return /\b(fix|please|should|could you|can you|need|change|remove|add|update|missing|broken|wrong|fail|error|conflict|rebase|test|why)\b/.test(text);
+}
 function actionablePrComments(task, comments) {
     const cutoff = task.prLastHandledCommentAt ? Date.parse(task.prLastHandledCommentAt) : 0;
     return comments.filter((comment) => {
-        if (!comment.body.trim())
-            return false;
-        if (/\[bot\]$/i.test(comment.author))
+        if (!actionablePrComment(comment))
             return false;
         const at = Date.parse(comment.createdAt ?? "") || 0;
         return at > (Number.isFinite(cutoff) ? cutoff : 0);
