@@ -24,4 +24,10 @@ export declare class LiveStatus {
     refresh(): void;
     note(message: string): void;
 }
+export declare function formatLiveTask(task: {
+    label?: string;
+    key: string;
+    kind: string;
+    ageMs: number;
+}): string;
 export declare function formatLiveDuration(ms: number | null | undefined): string;

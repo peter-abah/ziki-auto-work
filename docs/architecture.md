@@ -6,8 +6,11 @@ src/
   config.ts          config v3, defaults, validation, env
   keys.ts            key import, validation and role assignment
   types.ts           shared types
-  orchestrator.ts    the loop, dispatch and state machine
-  scheduler.ts       TaskPool with per-kind and total concurrency limits
+  orchestrator.ts    the loop, all-agent feed merge, dispatch and state machine
+  scheduler.ts       TaskPool with per-kind/total limits, agent binding and labels
+  capacity.ts        resolves "auto"/null concurrency from the configured agents
+  decisions.ts       parses "Your Call" owner decisions from comments
+  loop-context.ts    one renderable context object for every agent task
   mutex.ts           serialized state/history writes
   discover.ts        Ziki-first repo/fork/branch/stack discovery
   rules.ts           workflow/protected-file/PR-template prompt context
@@ -15,7 +18,11 @@ src/
   notify.ts          desktop/command notifications
   run-report.ts      clean/abrupt run summaries
   ziki.ts            typed Ziki API client
-  queue.ts           work-feed prioritisation and platform matching
+  queue.ts           all latest work kinds, prioritisation and platform matching
+  feed.ts            merges every agent's work feed without dropping agent-specific items
+  pr-comments.ts     structured PR comment/mention policy for follow-up
+  votes.ts           explicit vote policy for bids and comments
+  work-key.ts        deployment environment and per-target work keys
   memory.ts          instructions, project notes, private notes, mistakes
   hitl.ts            escalations, inbox, non-blocking resume
   github.ts          clone, worktrees, push, PRs, PR status
@@ -65,6 +72,12 @@ worker (self-award), and confirmations/idea verdicts run at weight 1. If no
 worker exists, manager keys perform working tasks.
 
 ## Run limits and concurrency
+
+The loop polls every worker and manager feed, binds offers/claims/reviews to the
+agent that owns them, reserves one task per key, heartbeats delivered and
+queued claims, and releases undelivered claims on provider quota, context
+overflow, permanent failure and shutdown. The Ziki project's `maxActiveClaims`
+(2 for `zedu`) is read at startup and used as the hard claim ceiling.
 
 `maxRuntimeMinutes` (default 120), `maxCycles`, `stopAt`,
 `maxDeliveriesTotal`, or an explicit stop ends the loop after the current

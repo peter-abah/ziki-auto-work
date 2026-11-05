@@ -49,6 +49,10 @@
    secrets.
 5. Be honest. If it is not good to merge, say exactly what the author must fix.
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}

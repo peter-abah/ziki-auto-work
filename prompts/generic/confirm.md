@@ -32,6 +32,10 @@
    and lines where you found the problem.
 4. Do not change code. Do not post to Ziki.
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}

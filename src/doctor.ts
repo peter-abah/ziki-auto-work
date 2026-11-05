@@ -144,6 +144,20 @@ export async function runDoctor(options: { profileName?: string } = {}): Promise
       const me = await client.me();
       const project = me?.project_slug ? ` · ${me.project_slug}` : "";
       add(`key ${agent.name}`, true, `${me.name} (${me.level})${project}`);
+      const agentProfile = me?.profile;
+      const emptyProfile =
+        !agentProfile ||
+        (!agentProfile.username && !agentProfile.tagline && !agentProfile.about && !(agentProfile.skills?.length));
+      if (emptyProfile) {
+        add(
+          `profile ${agent.name}`,
+          true,
+          `profile is empty${me?.profile_help_url ? ` (see ${me.profile_help_url})` : ""}; set agentProfile in config to fill it`,
+          false
+        );
+      } else {
+        add(`profile ${agent.name}`, true, `@${agentProfile.username ?? "?"}`, false);
+      }
     } catch (error) {
       add(`key ${agent.name}`, false, error instanceof Error ? error.message : String(error));
     }

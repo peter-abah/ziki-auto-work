@@ -20,7 +20,14 @@ import type {
   WorkFeed,
   WorkItem
 } from "./types.js";
-import { DEFAULT_PR_TRACKING, loadProfile, resolveParityFile, resolveRunLimits } from "./config.js";
+import {
+  DEFAULT_PR_TRACKING,
+  loadProfile,
+  resolveMergeMethod,
+  resolveMergeMode,
+  resolveParityFile,
+  resolveRunLimits
+} from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
 import type { Logger } from "./log.js";
 import {
@@ -47,6 +54,7 @@ import type { ZikiClient } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import type { PrComment } from "./github.js";
 import { formatPrContext } from "./pr-context.js";
+import { actionablePrComments } from "./pr-comments.js";
 import { preparePrBody } from "./pr-body.js";
 import { prepareWorktree, prepareReviewWorktree, cleanupWorktree } from "./worktree.js";
 import {
@@ -57,6 +65,16 @@ import {
   runConfirm,
   runTriage,
   runOwner,
+  runEstimate,
+  runInvestigate,
+  runImportance,
+  runStakeVote,
+  runSenseCheck,
+  runClose,
+  runResearch,
+  runJobReview,
+  runBidVote,
+  runCommentVote,
   killActiveAgents,
   activeAgentPids
 } from "./agent.js";
@@ -70,9 +88,21 @@ import { profilePaths, paths } from "./platform/paths.js";
 import { escalationUrl, inboxUrl, issueUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
 import { isTransientNetworkError } from "./network.js";
-import { formatLiveDuration, LiveStatus } from "./live-status.js";
+import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js";
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
+import { resolveCapacity } from "./capacity.js";
+import { mergeWorkItemFeeds } from "./feed.js";
+import type { AgentFeed } from "./feed.js";
+import { mergeGateReason } from "./merge.js";
+import { deploymentEnvironment, workTargetKey } from "./work-key.js";
+import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
+import type { Capacity } from "./capacity.js";
+import { latestDecision, parseOwnerDecisions } from "./decisions.js";
+import { formatLoopContext } from "./loop-context.js";
+import type { LoopContextInput } from "./loop-context.js";
+import type { GitHubPrStatus, PrComment as PrReviewComment } from "./github.js";
+import type { OwnerDecision } from "./types.js";
 
 const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
 const TERMINAL = new Set(["resolved", "closed"]);
@@ -120,6 +150,12 @@ interface Context {
   phaseStartedAt: string | null;
   live: { note: (message: string) => void } | null;
   consecutiveNetworkErrors: number;
+  capacity: Capacity;
+  unsupportedKinds: Set<string>;
+  profileSynced: boolean;
+  feedAgentCounts: Record<string, number>;
+  zikiWorkflow: Record<string, unknown> | null;
+  reservedTargets: Set<string>;
 }
 
 function setPhase(ctx: Context, phase: string, activity: string | null = null): void {
@@ -134,7 +170,7 @@ function renderLive(ctx: Context): { line: string; key: string } {
   const tasks = ctx.pool.list();
   const first = tasks[0];
   const activity = first
-    ? `${first.key} ${first.kind} ${formatLiveDuration(first.ageMs)}${tasks.length > 1 ? ` +${tasks.length - 1}` : ""}`
+    ? `${formatLiveTask(first)}${tasks.length > 1 ? ` +${tasks.length - 1}` : ""}`
     : ctx.activity ?? ctx.phase;
   const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
   const elapsed = formatLiveDuration(Date.now() - started);
@@ -144,10 +180,15 @@ function renderLive(ctx: Context): { line: string; key: string } {
   const needs = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open").length;
   const tokens = ctx.state.run.tokens;
   const tokenText = `tokens ${formatTokens(tokens.total)}${tokens.estimated ? " est" : ""}`;
+  const agentText = `agents ${tasks.length}/${ctx.capacity.totalKeys}`;
   return {
-    line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${tokenText}`,
-    key: `${ctx.phase}|${first?.key ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
+    line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${agentText} · ${tokenText}`,
+    key: `${ctx.phase}|${first?.key ?? ""}|${first?.label ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
   };
+}
+
+function trackingEnabled(profile: ProfileConfig): boolean {
+  return prTracking(profile).fixReviewComments;
 }
 
 function prTracking(profile: ProfileConfig) {
@@ -158,27 +199,29 @@ function prTaskKey(task: TaskState): string {
   return `pr:${task.prUrl ?? task.number ?? "unknown"}`;
 }
 
+function taskLabel(entry: QueueEntry): string {
+  const target = entry.issueNumber != null ? `#${entry.issueNumber}` : entry.ideaNumber != null ? `#${entry.ideaNumber}` : "";
+  const title = truncate(entry.title ?? "", 40);
+  const kind = entry.kind === "ready_issue" || entry.kind === "active_claim" || entry.kind === "offer" ? "" : entry.kind.replace(/_/g, " ");
+  if (entry.kind === "report_deployment" || entry.kind === "report_pr_status") {
+    return `${target} ${entry.kind.replace(/_/g, " ")}`.trim();
+  }
+  return [target, title || kind].filter(Boolean).join(" ").trim() || entry.key;
+}
+
+function kindLabel(entry: QueueEntry, kind: "review" | "aux"): string {
+  const target = entry.issueNumber != null ? `#${entry.issueNumber}` : entry.ideaNumber != null ? `#${entry.ideaNumber}` : entry.key;
+  return `${target} ${kind}`;
+}
+
+function followUpLabel(task: TaskState): string {
+  const number = task.prNumber ?? (task.prUrl ? task.prUrl.match(/\/pull\/(\d+)/)?.[1] : null) ?? task.number;
+  return `PR #${number ?? "?"} followup`;
+}
+
 function isoMax(values: Array<string | null | undefined>): string | null {
   const found = values.filter((value): value is string => Boolean(value)).sort();
   return found.at(-1) ?? null;
-}
-
-function actionablePrComment(comment: PrComment): boolean {
-  if (!comment.body.trim()) return false;
-  if (/\[bot\]$/i.test(comment.author)) return false;
-  const text = comment.body.trim().toLowerCase();
-  if (/^(lgtm|looks good|approved|ship it|nice|thanks|thank you)\b/.test(text)) return false;
-  if (comment.kind === "review" && (comment.path || comment.line)) return true;
-  return /\b(fix|please|should|could you|can you|need|change|remove|add|update|missing|broken|wrong|fail|error|conflict|rebase|test|why)\b/.test(text);
-}
-
-function actionablePrComments(task: TaskState, comments: PrComment[]): PrComment[] {
-  const cutoff = task.prLastHandledCommentAt ? Date.parse(task.prLastHandledCommentAt) : 0;
-  return comments.filter((comment) => {
-    if (!actionablePrComment(comment)) return false;
-    const at = Date.parse(comment.createdAt ?? "") || 0;
-    return at > (Number.isFinite(cutoff) ? cutoff : 0);
-  });
 }
 
 function prFollowUpDue(ctx: Context, task: TaskState, now = Date.now()): boolean {
@@ -256,10 +299,15 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
     .map((comment) => ({ ...comment, kind: "review" as const }));
   const allComments = new Map<string, PrComment>();
   for (const comment of [...status.comments, ...reviewComments]) allComments.set(comment.id, comment);
-  const comments = actionablePrComments(task, [...allComments.values()]);
+  const comments = actionablePrComments([...allComments.values()], task.prLastHandledCommentAt, {
+    mentions: ["auto-work", ...ctx.clients.workers.map((agent) => agent.name), ...ctx.clients.managers.map((agent) => agent.name)]
+  });
+  const unresolved = trackingEnabled(ctx.profile)
+    ? await ctx.github.unresolvedReviewThreads(task.prUrl).catch(() => [])
+    : [];
   const tracking = prTracking(ctx.profile);
   const failing = tracking.fixFailingChecks && status.checks === "failing";
-  const newComments = tracking.fixReviewComments && comments.length > 0;
+  const newComments = tracking.fixReviewComments && (comments.length > 0 || unresolved.length > 0);
   const changesRequested =
     tracking.fixReviewComments &&
     status.reviewDecision === "CHANGES_REQUESTED" &&
@@ -289,7 +337,10 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
   }
 
   const checkLogs = failing ? await ctx.github.failedCheckLogs(status).catch(() => []) : [];
-  const prContext = formatPrContext(status, [...allComments.values()].filter((comment) => comment.kind === "review"), checkLogs);
+  const threadText = unresolved
+    .map((thread) => `- ${thread.author ?? "someone"}${thread.path ? ` (${thread.path}${thread.line ? `:${thread.line}` : ""})` : ""}: ${thread.body}`)
+    .join("\n");
+  const prContext = `${formatPrContext(status, [...allComments.values()].filter((comment) => comment.kind === "review"), checkLogs)}${threadText ? `\n\nUnresolved review threads:\n${threadText}` : ""}`;
   const previousError = task.lastError ?? "";
   const attempt = (task.followUpAttempts ?? 0) + 1;
   task.followUpAttempts = attempt;
@@ -315,6 +366,7 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
       attempt,
       maxAttempts,
       previousError,
+      loopContext: await loopContextFor(ctx, { issue, worktree: task.worktree ?? null }),
       logger: ctx.logger,
       ...agentHooks(ctx)
     });
@@ -440,8 +492,125 @@ function clientByName(ctx: Context, name: string | null | undefined): AgentClien
   return [...ctx.clients.workers, ...ctx.clients.managers].find((agent) => agent.name === name) ?? null;
 }
 
-function activeClaims(ctx: Context): TaskState[] {
-  return Object.values(ctx.state.tasks).filter((task) => ["claimed", "working"].includes(task.status));
+function agentForItem(ctx: Context, item: QueueEntry): AgentClient {
+  return clientByName(ctx, item.item._feedAgent) ?? ctx.primary;
+}
+
+const CLAIM_ADDING_WORK = new Set(["offer", "ready_issue"]);
+
+function isManagerAgent(ctx: Context, agent: AgentClient | null | undefined): boolean {
+  return Boolean(agent && ctx.clients.managers.some((entry) => entry.name === agent.name));
+}
+
+function managerFor(ctx: Context, preferred?: AgentClient | null, exclude: string[] = []): AgentClient | null {
+  const excluded = new Set(exclude.filter(Boolean));
+  if (preferred && isManagerAgent(ctx, preferred) && !excluded.has(preferred.name)) return preferred;
+  return ctx.clients.managers.find((agent) => !excluded.has(agent.name)) ?? null;
+}
+
+function agentHoldsClaim(ctx: Context, name: string): boolean {
+  return Object.values(ctx.state.tasks).some(
+    (task) => task.agentName === name && Boolean(task.claimId) && ["claimed", "working", "queued"].includes(task.status)
+  );
+}
+
+function agentIsFree(ctx: Context, agent: AgentClient): boolean {
+  return !ctx.reservedAgents.has(agent.name);
+}
+
+function resolveAgent(
+  ctx: Context,
+  item: QueueEntry,
+  options: { forDelivery?: boolean; forReview?: boolean } = {}
+): AgentClient | null {
+  const preferred = clientByName(ctx, item.item._feedAgent);
+  const usable = (agent: AgentClient | null | undefined): agent is AgentClient => {
+    if (!agent || !agentIsFree(ctx, agent)) return false;
+    if (
+      options.forDelivery &&
+      item.kind !== "active_claim" &&
+      item.kind !== "review_offer" &&
+      item.kind !== "job_review_offer" &&
+      agentHoldsClaim(ctx, agent.name)
+    ) {
+      return false;
+    }
+    return true;
+  };
+  const role = item.item.minimumRole;
+
+  if (item.kind === "offer") {
+    if (claimCapacityReached(ctx)) return null;
+    return usable(preferred) ? preferred : null;
+  }
+  if (item.kind === "active_claim" || item.kind === "review_offer" || item.kind === "job_review_offer") {
+    return usable(preferred) ? preferred : null;
+  }
+
+  if (role === "manager" || role === "merger") {
+    if (usable(preferred) && isManagerAgent(ctx, preferred)) return preferred;
+    return ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+  }
+
+  if (usable(preferred)) return preferred;
+  return ctx.clients.workers.find((agent) => usable(agent)) ?? ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+}
+
+function itemTargetKey(item: QueueEntry): string {
+  return workTargetKey(item.key, item.issueId, item.ideaId);
+}
+
+function nextDispatch(
+  ctx: Context,
+  bucket: QueueEntry[] | undefined,
+  options: { forDelivery?: boolean; forReview?: boolean; skipClaimAdding?: boolean } = {}
+): { item: QueueEntry; agent: AgentClient } | null {
+  for (const item of bucket ?? []) {
+    if (ctx.pool.has(item.key) || item.item.canAct === false) continue;
+    if (ctx.reservedTargets.has(itemTargetKey(item))) continue;
+    if (options.skipClaimAdding && CLAIM_ADDING_WORK.has(item.kind)) continue;
+    const agent = resolveAgent(ctx, item, options);
+    if (agent) return { item, agent };
+  }
+  return null;
+}
+
+function zikiClaimLimit(ctx: Context): number | null {
+  const value = Number(ctx.zikiWorkflow?.maxActiveClaims);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function ownClaimCount(ctx: Context): number {
+  return Object.values(ctx.state.tasks).filter(
+    (task) => Boolean(task.claimId) && ["claimed", "working", "queued", "waiting_human"].includes(task.status)
+  ).length;
+}
+
+function claimCapacityReached(ctx: Context): boolean {
+  const limit = zikiClaimLimit(ctx);
+  return limit !== null && ownClaimCount(ctx) >= limit;
+}
+
+async function releaseClaim(ctx: Context, task: TaskState, agent: AgentClient | null, reason: string): Promise<void> {
+  if (!task.claimId) return;
+  const actor = agent ?? (task.agentName ? clientByName(ctx, task.agentName) : null);
+  if (actor) {
+    try {
+      await actor.client.release(task.id ?? task.number ?? "");
+    } catch (error) {
+      ctx.logger.warn(`Could not release claim for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  task.claimId = undefined;
+  task.lastError = reason;
+}
+
+async function releaseUndeliveredClaims(ctx: Context, reason: string): Promise<void> {
+  for (const task of Object.values(ctx.state.tasks)) {
+    if (!task.claimId) continue;
+    if (!["queued", "claimed", "working", "waiting_human"].includes(task.status)) continue;
+    await releaseClaim(ctx, task, null, reason);
+  }
 }
 
 function pickWorker(ctx: Context, exclude: string[] = []): AgentClient | null {
@@ -593,24 +762,6 @@ export function normalizeCommitMessage(message: string | undefined, issue: Issue
   return text.length > 72 ? text.slice(0, 72) : text;
 }
 
-const ENV_FAILURE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /command not found/i, label: "a required command is not on PATH" },
-  { pattern: /\bENOENT\b/i, label: "a required file or command is missing" },
-  { pattern: /missing (env|environment|variable|token|key)/i, label: "a required environment value is missing" },
-  { pattern: /environment variable .* (not set|missing)/i, label: "a required environment variable is not set" },
-  { pattern: /(401|403|unauthorized|forbidden|not authenticated|not logged in|no credentials)/i, label: "authentication or permission is missing" },
-  { pattern: /\.env/i, label: "a project .env value is missing" },
-  { pattern: /(flutter|dart|node|npm|go|cargo|gh|git):? not found/i, label: "a toolchain executable is missing" }
-];
-
-function classifyEnvironmentFailure(text: string | undefined): string | null {
-  if (!text) return null;
-  for (const entry of ENV_FAILURE_PATTERNS) {
-    if (entry.pattern.test(text)) return entry.label;
-  }
-  return null;
-}
-
 function remainingMs(ctx: Context): number | null {
   const limits = ctx.runLimits;
   const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
@@ -624,6 +775,108 @@ function remainingMs(ctx: Context): number | null {
   }
   if (!deadlines.length) return null;
   return Math.max(0, Math.min(...deadlines));
+}
+
+async function loopContextFor(
+  ctx: Context,
+  options: {
+    issue?: Issue | null;
+    idea?: Idea | null;
+    worktree?: string | null;
+    includeGit?: boolean;
+    prStatus?: GitHubPrStatus | null;
+  } = {}
+): Promise<string> {
+  const issue = options.issue ?? null;
+  let pr: GitHubPrStatus | null = options.prStatus ?? null;
+  let reviewComments: PrReviewComment[] = [];
+  let checkLogs: Array<{ name: string; log: string }> = [];
+  if (!pr && issue?.pullRequestUrl) {
+    pr = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  }
+  if (pr) {
+    reviewComments = (await ctx.github.prReviewComments(pr.url).catch(() => []))
+      .map((comment) => ({ ...comment, kind: "review" as const }));
+    checkLogs = await ctx.github.failedCheckLogs(pr).catch(() => []);
+  }
+
+  let git: LoopContextInput["git"] = null;
+  const worktree = options.worktree ?? (issue ? ctx.state.tasks[taskKey(issue)]?.worktree : null);
+  if (options.includeGit !== false && worktree && existsSync(worktree)) {
+    const branch = await ctx.github.git(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktree }).then((out) => out.stdout).catch(() => null);
+    const headSha = await ctx.github.headSha(worktree).catch(() => null);
+    const baseSha = await ctx.github.baseSha().catch(() => null);
+    const counts = await ctx.github
+      .git(["rev-list", "--left-right", "--count", `upstream/${ctx.profile.repo.base}...HEAD`], { cwd: worktree })
+      .then((out) => out.stdout.trim().split(/\s+/).map(Number))
+      .catch(() => []);
+    const conflicts = await ctx.github.git(["diff", "--name-only", "--diff-filter=U"], { cwd: worktree })
+      .then((out) => Boolean(out.stdout.trim()))
+      .catch(() => null);
+    const diff = await ctx.github.diffStats(worktree).catch(() => null);
+    const files = await ctx.github.changedFiles(worktree).catch(() => []);
+    git = {
+      branch,
+      base: ctx.profile.repo.base,
+      baseSha,
+      headSha,
+      behind: Number.isFinite(counts[0]) ? counts[0]! : null,
+      ahead: Number.isFinite(counts[1]) ? counts[1]! : null,
+      conflicts,
+      files,
+      diff
+    };
+  }
+
+  const task = issue ? ctx.state.tasks[taskKey(issue)] ?? null : null;
+  const decisions: OwnerDecision[] = parseOwnerDecisions(issue?.comments);
+  const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
+  const available = (ctx.queue?.all ?? []).slice(0, 8).map((entry) => `${entry.kind} #${entry.issueNumber ?? entry.ideaNumber ?? "?"} ${truncate(entry.title, 80)}`);
+  const blocked = [
+    ...Object.values(ctx.state.tasks)
+      .filter((entry) => entry.status === "waiting_human" || entry.status === "failed")
+      .slice(0, 8)
+      .map((entry) => `#${entry.number} ${entry.status}: ${entry.lastError ?? entry.reason ?? "no reason recorded"}`),
+    ...[...ctx.unsupportedKinds].map((kind) => `${kind}: unsupported by this build`)
+  ];
+  const changedSinceLastLoop = task
+    ? `task updated ${task.updatedAt}; PR checked ${task.prLastCheckedAt ?? "never"}; follow-ups ${task.followUpAttempts ?? 0}`
+    : null;
+
+  return formatLoopContext({
+    issue,
+    idea: options.idea ?? null,
+    task,
+    pr,
+    checkLogs,
+    reviewComments,
+    git,
+    ownerDecisions: decisions,
+    workflow: {
+      pushMode: ctx.profile.repo.pushMode ?? "inferred",
+      target: ctx.profile.repo.githubRepo,
+      fork: ctx.profile.repo.forkOwner,
+      base: ctx.profile.repo.base,
+      teamLead: ctx.profile.pr.teamLead || ctx.profile.repo.teamLead || null,
+      protectedFiles: ctx.profile.repo.protectedFiles ?? [],
+      requiredLabels: ctx.profile.repo.requiredLabels ?? [],
+      requiredReviewers: ctx.profile.repo.requiredReviewers ?? [],
+      mergeMode: resolveMergeMode(ctx.profile),
+      mergeMethod: resolveMergeMethod(ctx.profile),
+      maxFiles: ctx.profile.workflow.maxFiles,
+      maxLines: ctx.profile.workflow.maxLines
+    },
+    budgets: {
+      elapsed: formatLiveDuration(Date.now() - started),
+      remaining: formatLiveDuration(remainingMs(ctx)),
+      tokens: formatTokens(ctx.state.run.tokens.total),
+      attempt: task?.attempts ?? 0,
+      attemptLimit: ctx.profile.limits.maxAttemptsPerTask
+    },
+    available,
+    blocked,
+    changedSinceLastLoop
+  });
 }
 
 async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -645,6 +898,31 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
     phaseStartedAt: ctx.phaseStartedAt,
     activity: ctx.activity,
     queue: ctx.queue?.counts ?? null,
+    capacity: ctx.capacity,
+    profileLimits: ctx.profile.limits,
+    feedAgents: ctx.feedAgentCounts,
+    zikiWorkflow: {
+      maxActiveClaims: zikiClaimLimit(ctx),
+      stakeLimit: Number(ctx.zikiWorkflow?.stakeLimit) || null
+    },
+    agents: [...ctx.clients.workers, ...ctx.clients.managers].map((agent) => {
+      const owned = tasks.filter((task) => task.agentName === agent.name);
+      const current = owned.find((task) => ["claimed", "working"].includes(task.status)) ?? owned.find((task) => task.status === "queued" && task.claimId);
+      const poolTask = ctx.pool.list().find((task) => task.agent === agent.name);
+      const last = current?.lastHeartbeatAt ? new Date(current.lastHeartbeatAt).getTime() : 0;
+      const stale = Boolean(current && !["delivered"].includes(current.status) && (!last || Date.now() - last > 15 * 60 * 1000));
+      return {
+        name: agent.name,
+        level: isManagerAgent(ctx, agent) ? "manager" : "working",
+        busy: Boolean(poolTask),
+        current: poolTask ? { key: poolTask.key, kind: poolTask.kind, label: poolTask.label, ageMs: poolTask.ageMs } : null,
+        claim: current?.number ?? null,
+        claimStatus: current?.status ?? null,
+        lastHeartbeatAt: current?.lastHeartbeatAt ?? null,
+        stale
+      };
+    }),
+    unsupportedKinds: [...ctx.unsupportedKinds],
     tasks: {
       total: tasks.length,
       queued: tasks.filter((task) => task.status === "queued").length,
@@ -771,12 +1049,10 @@ async function save(ctx: Context): Promise<void> {
 }
 
 async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
-  const agents = [ctx.clients.workers[0], ctx.clients.managers[0]].filter(Boolean) as AgentClient[];
+  const agents = [...ctx.clients.workers, ...ctx.clients.managers];
   if (!agents.length) return null;
 
-  const merged = new Map<string, WorkItem>();
-  let base: WorkFeed | null = null;
-
+  const feeds: AgentFeed[] = [];
   for (const agent of agents) {
     try {
       const etag = ctx.state.feedEtags[agent.name];
@@ -791,22 +1067,17 @@ async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
       }
       if (!result.data) continue;
       ctx.feedCache[agent.name] = result.data;
-      if (!base) base = result.data;
-      for (const item of result.data.items ?? []) {
-        item._feedAgent = agent.name;
-        const previous = merged.get(item.key);
-        if (!previous || (item.actions?.length ?? 0) > (previous.actions?.length ?? 0)) {
-          merged.set(item.key, item);
-        }
-      }
+      feeds.push({ agent: agent.name, feed: result.data });
       if (result.etag) ctx.state.feedEtags[agent.name] = result.etag;
     } catch (error) {
       ctx.logger.warn(`Work feed failed for ${agent.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  if (!base) return null;
-  return { ...base, items: [...merged.values()] };
+  const merged = mergeWorkItemFeeds(feeds);
+  ctx.feedAgentCounts = merged.counts;
+  if (!merged.base) return null;
+  return { ...merged.base, items: merged.items };
 }
 
 async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
@@ -824,8 +1095,8 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
   }
   try {
     const [issues, ideas] = await Promise.all([
-      ctx.primary.client.listAllIssues({ platform: ctx.profile.ziki.platform, max: 600 }),
-      ctx.primary.client.listAllIdeas({ platform: ctx.profile.ziki.platform, max: 600 })
+      ctx.primary.client.listAllIssues({ platform: ctx.profile.ziki.platform, max: 2000 }),
+      ctx.primary.client.listAllIdeas({ platform: ctx.profile.ziki.platform, max: 1000 })
     ]);
     const data: Context["platform"] = {
       fetchedAt: new Date().toISOString(),
@@ -848,7 +1119,11 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
 
 async function heartbeatPass(ctx: Context): Promise<void> {
   const now = Date.now();
-  const live = Object.values(ctx.state.tasks).filter((task) => ["claimed", "working", "waiting_human"].includes(task.status));
+  const live = Object.values(ctx.state.tasks).filter(
+    (task) =>
+      ["claimed", "working", "waiting_human", "delivered"].includes(task.status) ||
+      (task.status === "queued" && Boolean(task.claimId))
+  );
   for (const task of live) {
     if (!task.agentName || !task.id) continue;
     const last = task.lastHeartbeatAt ? new Date(task.lastHeartbeatAt).getTime() : 0;
@@ -862,8 +1137,8 @@ async function heartbeatPass(ctx: Context): Promise<void> {
     } catch (error) {
       ctx.logger.warn(`Heartbeat failed for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
       if ([409, 410].includes((error as { status?: number }).status ?? 0) && task.status !== "waiting_human") {
-        task.status = "queued";
         task.claimId = undefined;
+        if (task.status !== "delivered") task.status = "queued";
         task.lastError = "claim lost";
       }
     }
@@ -937,6 +1212,22 @@ async function writeOwnerResult(ctx: Context, requestId: string, request: string
 }
 
 async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?: AgentClient): Promise<void> {
+  if (item.kind === "review_offer") {
+    await processReviewOffer(ctx, item, preferredWorker);
+    return;
+  }
+  if (item.kind === "job_review_offer") {
+    await processJobReviewOffer(ctx, item, preferredWorker);
+    return;
+  }
+  if (item.kind === "open_issue") {
+    await processOpenIssue(ctx, item, preferredWorker);
+    return;
+  }
+  if (item.kind === "reclaim_issue") {
+    await processReclaim(ctx, item, preferredWorker);
+    return;
+  }
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue) return;
@@ -1047,6 +1338,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
       base: ctx.profile.repo.base,
       previousError: ctx.state.tasks[taskKey(issue)]?.lastError ?? "",
       issueContext,
+      loopContext: await loopContextFor(ctx, { issue, worktree: dir }),
       attempt: ctx.state.tasks[taskKey(issue)]?.attempts ?? 1,
       logger: ctx.logger,
       ...agentHooks(ctx)
@@ -1058,7 +1350,16 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   taskUsage(ctx, issue, result.tokens);
   if (await handleProviderLimit(ctx, result)) {
     await cleanupWorktree(ctx.github, dir);
-    setTask(ctx.state, issue, { status: "queued", lastError: result.error ?? "provider limit", worktree: undefined });
+    const task = ctx.state.tasks[taskKey(issue)] ?? null;
+    if (result.providerLimit === "quota" && task) {
+      await releaseClaim(ctx, task, worker, "provider quota exhausted; claim released");
+    }
+    setTask(ctx.state, issue, {
+      status: "queued",
+      claimId: result.providerLimit === "quota" ? undefined : task?.claimId,
+      lastError: result.error ?? `provider ${result.providerLimit ?? "limit"}`,
+      worktree: undefined
+    });
     markRecent(ctx, item.key);
     await save(ctx);
     return;
@@ -1214,7 +1515,15 @@ async function handleWorkFailure(
   ctx: Context,
   issue: Issue,
   item: QueueEntry,
-  result: { error?: string; blocked?: boolean; blocker?: string | null; summary?: string; tail?: string; providerLimit?: "quota" | "rate-limit" | "context" | null },
+  result: {
+    error?: string;
+    blocked?: boolean;
+    blocker?: string | null;
+    summary?: string;
+    tail?: string;
+    environmentHint?: string | null;
+    providerLimit?: "quota" | "rate-limit" | "context" | null;
+  },
   worker: AgentClient,
   dir: string
 ): Promise<void> {
@@ -1223,7 +1532,7 @@ async function handleWorkFailure(
   const maxAttempts = ctx.profile.limits.maxAttemptsPerTask;
   const error = result.error ?? result.blocker ?? "unknown failure";
   ctx.state.run.failures += 1;
-  const environmentHint = classifyEnvironmentFailure(`${error}\n${result.tail ?? ""}`);
+  const environmentHint = result.environmentHint ?? null;
   ctx.logger.warn(`#${issue.number} attempt ${attempts} failed: ${truncate(error, 300)}`, {
     environmentHint: environmentHint ?? undefined
   });
@@ -1250,9 +1559,21 @@ async function handleWorkFailure(
     if (escalation.ok) {
       history(ctx, { type: "escalation", issue: issue.number, detail: environmentHint ?? "blocker", data: { id: escalation.escalation?.id } });
       await notifyNeedsYou(ctx);
+      if (result.providerLimit === "context") {
+        const task = ctx.state.tasks[taskKey(issue)] ?? null;
+        if (task) await releaseClaim(ctx, task, worker, "context overflow; claim released for a human");
+        setTask(ctx.state, issue, {
+          status: "waiting_human",
+          attempts,
+          claimId: undefined,
+          lastError: error,
+          worktree: undefined
+        });
+      }
     }
     if (!escalation.ok) {
-      await worker.client.release(issue.id).catch(() => {});
+      const task = ctx.state.tasks[taskKey(issue)] ?? null;
+      if (task) await releaseClaim(ctx, task, worker, error);
       setTask(ctx.state, issue, {
         status: "queued",
         attempts,
@@ -1262,8 +1583,9 @@ async function handleWorkFailure(
       });
     }
   } else if (attempts >= maxAttempts) {
-    setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined });
-    await worker.client.release(issue.id).catch(() => {});
+    const task = ctx.state.tasks[taskKey(issue)] ?? null;
+    if (task) await releaseClaim(ctx, task, worker, error);
+    setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined, claimId: undefined });
     await recordTaskNote(worker.client, issue, "failed", error, result.tail ?? "", ctx.state, worker.name);
     await notifyProfile(
       ctx.profile,
@@ -1282,6 +1604,7 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
   if (issue.substatus === "requires_confirmation") {
     const confirmer = pickManagerOrWorker(ctx);
     if (!confirmer) return false;
+    const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
     const result = await withScratch(ctx, `confirm-${issue.number}`, (dir) =>
       runConfirm({
         profile: ctx.profile,
@@ -1289,6 +1612,7 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
         issue,
         memoryText: ctx.memoryText,
         repoDir: dir,
+        loopContext,
         logger: ctx.logger,
         ...agentHooks(ctx)
       })
@@ -1345,6 +1669,10 @@ async function ensureBidAndAward(
 ): Promise<{ agent: AgentClient; claimId: string } | null> {
   const worker = preferred ?? pickWorker(ctx);
   if (!worker) return null;
+  if (claimCapacityReached(ctx)) {
+    ctx.logger.info(`Not bidding on #${issue.number}: ${ownClaimCount(ctx)}/${zikiClaimLimit(ctx)} Ziki claims already active for this owner`);
+    return null;
+  }
   const awarder = pickManager(ctx) ?? worker;
 
   let bids: any[] = [];
@@ -1435,7 +1763,7 @@ async function ensureClaim(
   return ensureBidAndAward(ctx, issue, preferred);
 }
 
-async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
+async function processTestFix(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<void> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue?.pullRequestUrl) {
@@ -1449,7 +1777,7 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
     return;
   }
   const holder = issue.holder?.agentName ?? null;
-  const reviewer = pickWorker(ctx, [holder ?? ""]) ?? pickManager(ctx, [holder ?? ""]);
+  const reviewer = preferred ?? pickWorker(ctx, [holder ?? ""]) ?? pickManager(ctx, [holder ?? ""]);
   if (!reviewer) {
     markRecent(ctx, item.key);
     return;
@@ -1477,6 +1805,7 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
       headSha: issue.pullRequestHeadSha ?? "",
       prContext,
       issueContext,
+      loopContext: await loopContextFor(ctx, { issue, prStatus: status, includeGit: false }),
       logger: ctx.logger,
       ...agentHooks(ctx)
     });
@@ -1518,7 +1847,7 @@ async function processTestFix(ctx: Context, item: QueueEntry): Promise<void> {
   await save(ctx);
 }
 
-async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
+async function processAccept(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<void> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue) {
@@ -1526,7 +1855,7 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
     return;
   }
   const holder = issue.holder?.agentName ?? null;
-  const manager = pickManager(ctx, [holder ?? ""]);
+  const manager = managerFor(ctx, preferred, [holder ?? ""]);
   if (!manager) {
     ctx.logger.debug(`Skipping merge review for #${issue.number}: no manager/merger agent configured`);
     markRecent(ctx, item.key);
@@ -1574,7 +1903,7 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
   await save(ctx);
 }
 
-async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processAuxItem(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   if (item.item.canAct === false) {
     markRecent(ctx, item.key);
     return false;
@@ -1583,28 +1912,76 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
     let did = false;
     switch (item.kind) {
       case "report_pr_status":
-        did = await processPrReport(ctx, item);
+        did = await processPrReport(ctx, item, preferred);
         break;
       case "report_deployment":
-        did = await processDeploymentReport(ctx, item);
+        did = await processDeploymentReport(ctx, item, preferred);
         break;
       case "review_bid":
-        did = await processBidVote(ctx, item);
+        did = await processBidVote(ctx, item, preferred);
         break;
       case "award_bid":
-        did = await processAward(ctx, item);
+        did = await processAward(ctx, item, preferred);
         break;
       case "review_comment":
-        did = await processCommentUpvote(ctx, item);
+        did = await processCommentUpvote(ctx, item, preferred);
         break;
       case "categorize":
-        did = await processCategorize(ctx, item);
+        did = await processCategorize(ctx, item, preferred);
         break;
       case "idea":
-        did = await processIdeaVerdict(ctx, item);
+        did = await processIdeaVerdict(ctx, item, preferred);
         break;
       case "confirm_issue":
-        did = await processConfirm(ctx, item);
+        did = await processConfirm(ctx, item, preferred);
+        break;
+      case "open_issue":
+        did = await processOpenIssue(ctx, item, preferred);
+        break;
+      case "refresh_stake":
+        did = await processRefreshStake(ctx, item, preferred);
+        break;
+      case "reclaim_issue":
+        did = await processReclaim(ctx, item, preferred);
+        break;
+      case "await_release":
+        did = await processAwaitRelease(ctx, item, preferred);
+        break;
+      case "repair_pull_request":
+        did = await processRepairPullRequest(ctx, item, preferred);
+        break;
+      case "convert_idea":
+        did = await processConvertIdea(ctx, item, preferred);
+        break;
+      case "reject_idea":
+        did = await processRejectIdea(ctx, item, preferred);
+        break;
+      case "estimate_reward":
+        did = await processEstimate(ctx, item, preferred);
+        break;
+      case "investigate_issue":
+        did = await processInvestigate(ctx, item, preferred);
+        break;
+      case "vote_importance":
+        did = await processImportance(ctx, item, preferred);
+        break;
+      case "vote_stake":
+        did = await processStakeVote(ctx, item, preferred);
+        break;
+      case "sense_check":
+        did = await processSenseCheck(ctx, item, preferred);
+        break;
+      case "close_issue":
+        did = await processClose(ctx, item, preferred);
+        break;
+      case "research_job":
+        did = await processResearchJob(ctx, item, preferred);
+        break;
+      case "review_offer":
+        did = await processReviewOffer(ctx, item, preferred);
+        break;
+      case "job_review_offer":
+        did = await processJobReviewOffer(ctx, item, preferred);
         break;
       default:
         ctx.logger.warn(`Unhandled Ziki work kind "${item.kind}" for #${item.issueNumber ?? item.ideaNumber ?? "?"}; skipping`);
@@ -1628,7 +2005,7 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
   }
 }
 
-async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processPrReport(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue?.pullRequestUrl) {
@@ -1636,7 +2013,7 @@ async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean>
     return false;
   }
   const holder = issue.holder?.agentName ?? null;
-  const reporter = pickManager(ctx, [holder ?? ""]) ?? pickWorker(ctx, [holder ?? ""]);
+  const reporter = managerFor(ctx, preferred, [holder ?? ""]) ?? pickWorker(ctx, [holder ?? ""]);
   if (!reporter) {
     markRecent(ctx, item.key);
     return false;
@@ -1654,26 +2031,20 @@ async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean>
   return true;
 }
 
-async function processDeploymentReport(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processDeploymentReport(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const text = `${item.title ?? ""}\n${item.detail ?? ""}`;
-  const match = text.match(/\b(dev|development|staging|stage|prod|production)\b/i);
-  const environment = match
-    ? ({ dev: "dev", development: "dev", staging: "staging", stage: "staging", prod: "prod", production: "prod" } as const)[
-        match[1]!.toLowerCase() as "dev" | "development" | "staging" | "stage" | "prod" | "production"
-      ]
-    : null;
+  const environment = deploymentEnvironment(item.key);
   if (!environment) {
-    ctx.logger.warn(`Deployment report for #${issue.number} has no environment; skipping`);
+    ctx.logger.warn(`Deployment report for #${issue.number} has no on_dev/on_staging/on_prod key suffix; skipping`);
     markRecent(ctx, item.key);
     return false;
   }
-  const reporter = pickManager(ctx) ?? pickWorker(ctx);
+  const reporter = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!reporter) {
     markRecent(ctx, item.key);
     return false;
@@ -1720,24 +2091,76 @@ async function isInDefaultBranch(ctx: Context, sha: string | null): Promise<bool
   }
 }
 
-async function processBidVote(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processBidVote(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const bidId = (item.actions.find((action) => action.name === "vote_bid")?.path ?? "").match(/bids\/([^/]+)\/votes/)?.[1];
   if (!bidId) {
     markRecent(ctx, item.key);
     return false;
   }
-  if (item.detail.length < 40 || !/fix|implement|add|update|test|change/i.test(item.detail)) {
+  const policy = resolveVotePolicy(ctx.profile.workflow.autoVoteBids);
+  if (policy === "off") {
+    history(ctx, { type: "aux", issue: item.issueNumber, detail: "bid vote skipped: autoVoteBids is off" });
     markRecent(ctx, item.key);
     return false;
   }
-  const voter = pickManager(ctx) ?? pickWorker(ctx);
+  const voter = preferred ?? managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!voter) return false;
-  await voter.client.voteBid(bidId);
+  if (policy === "heuristic") {
+    if (!heuristicBidVote(item.detail)) {
+      markRecent(ctx, item.key);
+      return false;
+    }
+    await voter.client.voteBid(bidId);
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
+  let bid: Record<string, unknown> = { id: bidId, title: item.title, detail: item.detail, key: item.key };
+  if (issue) {
+    try {
+      const data = await ctx.primary.client.listBids(issue.id);
+      const found = (data.bids ?? data.items ?? []).find((entry: { id?: string }) => entry?.id === bidId);
+      if (found) bid = found as Record<string, unknown>;
+    } catch {
+      // keep the work-feed copy
+    }
+  }
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `bid-vote-${bidId}`, (dir) =>
+    runBidVote({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      bid,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const vote = result.vote === true;
+  if (vote) await voter.client.voteBid(bidId);
+  history(ctx, {
+    type: "decision",
+    issue: issue?.number ?? item.issueNumber,
+    detail: `${vote ? "voted for" : "declined"} bid ${bidId}: ${truncate(result.summary ?? "", 120)}`
+  });
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processAward(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processAward(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const bidId = (item.actions.find((action) => action.name === "award_bid")?.path ?? "").match(/bids\/([^/]+)\/award/)?.[1];
   if (!bidId) {
     markRecent(ctx, item.key);
@@ -1748,7 +2171,7 @@ async function processAward(ctx: Context, item: QueueEntry): Promise<boolean> {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx) ?? pickWorker(ctx);
+  const manager = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!manager) return false;
   try {
     await manager.client.awardBid(bidId);
@@ -1761,25 +2184,72 @@ async function processAward(ctx: Context, item: QueueEntry): Promise<boolean> {
   return true;
 }
 
-async function processCommentUpvote(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processCommentUpvote(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const commentId = (item.actions.find((action) => action.name === "upvote_comment")?.path ?? "").match(/comments\/([^/]+)\/votes/)?.[1];
   if (!commentId) {
     markRecent(ctx, item.key);
     return false;
   }
-  if (!/root cause|\b[\w./-]+\.(dart|ts|tsx|js|jsx|py|go|rs):\d+/.test(item.detail)) {
+  const policy = resolveVotePolicy(ctx.profile.workflow.autoUpvoteComments);
+  if (policy === "off") {
+    history(ctx, { type: "aux", issue: item.issueNumber, detail: "comment vote skipped: autoUpvoteComments is off" });
     markRecent(ctx, item.key);
     return false;
   }
-  const voter = pickWorker(ctx) ?? pickManager(ctx);
+  const voter = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
   if (!voter) return false;
-  await voter.client.upvoteComment(commentId);
+  if (policy === "heuristic") {
+    if (!heuristicCommentVote(item.detail)) {
+      markRecent(ctx, item.key);
+      return false;
+    }
+    await voter.client.upvoteComment(commentId);
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
+  const comment = issue?.comments?.find((entry) => entry.id === commentId) ?? {
+    id: commentId,
+    body: item.detail,
+    summary: item.title
+  };
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `comment-vote-${commentId}`, (dir) =>
+    runCommentVote({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      comment,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const vote = result.vote === true;
+  if (vote) await voter.client.upvoteComment(commentId);
+  history(ctx, {
+    type: "decision",
+    issue: issue?.number ?? item.issueNumber,
+    detail: `${vote ? "upvoted" : "declined"} comment ${commentId}: ${truncate(result.summary ?? "", 120)}`
+  });
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolean> {
-  const actor = pickWorker(ctx) ?? pickManager(ctx);
+async function processCategorize(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const actor = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
   if (!actor) return false;
   let did = 0;
   try {
@@ -1811,15 +2281,15 @@ async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolea
   return did > 0;
 }
 
-async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processIdeaVerdict(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
   const idea = normalizeIdea(data);
   if (!idea) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx);
-  const voter = manager ?? pickWorker(ctx);
+  const manager = managerFor(ctx, preferred);
+  const voter = manager ?? preferred ?? pickWorker(ctx);
   if (!voter) {
     markRecent(ctx, item.key);
     return false;
@@ -1877,15 +2347,16 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boole
   return true;
 }
 
-async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processConfirm(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue || issue.substatus !== "requires_confirmation") {
     markRecent(ctx, item.key);
     return false;
   }
-  const confirmer = pickManagerOrWorker(ctx);
+  const confirmer = preferred ?? pickManagerOrWorker(ctx);
   if (!confirmer) return false;
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
   const result = await withScratch(ctx, `confirm-aux-${issue.number}`, (dir) =>
     runConfirm({
       profile: ctx.profile,
@@ -1893,6 +2364,7 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
       issue,
       memoryText: ctx.memoryText,
       repoDir: dir,
+      loopContext,
       logger: ctx.logger,
       ...agentHooks(ctx)
     })
@@ -1920,21 +2392,749 @@ async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> 
   return true;
 }
 
+function issueIdFromActions(item: QueueEntry): string | null {
+  for (const action of item.actions) {
+    const match = action.path.match(/\/issues\/([^/]+)\//);
+    if (match?.[1]) return match[1]!;
+  }
+  return null;
+}
+
+async function loadIssueForItem(ctx: Context, item: QueueEntry): Promise<Issue | null> {
+  const id = item.issueId ?? item.issueNumber ?? issueIdFromActions(item) ?? "";
+  if (!id) return null;
+  const data = await ctx.primary.client.getIssue(id);
+  return normalizeIssue(data);
+}
+
+function actionId(item: QueueEntry, names: string[], pattern: RegExp): string | null {
+  for (const action of item.actions) {
+    if (names.length && !names.includes(action.name)) continue;
+    const match = action.path.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
+function pullRequestUrlFrom(item: QueueEntry): string | null {
+  const text = `${item.title ?? ""}\n${item.detail ?? ""}`;
+  return text.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/)?.[0] ?? null;
+}
+
+async function processOpenIssue(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
+  history(ctx, { type: "aux", issue: issue.number, detail: "opened issue" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processRefreshStake(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  let stakeId = actionId(item, ["refresh_stake"], /stakes\/([^/]+)\/refresh/);
+  if (!stakeId && item.issueId) {
+    const stakes = await ctx.primary.client.listStakes(item.issueId).catch(() => null);
+    stakeId = (stakes?.stakes ?? [])[0]?.id ?? null;
+  }
+  if (!stakeId) {
+    ctx.logger.warn(`refresh_stake item ${item.key} has no stake id; skipping`);
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await (preferred ?? agentForItem(ctx, item)).client.refreshStake(stakeId);
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processReclaim(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
+  history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed stale work" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processReconcileMerged(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue?.pullRequestUrl) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
+  if (!manager) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  if (!status) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await reportPrStatusWith(ctx, manager, issue, status).catch(() => {});
+  const inDefault = status.merged ? await isInDefaultBranch(ctx, status.mergeCommitSha) : false;
+  if (!status.merged || !inDefault) {
+    ctx.logger.info(`#${issue.number} is not merged into the default branch yet; reported instead`);
+    markRecent(ctx, item.key);
+    return true;
+  }
+  await manager.client.resolveIssue(issue.id, issue.pullRequestUrl);
+  history(ctx, { type: "aux", issue: issue.number, detail: "resolved merged work", data: { pr: issue.pullRequestUrl } });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processAwaitRelease(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue?.pullRequestUrl) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const reporter = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
+  if (!reporter) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  if (!status) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await reportPrStatusWith(ctx, reporter, issue, status);
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processRepairPullRequest(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
+  if (!manager) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await manager.client.repairPullRequest(issue.id, pullRequestUrlFrom(item) ?? undefined);
+  history(ctx, { type: "aux", issue: issue.number, detail: "repaired pull request link" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processConvertIdea(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
+  const idea = normalizeIdea(data);
+  if (!idea) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const convertAction = item.actions.find((action) => action.name === "convert_idea" || /\/convert\b/.test(action.path));
+  if (!convertAction) {
+    ctx.logger.info(`convert_idea item #${idea.number} has no convert action (threshold-only project); leaving the verdict vote to its own item`);
+    markRecent(ctx, item.key);
+    return false;
+  }
+  try {
+    await (preferred ?? agentForItem(ctx, item)).client.convertIdea(idea.id);
+    history(ctx, { type: "aux", idea: idea.number, detail: "converted idea" });
+    markRecent(ctx, item.key);
+    return true;
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    ctx.logger.info(`Idea #${idea.number} not converted: ${error instanceof Error ? error.message : String(error)}`, { status });
+    markRecent(ctx, item.key);
+    return false;
+  }
+}
+
+async function processRejectIdea(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
+  const idea = normalizeIdea(data);
+  if (!idea) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const manager = managerFor(ctx, preferred);
+  if (!manager) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const verdicts = await manager.client.ideaVerdicts(idea.id).catch(() => null);
+  if (verdicts && verdicts.rejectable === false) {
+    ctx.logger.info(`Idea #${idea.number} is not rejectable; leaving it`);
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await manager.client.rejectIdea(idea.id, {});
+  history(ctx, { type: "aux", idea: idea.number, detail: "rejected idea" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processEstimate(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `estimate-${issue.number}`, (dir) =>
+    runEstimate({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const value = Math.round(Number(result.value));
+  if (!result.ok || !Number.isFinite(value) || value < 1 || value > 10) {
+    ctx.logger.warn(`Estimate for #${issue.number} was not a whole 1-10 value; skipping`);
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await agent.client.estimateReward(issue.id, {
+    value,
+    reason: result.reason ?? result.summary ?? "Estimated from the issue scope."
+  });
+  history(ctx, { type: "aux", issue: issue.number, detail: `estimated $${value}` });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processInvestigate(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
+  const loopContext = await loopContextFor(ctx, { issue });
+  const result = await withScratch(ctx, `investigate-${issue.number}`, (dir) =>
+    runInvestigate({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const body = result.comment ?? result.description;
+  if (!result.ok || !body) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await agent.client.comment(issue.id, {
+    summary: result.summary ?? `Investigation for #${issue.number}`,
+    body,
+    projectId: ctx.profile.ziki.projectId
+  });
+  history(ctx, { type: "aux", issue: issue.number, detail: "investigation comment" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processImportance(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const agent = managerFor(ctx, preferred) ?? pickWorker(ctx);
+  if (!agent) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `importance-${issue.number}`, (dir) =>
+    runImportance({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok || result.important !== true) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await agent.client.markImportant(issue.id);
+  history(ctx, { type: "aux", issue: issue.number, detail: "marked important" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processStakeVote(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const stakeIds = item.actions
+    .map((action) => action.path.match(/stakes\/([^/]+)\/votes/)?.[1])
+    .filter((value): value is string => Boolean(value));
+  if (stakeIds.length < 2) {
+    const fallback = actionId(item, ["vote_stake"], /stakes\/([^/]+)\/votes/);
+    if (fallback) stakeIds.push(fallback);
+  }
+  if (!stakeIds.length) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
+  const stakes = issue ? await ctx.primary.client.listStakes(issue.id).catch(() => null) : null;
+  const voter = managerFor(ctx, preferred) ?? pickWorker(ctx);
+  if (!voter) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `stake-${item.key.replace(/[^a-z0-9-]/gi, "-").slice(0, 40)}`, (dir) =>
+    runStakeVote({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      stakes: stakes?.stakes ?? [],
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const chosen =
+    result.voteForStakeId ??
+    result.stakeId ??
+    item.actions.find((action) => action.name.startsWith("vote_for_"))?.path.match(/stakes\/([^/]+)\/votes/)?.[1] ??
+    actionId(item, ["vote_stake"], /stakes\/([^/]+)\/votes/);
+  if (!result.ok || !chosen) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await voter.client.voteStake(chosen);
+  history(ctx, { type: "aux", issue: issue?.number, detail: `voted stake ${chosen}`, data: { summary: result.summary } });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processSenseCheck(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const agent = managerFor(ctx, preferred) ?? pickWorker(ctx);
+  if (!agent) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `sense-${issue.number}`, (dir) =>
+    runSenseCheck({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok || result.abandon !== true) {
+    markRecent(ctx, item.key);
+    history(ctx, { type: "decision", issue: issue.number, detail: "sense check: left the claim alone" });
+    return false;
+  }
+  await agent.client.abandonVote(issue.id, result.summary ?? "No activity and no evidence of work; voting abandoned.");
+  history(ctx, { type: "aux", issue: issue.number, detail: "voted abandoned" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+const CLOSE_REASONS = new Set([
+  "duplicate",
+  "not_reproducible",
+  "already_implemented",
+  "invalid",
+  "wont_fix",
+  "superseded",
+  "withdrawn"
+]);
+
+async function processClose(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const manager = managerFor(ctx, preferred);
+  const actingAs: "working" | "manager" = manager && item.item.minimumRole === "manager" ? "manager" : "working";
+  const agent = (actingAs === "manager" ? manager : preferred) ?? pickWorker(ctx) ?? manager;
+  if (!agent) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `close-${issue.number}`, (dir) =>
+    runClose({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      actingAs,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const reason = String(result.closeReason ?? "").trim();
+  if (!result.ok || !CLOSE_REASONS.has(reason)) {
+    ctx.logger.info(`Close decision for #${issue.number} was not usable (${reason || "no reason"}); leaving it`);
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const evidence = result.evidence ?? result.description ?? "";
+  const summary = result.summary ?? `Close #${issue.number} as ${reason}`;
+  if (actingAs === "manager" && manager) {
+    await manager.client.closeIssue(issue.id, {
+      reason,
+      evidence,
+      duplicateOf: result.duplicateOf ?? undefined
+    });
+    history(ctx, { type: "aux", issue: issue.number, detail: `closed as ${reason}` });
+  } else {
+    await agent.client.suggestClose(issue.id, {
+      reason,
+      evidence,
+      summary,
+      description: result.description,
+      duplicateOf: result.duplicateOf ?? undefined
+    });
+    history(ctx, { type: "aux", issue: issue.number, detail: `suggested close as ${reason}` });
+  }
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processResearchJob(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const jobId =
+    actionId(item, [], /\/jobs\/([^/]+)\/submissions/) ??
+    item.actions.map((action) => action.path.match(/\/jobs\/([^/]+)/)?.[1]).find(Boolean) ??
+    item.key.split(":").pop() ??
+    null;
+  if (!jobId) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
+  const job = await agent.client.getJob(jobId);
+  const loopContext = await loopContextFor(ctx, { includeGit: false });
+  const result = await withScratch(ctx, `research-${jobId}`, (dir) =>
+    runResearch({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      job,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, null, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok || result.jobData === undefined) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await agent.client.submitJob(jobId, result.jobData);
+  history(ctx, { type: "aux", detail: `submitted research row for job ${jobId}` });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processReviewOffer(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const offerId = actionId(item, [], /\/reviews\/([^/]+)\/accept/);
+  if (!offerId) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const reviewer = preferred ?? agentForItem(ctx, item);
+  await reviewer.client.acceptReviewOffer(offerId);
+  history(ctx, { type: "accept", issue: item.issueNumber, detail: "accepted review offer" });
+  await processTestFix(ctx, item, reviewer);
+  return true;
+}
+
+async function processJobReviewOffer(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const offerId = actionId(item, [], /\/jobs\/reviews\/([^/]+)\/accept/);
+  if (!offerId) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const agent = preferred ?? agentForItem(ctx, item);
+  await agent.client.acceptJobReview(offerId);
+  const jobId =
+    item.actions.map((action) => action.path.match(/\/jobs\/(?!reviews\/)([^/]+)/)?.[1]).find(Boolean) ??
+    `${item.detail ?? ""}`.match(/\bjob[ _-]?([A-Za-z0-9_-]+)/i)?.[1] ??
+    null;
+  if (!jobId) {
+    ctx.logger.warn(`Accepted job review ${offerId} but could not find its job id; skipping the review`);
+    markRecent(ctx, item.key);
+    return true;
+  }
+  const job = await agent.client.getJob(jobId);
+  const submission = (job.submissions ?? []).find((entry) => entry.status !== "accepted" && entry.status !== "rejected") ?? (job.submissions ?? [])[0];
+  if (!submission?.id) {
+    markRecent(ctx, item.key);
+    return true;
+  }
+  const loopContext = await loopContextFor(ctx, { includeGit: false });
+  const result = await withScratch(ctx, `job-review-${submission.id}`, (dir) =>
+    runJobReview({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      job,
+      submission,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, null, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const jobVerdict = result.verdict as string | undefined;
+  if (!result.ok || (jobVerdict !== "accept" && jobVerdict !== "reject")) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await agent.client.reviewJobSubmission(submission.id, {
+    verdict: jobVerdict,
+    notes: result.description ?? result.summary
+  });
+  history(ctx, { type: "aux", detail: `reviewed job submission ${submission.id}: ${result.verdict}` });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processReviewIdle(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const manager = managerFor(ctx, preferred);
+  if (!manager) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await manager.client.reclaim(issue.id);
+  history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed idle work" });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processDeliverStranded(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue?.pullRequestUrl) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
+  if (!manager) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  let verdicts = 0;
+  try {
+    const tests = await manager.client.listTestResults(issue.id);
+    verdicts = (tests.verdicts ?? []).filter((verdict) => verdict.goodToMerge && verdict.current !== false).length;
+  } catch {
+    verdicts = 0;
+  }
+  if (!status || status.merged || status.state === "CLOSED") {
+    if (status) await reportPrStatusWith(ctx, manager, issue, status).catch(() => {});
+    markRecent(ctx, item.key);
+    return false;
+  }
+  await manager.client.deliver(issue.id, {
+    pullRequestUrl: issue.pullRequestUrl,
+    summary: `Delivering #${issue.number} on the holder's behalf: the pull request already has ${verdicts} good-to-merge verdict(s).`,
+    description: [
+      `The linked pull request is ${issue.pullRequestUrl}.`,
+      `Latest report: state=${status.state}, checks=${status.checks}, mergeable=${String(status.mergeable)}.`,
+      `Good-to-merge verdicts: ${verdicts}.`,
+      item.detail ? `Ziki item: ${item.detail}` : ""
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    testResults: `Ziki good-to-merge verdicts on this pull request: ${verdicts}`,
+    headSha: status.headSha ?? issue.pullRequestHeadSha ?? undefined
+  });
+  history(ctx, { type: "delivery", issue: issue.number, detail: "delivered stranded work", data: { pr: issue.pullRequestUrl } });
+  markRecent(ctx, item.key);
+  return true;
+}
+
+async function processMergeFix(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const issue = await loadIssueForItem(ctx, item);
+  if (!issue?.pullRequestUrl) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const mode = resolveMergeMode(ctx.profile);
+  const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  if (!status) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const reporter = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
+
+  if (mode === "never") {
+    ctx.logger.info(`merge_fix for #${issue.number} skipped: mergeMode is "never"`);
+    history(ctx, { type: "decision", issue: issue.number, detail: "merge skipped (mergeMode never)" });
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  if (mode === "handoff") {
+    if (reporter) await reportPrStatusWith(ctx, reporter, issue, status);
+    history(ctx, {
+      type: "decision",
+      issue: issue.number,
+      detail: "merge handed off: reported PR status without merging (mergeMode handoff)"
+    });
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  const zikiReady = issue.status === "merge" || issue.status === "accepted" || issue.substatus === "ready_to_merge" || issue.substatus === "accepted";
+  const gate = mergeGateReason({
+    zikiReady,
+    checks: status.checks,
+    mergeable: status.mergeable,
+    merged: status.merged,
+    state: status.state,
+    reviewDecision: status.reviewDecision,
+    approvedReviews: status.reviews.filter((review) => review.state === "APPROVED").length,
+    requiredReviewers: ctx.profile.repo.requiredReviewers?.length ?? 0
+  });
+  if (gate) {
+    ctx.logger.info(
+      `merge_fix for #${issue.number} held: ${gate} (checks=${status.checks}, mergeable=${String(status.mergeable)}, review=${String(status.reviewDecision)})`
+    );
+    if (reporter) await reportPrStatusWith(ctx, reporter, issue, status).catch(() => {});
+    history(ctx, { type: "decision", issue: issue.number, detail: "merge held by a gate" });
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  await ctx.github.mergePr(issue.pullRequestUrl, resolveMergeMethod(ctx.profile));
+  const merged = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
+  if (merged && manager) {
+    await reportPrStatusWith(ctx, manager, issue, merged).catch(() => {});
+    const inDefault = await isInDefaultBranch(ctx, merged.mergeCommitSha);
+    if (inDefault) {
+      await manager.client.resolveIssue(issue.id, issue.pullRequestUrl).catch(() => {});
+    }
+  }
+  history(ctx, { type: "delivery", issue: issue.number, detail: "merged and reported", data: { pr: issue.pullRequestUrl } });
+  markRecent(ctx, item.key);
+  return true;
+}
+
 async function discoveryPass(ctx: Context): Promise<void> {
   if (!ctx.profile.discovery.enabled) return;
-  if (counter(ctx).discoveries >= ctx.profile.limits.maxDiscoveriesPerDay) return;
+  if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay)) return;
   const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
   if (ctx.state.cycles % every !== 0) return;
 
   const existing = (ctx.platform.issues ?? [])
-    .filter((issue) => ["open", "in_progress", "done", "merge"].includes(issue.status))
-    .slice(0, 100)
+    .filter((issue) => ["open", "in_progress", "done", "merge", "resolved", "closed"].includes(issue.status))
+    .slice(0, 300)
     .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
     .join("\n");
   const existingIdeas = (ctx.platform.ideas ?? [])
-    .slice(0, 100)
+    .slice(0, 300)
     .map((idea) => `#${idea.number} ${idea.title} [${idea.status}]`)
     .join("\n");
+  const recentMerged = (ctx.platform.issues ?? [])
+    .filter((issue) => ["resolved", "closed"].includes(issue.status) || ["on_dev", "on_staging", "on_prod"].includes(issue.substatus))
+    .slice(0, 60)
+    .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
+    .join("\n");
+  const inFlight = [
+    ...Object.values(ctx.state.tasks)
+      .filter((task) => ["claimed", "working", "delivered"].includes(task.status))
+      .slice(0, 40)
+      .map((task) => `#${task.number} ${task.title ?? ""} [${task.status}]`),
+    ...Object.values(ctx.state.tasks)
+      .filter((task) => task.claimId && ["claimed", "working"].includes(task.status))
+      .slice(0, 40)
+      .map((task) => `claim #${task.number} ${task.claimId}`)
+  ].join("\n");
+  const platformPolicy = [
+    `platform: ${ctx.profile.ziki.platform}`,
+    `project: ${ctx.profile.ziki.projectName ?? ctx.profile.ziki.projectSlug}`,
+    `keywords: ${(ctx.profile.platformMatch.keywords ?? []).join(", ") || "(none)"}`,
+    `regex: ${ctx.profile.platformMatch.regex ?? "(none)"}`,
+    `max ideas per run: ${ctx.profile.discovery.maxIdeasPerRun ?? 3}`
+  ].join("\n");
 
   const parityFile = resolveParityFile(ctx.profile);
   const parity = parityFile && existsSync(parityFile) ? await readFile(parityFile, "utf8") : "(no parity map yet)";
@@ -1946,7 +3146,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
       memoryText: ctx.memoryText,
       repoDir: dir,
       parity,
-      existingIssues: existing,
+      existingIssues: [existing, recentMerged ? `\n## Recently merged or delivered\n${recentMerged}` : "", inFlight ? `\n## In flight\n${inFlight}` : "", `\n## Platform policy\n${platformPolicy}`].filter(Boolean).join("\n"),
       existingIdeas,
       maxIdeas: ctx.profile.discovery.maxIdeasPerRun ?? 3,
       logger: ctx.logger,
@@ -1964,25 +3164,48 @@ async function discoveryPass(ctx: Context): Promise<void> {
   const ideas = (result.ideas ?? []).slice(0, ctx.profile.discovery.maxIdeasPerRun ?? 3);
   for (const idea of ideas) {
     if (!idea?.title || !idea?.description) continue;
+    let summary = idea.summary || idea.title;
+    if (summary.length < 20) summary = `${summary} — platform parity gap.`;
+    const baseInput = {
+      title: idea.title.slice(0, 200),
+      summary: summary.slice(0, 300),
+      description: idea.description.slice(0, 5000),
+      platform: ctx.profile.ziki.platform,
+      idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
+      acknowledgeSimilar: false
+    };
+    const vetted = ctx.profile.discovery.alreadyVetted === true && Boolean(ctx.profile.discovery.vettedNote);
     try {
-      let summary = idea.summary || idea.title;
-      if (summary.length < 20) summary = `${summary} — platform parity gap.`;
-      const created = await ctx.primary.client.createIdea({
-        title: idea.title.slice(0, 200),
-        summary: summary.slice(0, 300),
-        description: idea.description.slice(0, 5000),
-        platform: ctx.profile.ziki.platform,
-        idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
-        acknowledgeSimilar: false
-      });
+      const created = await ctx.primary.client.createIdea(
+        vetted ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote } : baseInput
+      );
       const createdIdea = normalizeIdea(created);
       counter(ctx).discoveries += 1;
       ctx.state.run.discoveries += 1;
-      ctx.logger.info(`Filed idea #${createdIdea?.number ?? "?"}: ${idea.title}`);
+      const converted = created?.converted;
+      ctx.logger.info(
+        converted?.issueNumber
+          ? `Filed and converted idea to issue #${converted.issueNumber}: ${idea.title}`
+          : `Filed idea #${createdIdea?.number ?? "?"}: ${idea.title}`
+      );
     } catch (error) {
       const status = (error as { status?: number }).status;
+      const code = String((error as { body?: { error?: string } }).body?.error ?? "");
       if (status === 409) {
         ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
+      } else if (vetted && (status === 429 || code === "vetted_limit" || status === 400 || code === "invalid_request")) {
+        ctx.logger.warn(`Vetted idea refused (${code || status}); filing it normally: ${idea.title}`);
+        try {
+          const retried = await ctx.primary.client.createIdea(baseInput);
+          const createdIdea = normalizeIdea(retried);
+          counter(ctx).discoveries += 1;
+          ctx.state.run.discoveries += 1;
+          ctx.logger.info(`Filed idea #${createdIdea?.number ?? "?"}: ${idea.title}`);
+        } catch (retryError) {
+          const retryStatus = (retryError as { status?: number }).status;
+          if (retryStatus === 409) ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
+          else ctx.logger.warn(`Could not file idea "${idea.title}": ${retryError instanceof Error ? retryError.message : String(retryError)}`);
+        }
       } else {
         ctx.logger.warn(`Could not file idea "${idea.title}": ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -2004,6 +3227,155 @@ async function cleanupOldWorktrees(ctx: Context): Promise<void> {
     await cleanupWorktree(ctx.github, task.worktree);
     task.worktree = undefined;
     ctx.logger.info(`Cleaned worktree for #${task.number}`);
+  }
+}
+
+async function ownerDecisionPass(ctx: Context): Promise<void> {
+  const candidates = (ctx.platform.issues ?? []).filter(
+    (issue) =>
+      issue.substatus === "requires_confirmation" ||
+      issue.substatus === "requires_review" ||
+      issue.status === "requires_confirmation" ||
+      ["done", "accepted", "merge"].includes(issue.status)
+  );
+  for (const candidate of candidates.slice(0, 25)) {
+    if (ctx.pool.total() >= ctx.capacity.agentCeiling) return;
+    const data = await ctx.primary.client.getIssue(candidate.id).catch(() => null);
+    const issue = normalizeIssue(data);
+    if (!issue) continue;
+    const decisions = parseOwnerDecisions(issue.comments);
+    if (!decisions.length) continue;
+    const stateKey = (decision: OwnerDecision): string => `decision:${issue.id}:${decision.kind}:${decision.answer}:${decision.text.slice(0, 80)}`;
+    const confirm = latestDecision(decisions, "confirm");
+    const merge = latestDecision(decisions, "merge");
+
+    if (confirm && (issue.substatus === "requires_confirmation" || issue.status === "requires_confirmation")) {
+      const key = stateKey(confirm);
+      if (ctx.state.recentFeedKeys[key]) continue;
+      const confirmer = pickManagerOrWorker(ctx);
+      if (!confirmer) continue;
+      try {
+        if (!confirm.answer) {
+          await confirmer.client.confirmIssue(issue.id, {
+            verdict: "reject",
+            summary: `Owner decision: do not confirm #${issue.number}.`,
+            description: confirm.text
+          });
+          history(ctx, { type: "decision", issue: issue.number, detail: "owner said no: rejected confirmation" });
+        } else {
+          const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+          const result = await withScratch(ctx, `decision-confirm-${issue.number}`, (dir) =>
+            runConfirm({
+              profile: ctx.profile,
+              profilePaths: ctx.profilePaths,
+              issue,
+              memoryText: ctx.memoryText,
+              repoDir: dir,
+              loopContext,
+              logger: ctx.logger,
+              ...agentHooks(ctx)
+            })
+          );
+          taskUsage(ctx, issue, result.tokens);
+          if (await handleProviderLimit(ctx, result)) return;
+          if (!result.ok) {
+            ctx.logger.warn(`Owner said confirm #${issue.number}, but the confirmation agent failed: ${result.error ?? result.blocker ?? "unknown"}`);
+            continue;
+          }
+          const response = await confirmer.client.confirmIssue(issue.id, {
+            verdict: "confirm",
+            summary: result.summary ?? `Owner decision: confirm #${issue.number}.`,
+            description: [confirm.text, result.description ?? ""].filter(Boolean).join("\n\n"),
+            files: fileEvidence(result.files),
+            duplicateOfId: result.duplicateOfId ?? undefined
+          });
+          if (response?.confirmed) await confirmer.client.openIssue(issue.id).catch(() => {});
+          history(ctx, { type: "decision", issue: issue.number, detail: "owner said yes: confirmed issue" });
+        }
+        markRecent(ctx, key);
+      } catch (error) {
+        ctx.logger.warn(`Owner confirmation decision for #${issue.number} failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (merge && (["done", "accepted", "merge"].includes(issue.status) || issue.substatus === "requires_review")) {
+      const key = stateKey(merge);
+      if (ctx.state.recentFeedKeys[key]) continue;
+      const manager = managerFor(ctx, null, [issue.holder?.agentName ?? ""]);
+      if (!manager) continue;
+      try {
+        if (!merge.answer) {
+          await manager.client.mergeReview(issue.id, {
+            verdict: "reject",
+            summary: `Owner decision: do not merge #${issue.number}.`,
+            description: merge.text
+          });
+          history(ctx, { type: "decision", issue: issue.number, detail: "owner said no: rejected merge" });
+          markRecent(ctx, key);
+          continue;
+        }
+        const mode = resolveMergeMode(ctx.profile);
+        if (mode === "never") {
+          history(ctx, { type: "decision", issue: issue.number, detail: "owner said merge, but mergeMode is never" });
+          markRecent(ctx, key);
+          continue;
+        }
+        if (mode === "handoff") {
+          if (issue.pullRequestUrl) {
+            const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+            if (status) await reportPrStatusWith(ctx, manager, issue, status);
+          }
+          history(ctx, { type: "decision", issue: issue.number, detail: "owner said merge: handed off, PR reported" });
+          markRecent(ctx, key);
+          continue;
+        }
+        const synthetic: QueueEntry = {
+          key: `decision-merge:${issue.id}`,
+          kind: "merge_fix",
+          priority: 0,
+          item: {
+            kind: "merge_fix",
+            key: `decision-merge:${issue.id}`,
+            title: `Merge #${issue.number}`,
+            detail: merge.text,
+            minimumRole: "merger",
+            canAct: true,
+            actions: []
+          },
+          issueId: issue.id,
+          issueNumber: issue.number,
+          ideaId: null,
+          ideaNumber: null,
+          title: `Merge #${issue.number}`,
+          detail: merge.text,
+          actions: [],
+          bucket: "review"
+        };
+        await processMergeFix(ctx, synthetic);
+        markRecent(ctx, key);
+      } catch (error) {
+        ctx.logger.warn(`Owner merge decision for #${issue.number} failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+}
+
+async function syncAgentProfile(ctx: Context): Promise<void> {
+  const config = ctx.profile.agentProfile;
+  if (!config) return;
+  const client = ctx.primary.client;
+  try {
+    const patch: { username?: string; tagline?: string | null; about?: string | null } = {};
+    if (config.username) patch.username = config.username;
+    if (config.tagline !== undefined) patch.tagline = config.tagline;
+    if (config.about !== undefined) patch.about = config.about;
+    if (Object.keys(patch).length) await client.updateProfile(patch);
+    if (Array.isArray(config.skills)) await client.setSkills(config.skills);
+    if (config.pictureFile && existsSync(config.pictureFile)) await client.setPicture(config.pictureFile);
+    ctx.profileSynced = true;
+    ctx.logger.info("Agent profile synced from config", { fields: Object.keys(patch) });
+  } catch (error) {
+    ctx.logger.warn(`Agent profile sync failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -2076,6 +3448,9 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
     return { ok: true, dryRun: true };
   }
 
+  setPhase(ctx, "decisions");
+  await ownerDecisionPass(ctx);
+
   setPhase(ctx, "heartbeat");
   await heartbeatPass(ctx);
   setPhase(ctx, "dispatch");
@@ -2101,13 +3476,9 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
 
 function discoveryDue(ctx: Context): boolean {
   if (!ctx.profile.discovery.enabled) return false;
-  if (counter(ctx).discoveries >= ctx.profile.limits.maxDiscoveriesPerDay) return false;
+  if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay)) return false;
   const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
   return ctx.state.cycles > 0 && ctx.state.cycles % every === 0;
-}
-
-function nextItem(ctx: Context, bucket: QueueEntry[] | undefined): QueueEntry | null {
-  return (bucket ?? []).find((entry) => !ctx.pool.has(entry.key) && entry.item.canAct !== false) ?? null;
 }
 
 async function processWorkSafe(ctx: Context, item: QueueEntry, worker?: AgentClient): Promise<void> {
@@ -2137,10 +3508,14 @@ async function processWorkSafe(ctx: Context, item: QueueEntry, worker?: AgentCli
   }
 }
 
-async function processReviewSafe(ctx: Context, item: QueueEntry): Promise<void> {
+async function processReviewSafe(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<void> {
   try {
-    if (item.kind === "test_fix") await processTestFix(ctx, item);
-    else if (item.kind === "accept_fix") await processAccept(ctx, item);
+    if (item.kind === "test_fix") await processTestFix(ctx, item, preferred);
+    else if (item.kind === "accept_fix") await processAccept(ctx, item, preferred);
+    else if (item.kind === "review_idle") await processReviewIdle(ctx, item, preferred);
+    else if (item.kind === "deliver_stranded") await processDeliverStranded(ctx, item, preferred);
+    else if (item.kind === "merge_fix") await processMergeFix(ctx, item, preferred);
+    else if (item.kind === "reconcile_merged") await processReconcileMerged(ctx, item, preferred);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const network = isTransientNetworkError(error);
@@ -2165,66 +3540,159 @@ async function processReviewSafe(ctx: Context, item: QueueEntry): Promise<void> 
   }
 }
 
+function reportUnsupported(ctx: Context): void {
+  for (const entry of ctx.queue?.other ?? []) {
+    if (ctx.unsupportedKinds.has(entry.kind)) continue;
+    ctx.unsupportedKinds.add(entry.kind);
+    ctx.logger.warn(`Unsupported Ziki work kind "${entry.kind}" (key ${entry.key}); it is visible in status but not handled`);
+    history(ctx, {
+      type: "unsupported",
+      issue: entry.issueNumber,
+      idea: entry.ideaNumber,
+      detail: `unsupported work kind: ${entry.kind}`
+    });
+  }
+}
+
 function dispatch(ctx: Context): void {
   if (ctx.providerLimit || ctx.tokenLimitReached || Date.now() < ctx.rateLimitUntil) return;
   const limits = ctx.profile.limits;
   const pool = ctx.pool;
+  const capacity = ctx.capacity;
   ctx.auxThisCycle = 0;
 
+  reportUnsupported(ctx);
+
   if (pool.canStart("owner")) {
-    const owner = nextItem(ctx, ctx.queue?.owner);
-    if (owner) pool.reserve(owner.key, "owner", () => processOwnerItem(ctx, owner));
+    const pair = nextDispatch(ctx, ctx.queue?.owner);
+    if (pair) {
+      const target = itemTargetKey(pair.item);
+      ctx.reservedAgents.add(pair.agent.name);
+      ctx.reservedTargets.add(target);
+      pool.reserve(
+        pair.item.key,
+        "owner",
+        async () => {
+          try {
+            await processOwnerItem(ctx, pair.item);
+          } finally {
+            ctx.reservedAgents.delete(pair.agent.name);
+            ctx.reservedTargets.delete(target);
+          }
+        },
+        `owner ${truncate(pair.item.title, 40)}`,
+        pair.agent.name
+      );
+    }
   }
 
   while (pool.canStart("followup")) {
-    const task = Object.values(ctx.state.tasks).find((entry) => prFollowUpDue(ctx, entry));
+    const task = Object.values(ctx.state.tasks).find((entry) => {
+      if (!prFollowUpDue(ctx, entry)) return false;
+      if (entry.agentName && ctx.reservedAgents.has(entry.agentName)) return false;
+      return !ctx.reservedTargets.has(`issue:${entry.id ?? entry.number}`);
+    });
     if (!task) break;
-    pool.reserve(prTaskKey(task), "followup", () => processPrFollowUpSafe(ctx, task));
+    const target = `issue:${task.id ?? task.number}`;
+    if (task.agentName) ctx.reservedAgents.add(task.agentName);
+    ctx.reservedTargets.add(target);
+    pool.reserve(
+      prTaskKey(task),
+      "followup",
+      async () => {
+        try {
+          await processPrFollowUpSafe(ctx, task);
+        } finally {
+          if (task.agentName) ctx.reservedAgents.delete(task.agentName);
+          ctx.reservedTargets.delete(target);
+        }
+      },
+      followUpLabel(task),
+      task.agentName
+    );
   }
 
-  const maxDeliveries = Math.max(0, Math.min(limits.maxConcurrentDeliveries ?? 2, limits.maxActiveClaims));
-  while (pool.canStart("delivery") && pool.count("delivery") < maxDeliveries) {
-    if (activeClaims(ctx).length + pool.count("delivery") >= limits.maxActiveClaims) break;
-    if (counter(ctx).deliveries >= limits.maxDeliveriesPerDay) break;
+  const maxClaims = Math.min(capacity.activeClaims, zikiClaimLimit(ctx) ?? capacity.activeClaims);
+  while (pool.canStart("delivery") && pool.count("delivery") < capacity.delivery) {
+    if (!underCap(counter(ctx).deliveries, limits.maxDeliveriesPerDay)) break;
     if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal) break;
-    const item = (ctx.queue?.work ?? []).find((entry) => {
-      if (!entry.issueId || pool.has(entry.key)) return false;
-      const task = ctx.state.tasks[entry.issueId];
-      return !task || !["waiting_human", "delivered", "done", "failed", "skipped"].includes(task.status);
-    });
-    if (!item) break;
-    const worker = pickAvailableWorker(ctx);
-    if (!worker) break;
-    ctx.reservedAgents.add(worker.name);
-    pool.reserve(item.key, "delivery", async () => {
-      try {
-        await processWorkSafe(ctx, item, worker);
-      } finally {
-        ctx.reservedAgents.delete(worker.name);
-      }
-    });
+    const atClaimCapacity = ownClaimCount(ctx) + pool.count("delivery") >= maxClaims;
+    const pair = nextDispatch(ctx, ctx.queue?.work, { forDelivery: true, skipClaimAdding: atClaimCapacity });
+    if (!pair) break;
+    const target = itemTargetKey(pair.item);
+    ctx.reservedAgents.add(pair.agent.name);
+    ctx.reservedTargets.add(target);
+    pool.reserve(
+      pair.item.key,
+      "delivery",
+      async () => {
+        try {
+          await processWorkSafe(ctx, pair.item, pair.agent);
+        } finally {
+          ctx.reservedAgents.delete(pair.agent.name);
+          ctx.reservedTargets.delete(target);
+        }
+      },
+      taskLabel(pair.item),
+      pair.agent.name
+    );
   }
 
-  while (pool.canStart("review")) {
-    if (counter(ctx).reviews >= limits.maxReviewsPerDay) break;
-    const item = nextItem(ctx, ctx.queue?.review);
-    if (!item) break;
-    pool.reserve(item.key, "review", () => processReviewSafe(ctx, item));
+  while (pool.canStart("review") && pool.count("review") < capacity.review) {
+    if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay)) break;
+    const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
+    if (!pair) break;
+    const target = itemTargetKey(pair.item);
+    ctx.reservedAgents.add(pair.agent.name);
+    ctx.reservedTargets.add(target);
+    pool.reserve(
+      pair.item.key,
+      "review",
+      async () => {
+        try {
+          await processReviewSafe(ctx, pair.item, pair.agent);
+        } finally {
+          ctx.reservedAgents.delete(pair.agent.name);
+          ctx.reservedTargets.delete(target);
+        }
+      },
+      kindLabel(pair.item, "review"),
+      pair.agent.name
+    );
   }
 
-  while (pool.canStart("aux") && ctx.auxThisCycle < limits.maxAuxPerCycle) {
-    const item = nextItem(ctx, ctx.queue?.aux);
-    if (!item) break;
+  while (pool.canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
+    const pair = nextDispatch(ctx, ctx.queue?.aux);
+    if (!pair) break;
     ctx.auxThisCycle += 1;
-    pool.reserve(item.key, "aux", async () => {
-      await processAuxItem(ctx, item);
-      await save(ctx).catch(() => {});
-    });
+    const target = itemTargetKey(pair.item);
+    ctx.reservedAgents.add(pair.agent.name);
+    ctx.reservedTargets.add(target);
+    pool.reserve(
+      pair.item.key,
+      "aux",
+      async () => {
+        try {
+          await processAuxItem(ctx, pair.item, pair.agent);
+          await save(ctx).catch(() => {});
+        } finally {
+          ctx.reservedAgents.delete(pair.agent.name);
+          ctx.reservedTargets.delete(target);
+        }
+      },
+      kindLabel(pair.item, "aux"),
+      pair.agent.name
+    );
   }
 
   if (pool.canStart("discovery") && discoveryDue(ctx) && !pool.has("discovery")) {
-    pool.reserve("discovery", "discovery", () => discoveryPass(ctx));
+    pool.reserve("discovery", "discovery", () => discoveryPass(ctx), "discovery");
   }
+}
+
+function underCap(value: number, cap: number | "auto" | null | undefined): boolean {
+  if (cap === null || cap === "auto" || cap === undefined) return true;
+  return value < Number(cap);
 }
 
 async function createContext(
@@ -2242,6 +3710,15 @@ async function createContext(
   };
   const primary = clients.workers[0] ?? clients.managers[0];
   if (!primary) throw new Error("No valid agent keys. Add them to the env file.");
+  const capacity = resolveCapacity(profile, keys);
+  let zikiWorkflow: Record<string, unknown> | null = null;
+  try {
+    const data = await primary.client.project();
+    const project = data?.project ?? data;
+    zikiWorkflow = (project?.workflow ?? null) as Record<string, unknown> | null;
+  } catch (error) {
+    logger.warn(`Could not read the Ziki project workflow: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   const github = new GitHub({ profile, profileName, reposDir: loaded.profilePaths.reposDir, logger });
   let repoReady = false;
@@ -2276,13 +3753,13 @@ async function createContext(
     platform: { issues: [], ideas: [], fetchedAt: null },
     dryRun: options.dryRun,
     pool: new TaskPool({
-      delivery: profile.limits.maxConcurrentDeliveries ?? 2,
-      followup: profile.limits.maxConcurrentFollowUps ?? 1,
-      review: profile.limits.maxConcurrentReviews ?? 1,
-      aux: profile.limits.maxConcurrentAux ?? 2,
-      discovery: profile.limits.maxConcurrentDiscovery ?? 1,
-      owner: 1,
-      agents: profile.limits.maxConcurrentAgents ?? 4
+      delivery: capacity.delivery,
+      followup: capacity.followup,
+      review: capacity.review,
+      aux: capacity.aux,
+      discovery: capacity.discovery,
+      owner: capacity.owner,
+      agents: capacity.agentCeiling
     }),
     mutex: new Mutex(),
     runLimits: options.runLimits,
@@ -2300,7 +3777,13 @@ async function createContext(
     activity: null,
     phaseStartedAt: new Date().toISOString(),
     live: null,
-    consecutiveNetworkErrors: 0
+    consecutiveNetworkErrors: 0,
+    capacity,
+    unsupportedKinds: new Set(),
+    profileSynced: false,
+    feedAgentCounts: {},
+    zikiWorkflow,
+    reservedTargets: new Set()
   };
 }
 
@@ -2477,6 +3960,7 @@ export async function runLoop(options: {
     repoReady: ctx.repoReady,
     runLimits
   });
+  await syncAgentProfile(ctx);
   await writeStatus(ctx, { running: true });
 
   let stopReason: StopReason = null;
@@ -2544,7 +4028,11 @@ export async function runLoop(options: {
         break;
       }
       if (ctx.rateLimitUntil > Date.now()) {
-        await sleep(ctx.rateLimitUntil - Date.now(), controller.signal);
+        while (ctx.rateLimitUntil > Date.now() && !controller.signal.aborted) {
+          await heartbeatPass(ctx);
+          const wait = Math.min(5 * 60_000, ctx.rateLimitUntil - Date.now());
+          await sleep(Math.max(1000, wait), controller.signal);
+        }
         continue;
       }
       const reason = limitReached(ctx);
@@ -2594,6 +4082,7 @@ export async function runLoop(options: {
       await ctx.pool.drain(5_000);
     }
     ctx.state.activePids = [];
+    await releaseUndeliveredClaims(ctx, `auto-work stopped (${stopReason ?? "stop"}); claim released`).catch(() => {});
     await save(ctx).catch(() => {});
     await writeStatus(ctx, { running: false }).catch(() => {});
     await writeRunSummary(ctx.profilePaths, finalSummary).catch(() => {});

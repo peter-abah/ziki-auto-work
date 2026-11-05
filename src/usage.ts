@@ -22,37 +22,37 @@ function numberFrom(value: unknown): number | undefined {
   return undefined;
 }
 
-function usageFromObject(value: Record<string, unknown>): TokenUsage | null {
+function usageFromObject(value: Record<string, unknown>, allowGeneric = false): TokenUsage | null {
   const input =
     numberFrom(value.input_tokens) ??
     numberFrom(value.inputTokens) ??
     numberFrom(value.prompt_tokens) ??
     numberFrom(value.promptTokens) ??
     numberFrom(value.promptTokenCount) ??
-    numberFrom(value.input);
+    (allowGeneric ? numberFrom(value.input) : undefined);
   const output =
     numberFrom(value.output_tokens) ??
     numberFrom(value.outputTokens) ??
     numberFrom(value.completion_tokens) ??
     numberFrom(value.completionTokens) ??
     numberFrom(value.candidatesTokenCount) ??
-    numberFrom(value.output);
+    (allowGeneric ? numberFrom(value.output) : undefined);
   const total =
     numberFrom(value.total_tokens) ??
     numberFrom(value.totalTokens) ??
     numberFrom(value.totalTokenCount) ??
-    numberFrom(value.total);
+    (allowGeneric ? numberFrom(value.total) : undefined);
   const cached =
     numberFrom(value.cached_input_tokens) ??
     numberFrom(value.cachedInputTokens) ??
     numberFrom(value.cache_read_input_tokens) ??
     numberFrom(value.cachedContentTokenCount) ??
-    numberFrom(value.cached);
+    (allowGeneric ? numberFrom(value.cached) : undefined);
   const cost =
     numberFrom(value.total_cost_usd) ??
     numberFrom(value.cost_usd) ??
     numberFrom(value.costUsd) ??
-    numberFrom(value.cost);
+    (allowGeneric ? numberFrom(value.cost) : undefined);
   if (input === undefined && output === undefined && total === undefined && cost === undefined) return null;
   const resolvedInput = input ?? 0;
   const resolvedOutput = output ?? 0;
@@ -66,16 +66,21 @@ function usageFromObject(value: Record<string, unknown>): TokenUsage | null {
   };
 }
 
-function findUsage(value: unknown, found: TokenUsage[]): void {
+function findUsage(value: unknown, found: TokenUsage[], parentKey = ""): void {
   if (Array.isArray(value)) {
-    for (const item of value) findUsage(item, found);
+    for (const item of value) findUsage(item, found, parentKey);
     return;
   }
   if (!value || typeof value !== "object") return;
   const record = value as Record<string, unknown>;
-  const usage = usageFromObject(record);
+  const allowGeneric =
+    parentKey === "tokens" ||
+    parentKey === "usage" ||
+    record.type === "usage" ||
+    ("tokens" in record && (record.cost !== undefined || record.costUsd !== undefined));
+  const usage = usageFromObject(record, allowGeneric);
   if (usage) found.push(usage);
-  for (const child of Object.values(record)) findUsage(child, found);
+  for (const [key, child] of Object.entries(record)) findUsage(child, found, key);
 }
 
 function fromRegex(text: string, config: ProviderUsageConfig["regex"]): TokenUsage | null {

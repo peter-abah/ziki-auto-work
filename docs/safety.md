@@ -3,6 +3,14 @@
 auto-work runs a coding agent unattended. Treat it like giving a capable
 contractor shell access to the repository.
 
+## Merge policy
+
+`merge_fix` defaults to `repo.mergeMode: "handoff"`: the loop reports the pull
+request state to Ziki and never merges. `"never"` skips merges explicitly.
+`"auto"` merges only when Ziki says the fix is accepted/ready, GitHub checks are
+green, the PR is mergeable and required approvals are present. Ziki's own
+acceptance/review gates and GitHub checks/approvals stay external.
+
 ## Full-auto flags
 
 `permissionMode: "auto"` maps to:
@@ -59,12 +67,15 @@ block waiting for approval, which is not suitable for unattended runs.
 
 ## Caps and stop switches
 
-- Daily caps for deliveries, reviews, discoveries and auxiliary work.
+- Optional daily caps for deliveries, reviews, discoveries and auxiliary work
+  (`null` by default, so there is no artificial cap).
 - Per-run limits: `--max-runtime` (default 2h), `--max-cycles`, `--until`,
   `--max-deliveries`, `--forever`. The loop finishes the current cycle, then
   stops and records the reason.
-- Concurrency caps: 2 deliveries, 1 review, 2 auxiliary tasks, 1 discovery, and
-  4 agents total (`maxConcurrent*`). `maxActiveClaims` caps deliveries per owner.
+- Adaptive concurrency: `maxConcurrent*` defaults to `"auto"` and follows the
+  configured agents; `maxConcurrentAgents` is the total ceiling. Set a number to
+  cap a kind, or `null`/`"auto"` for automatic capacity. `maxActiveClaims`
+  defaults to one per worker.
 - `auto-work pause` stops work without killing the process.
 - `auto-work stop` sends SIGTERM, aborts in-flight tasks, and kills child
   process trees. systemd units use `KillMode=control-group` and a stop timeout.

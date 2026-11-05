@@ -33,18 +33,19 @@ export function isTransientNetworkText(text) {
         return false;
     return NETWORK_PATTERNS.some((pattern) => pattern.test(text));
 }
-export function errorText(error) {
-    if (error instanceof Error)
-        return `${error.message}\n${error.stack ?? ""}`;
-    return String(error ?? "");
-}
 export function isTransientNetworkError(error) {
     const record = error;
     if (record?.status === 502 || record?.status === 503 || record?.status === 504)
         return true;
-    if (typeof record?.code === "string" && isTransientNetworkText(record.code))
+    if (record?.name === "TimeoutError")
         return true;
-    return isTransientNetworkText(errorText(error));
+    for (const value of [record?.code, record?.cause?.code]) {
+        if (typeof value === "string" && isTransientNetworkText(value))
+            return true;
+    }
+    if (record?.cause?.name === "TimeoutError")
+        return true;
+    return false;
 }
 export async function retryNetwork(operation, options = {}) {
     const attempts = Math.max(1, options.attempts ?? 3);

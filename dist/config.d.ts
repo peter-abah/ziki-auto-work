@@ -34,6 +34,8 @@ export declare function inferPushMode(forkOwner: string, upstreamOwner: string, 
 export declare function validateConfig(config: Config): ValidationResult;
 export declare function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig;
 export declare function resolveModel(profile: ProfileConfig, role: Role): string | null;
+export declare function resolveMergeMode(profile: ProfileConfig): "handoff" | "never" | "auto";
+export declare function resolveMergeMethod(profile: ProfileConfig): "merge" | "squash" | "rebase";
 export declare function resolvePromptDir(profile: ProfileConfig): string;
 export declare function resolvePrTemplate(profile: ProfileConfig): string;
 export declare function resolveParityFile(profile: ProfileConfig): string | null;

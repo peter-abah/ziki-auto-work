@@ -13,6 +13,8 @@ shows up in `auto-work doctor`.
 - A Ziki account, project, and platform slug. No local repo or fork is
   required up front; `init --discover` finds or creates them.
 - **At least one `working` agent key.** `manager`/`merger` keys are optional.
+- An agent profile is optional; `doctor` reports an empty one. Configure
+  `agentProfile` only if you want the loop to set it.
 - A coding CLI with provider auth: opencode, Claude Code, Codex, Gemini CLI, or a
   custom command.
 - The project toolchain used by checks (Flutter/Dart, Node, Go, Rust, Python, …).

@@ -18,7 +18,7 @@ export class TaskPool {
             return false;
         return this.count(kind) < (this.limits[kind] ?? 1);
     }
-    reserve(key, kind, run) {
+    reserve(key, kind, run, label, agent) {
         if (this.tasks.has(key) || !this.canStart(kind))
             return false;
         const promise = Promise.resolve()
@@ -27,7 +27,7 @@ export class TaskPool {
             .finally(() => {
             this.tasks.delete(key);
         });
-        this.tasks.set(key, { key, kind, startedAt: Date.now(), promise });
+        this.tasks.set(key, { key, kind, label, agent, startedAt: Date.now(), promise });
         return true;
     }
     list() {
@@ -35,6 +35,8 @@ export class TaskPool {
         return [...this.tasks.values()].map((task) => ({
             key: task.key,
             kind: task.kind,
+            label: task.label,
+            agent: task.agent,
             startedAt: new Date(task.startedAt).toISOString(),
             ageMs: now - task.startedAt
         }));

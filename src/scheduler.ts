@@ -13,8 +13,19 @@ export interface TaskPoolLimits {
 interface InFlight {
   key: string;
   kind: TaskKind;
+  label?: string;
+  agent?: string;
   startedAt: number;
   promise: Promise<void>;
+}
+
+export interface InFlightTask {
+  key: string;
+  kind: TaskKind;
+  label?: string;
+  agent?: string;
+  startedAt: string;
+  ageMs: number;
 }
 
 export class TaskPool {
@@ -39,7 +50,7 @@ export class TaskPool {
     return this.count(kind) < (this.limits[kind] ?? 1);
   }
 
-  reserve(key: string, kind: TaskKind, run: () => Promise<void>): boolean {
+  reserve(key: string, kind: TaskKind, run: () => Promise<void>, label?: string, agent?: string): boolean {
     if (this.tasks.has(key) || !this.canStart(kind)) return false;
     const promise = Promise.resolve()
       .then(run)
@@ -47,15 +58,17 @@ export class TaskPool {
       .finally(() => {
         this.tasks.delete(key);
       });
-    this.tasks.set(key, { key, kind, startedAt: Date.now(), promise });
+    this.tasks.set(key, { key, kind, label, agent, startedAt: Date.now(), promise });
     return true;
   }
 
-  list(): Array<{ key: string; kind: TaskKind; startedAt: string; ageMs: number }> {
+  list(): InFlightTask[] {
     const now = Date.now();
     return [...this.tasks.values()].map((task) => ({
       key: task.key,
       kind: task.kind,
+      label: task.label,
+      agent: task.agent,
       startedAt: new Date(task.startedAt).toISOString(),
       ageMs: now - task.startedAt
     }));

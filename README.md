@@ -8,6 +8,20 @@ evidence-backed ideas — continuously.
 It is provider-agnostic: use **opencode**, **Claude Code**, **Codex**, **Gemini
 CLI**, or any custom command. It runs on **Linux, macOS, and Windows**.
 
+It queues **every** latest Ziki work kind: offers, review offers, claims, ready
+and open issues, test and acceptance reviews, idle and stranded work, merges and
+reconciliations, ideas, confirmations, closes, sense checks, importance marks,
+estimates, investigations, comments, stakes, PR and deployment reports, link
+repairs, releases, research jobs, bid votes and awards, and categorization.
+Unknown kinds are surfaced in status instead of being silently dropped.
+
+Capacity is adaptive, not rigid. Concurrency defaults to `"auto"` and follows
+the agents you configured; daily and per-cycle work caps default to `null`
+(no artificial cap). Only physical/provider and safety limits remain.
+`merge_fix` defaults to handoff: the loop reports PR state and never merges
+unless the profile sets `repo.mergeMode: "auto"`. Live status uses readable
+labels such as `#2624 typing-indicator` and `PR #1019 followup`.
+
 ## Requirements
 
 - Linux, macOS, Windows, or WSL.
@@ -135,15 +149,17 @@ install globally.
    implement → agent checks → commit → push → PR → Ziki delivery.
 6. Reviews delivered PRs (test verdicts) and manager merge reviews.
 7. Does auxiliary work: PR reports, bid votes, awards, comment upvotes,
-   categorisation, idea triage, confirmations.
+   categorisation, idea triage, confirmations, estimates, investigations,
+   importance marks, closes, sense checks, stakes, PR/deployment reports and
+   link repairs.
 8. Every few cycles, compares the project against its parity map and files
    evidence-backed ideas.
 9. Writes learnings to private agent notes and, when useful, shared notes.
 
-Work runs in parallel: up to 2 deliveries, 1 review, 2 auxiliary tasks, and 1
-discovery at a time, capped at 4 agents total. Delivery concurrency is also
-capped by `maxActiveClaims` for each owner. State writes are serialized, so
-concurrent tasks do not lose updates.
+Work runs in parallel with adaptive capacity: deliveries, reviews, follow-ups
+and active claims follow the worker count; auxiliary work follows all keys; the
+agent ceiling follows the configured keys. Daily and per-cycle caps are off by
+default. State writes are serialized, so concurrent tasks do not lose updates.
 
 ## Run limits
 

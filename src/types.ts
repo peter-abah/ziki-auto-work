@@ -1,5 +1,25 @@
 export type ProviderName = string;
-export type Role = "worker" | "review" | "followup" | "triage" | "confirm" | "discovery" | "owner";
+export type Role =
+  | "worker"
+  | "review"
+  | "followup"
+  | "triage"
+  | "confirm"
+  | "discovery"
+  | "owner"
+  | "estimate"
+  | "investigate"
+  | "importance"
+  | "stakeVote"
+  | "senseCheck"
+  | "close"
+  | "research"
+  | "jobReview"
+  | "bidVote"
+  | "commentVote";
+export type CapacityLimit = number | "auto" | null;
+export type MergeMode = "handoff" | "never" | "auto";
+export type MergeMethod = "merge" | "squash" | "rebase";
 export type EscalationType =
   | "question"
   | "work_authorization"
@@ -21,6 +41,20 @@ export interface ZikiConfig {
   projectName?: string;
 }
 
+export interface AgentSkillConfig {
+  tag: string;
+  summary: string;
+  description: string;
+}
+
+export interface AgentProfileConfig {
+  username?: string;
+  tagline?: string;
+  about?: string;
+  skills?: AgentSkillConfig[];
+  pictureFile?: string;
+}
+
 export type PushMode = "personal-fork" | "team-fork" | "upstream";
 
 export interface RepoConfig {
@@ -36,6 +70,10 @@ export interface RepoConfig {
   baselineFile?: string;
   envFiles?: string[];
   requiredEnv?: string[];
+  mergeMode?: MergeMode;
+  mergeMethod?: MergeMethod;
+  requiredLabels?: string[];
+  requiredReviewers?: string[];
 }
 
 export interface WorkflowConfig {
@@ -44,6 +82,8 @@ export interface WorkflowConfig {
   branchPrefix: string;
   commitTypes: string[];
   requireTests: boolean;
+  autoVoteBids?: "off" | "agent" | "heuristic";
+  autoUpvoteComments?: "off" | "agent" | "heuristic";
 }
 
 export interface AgentsConfig {
@@ -128,14 +168,16 @@ export interface DiscoveryConfig {
   parityFile?: string;
   maxIdeasPerRun?: number;
   maxCyclesBeforeRun?: number;
+  alreadyVetted?: boolean;
+  vettedNote?: string;
 }
 
 export interface LimitsConfig {
-  maxDeliveriesPerDay: number;
-  maxReviewsPerDay: number;
-  maxDiscoveriesPerDay: number;
-  maxAuxPerCycle: number;
-  maxActiveClaims: number;
+  maxDeliveriesPerDay: CapacityLimit;
+  maxReviewsPerDay: CapacityLimit;
+  maxDiscoveriesPerDay: CapacityLimit;
+  maxAuxPerCycle: CapacityLimit;
+  maxActiveClaims: CapacityLimit;
   maxAttemptsPerTask: number;
   maxNetworkRetries: number;
   networkRetryMinutes: number;
@@ -149,12 +191,12 @@ export interface LimitsConfig {
   stopAt?: string | null;
   /** Stop after this many deliveries in the current run; null means no limit. */
   maxDeliveriesTotal?: number | null;
-  maxConcurrentDeliveries?: number;
-  maxConcurrentFollowUps?: number;
-  maxConcurrentReviews?: number;
-  maxConcurrentAux?: number;
-  maxConcurrentDiscovery?: number;
-  maxConcurrentAgents?: number;
+  maxConcurrentDeliveries?: CapacityLimit;
+  maxConcurrentFollowUps?: CapacityLimit;
+  maxConcurrentReviews?: CapacityLimit;
+  maxConcurrentAux?: CapacityLimit;
+  maxConcurrentDiscovery?: CapacityLimit;
+  maxConcurrentAgents?: CapacityLimit;
   maxTokensPerRun?: number | null;
   tokenWarnPercent?: number;
   providerRetryMinutes?: number;
@@ -247,6 +289,7 @@ export interface HitlConfig {
 
 export interface ProfileConfig {
   ziki: ZikiConfig;
+  agentProfile?: AgentProfileConfig;
   stack?: string;
   repo: RepoConfig;
   agents: AgentsConfig;
@@ -378,8 +421,18 @@ export interface WorkItem {
   idea?: IdeaRef;
   points?: number;
   dueAt?: string;
+  what?: string;
+  priority?: number;
   actions: WorkAction[];
   _feedAgent?: string;
+  [key: string]: unknown;
+}
+
+export interface WorkWaiting {
+  kind: string;
+  count: number;
+  minimumRole: string;
+  what?: string;
 }
 
 export interface WorkFeed {
@@ -390,8 +443,64 @@ export interface WorkFeed {
   ask: string[];
   inbox: { unread: number; path: string };
   counts: Record<string, number>;
-  waiting: unknown[];
+  waiting: WorkWaiting[];
   items: WorkItem[];
+}
+
+export interface AgentProfile {
+  username?: string | null;
+  tagline?: string | null;
+  about?: string | null;
+  rating?: number | null;
+  picture_url?: string | null;
+  skills?: Array<{ tag: string; slug?: string; summary: string; description: string }>;
+}
+
+export interface AgentMe {
+  id: string;
+  name: string;
+  level: string;
+  project_id?: string;
+  project_slug?: string;
+  work_url?: string | null;
+  instructions?: string | null;
+  profile?: AgentProfile | null;
+  profile_help_url?: string;
+  projects?: Array<{ id: string; slug: string; name: string }>;
+  [key: string]: unknown;
+}
+
+export interface Stake {
+  id: string;
+  issueId?: string;
+  ideaId?: string;
+  agentName?: string;
+  status: string;
+  summary?: string;
+  description?: string;
+  windowEndsAt?: string;
+  contestEndsAt?: string;
+  refreshDueAt?: string;
+  votes?: number;
+  [key: string]: unknown;
+}
+
+export interface ResearchJob {
+  id: string;
+  brief?: string;
+  pointsPerAccepted?: number;
+  maxSubmissions?: number;
+  submissionSchema?: unknown;
+  submissions?: Array<{ id: string; data?: unknown; status?: string; agentName?: string }>;
+  [key: string]: unknown;
+}
+
+export interface OwnerDecision {
+  kind: "confirm" | "merge";
+  answer: boolean;
+  text: string;
+  at?: string;
+  author?: string;
 }
 
 export interface Holder {
@@ -607,6 +716,8 @@ export interface HistoryEntry {
     | "aux"
     | "escalation"
     | "failure"
+    | "decision"
+    | "unsupported"
     | "stop";
   issue?: number | string | null;
   idea?: number | string | null;
@@ -647,8 +758,25 @@ export interface AgentResult {
   verdict?: "confirm" | "reject" | "neutral";
   goodToMerge?: boolean;
   headSha?: string;
+  environmentHint?: string | null;
+  vote?: boolean;
   duplicateOfId?: string | number | null;
   actions?: string[];
+  value?: number;
+  reason?: string;
+  important?: boolean;
+  abandon?: boolean;
+  stakeId?: string;
+  voteForStakeId?: string;
+  convert?: boolean;
+  reject?: boolean;
+  comment?: string;
+  jobId?: string;
+  submissionId?: string;
+  jobData?: unknown;
+  closeReason?: string;
+  duplicateOf?: number | string;
+  evidence?: string;
   tokens?: TokenUsage;
   providerLimit?: ProviderLimit;
 }

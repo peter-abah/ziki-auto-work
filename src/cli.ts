@@ -1105,7 +1105,7 @@ function statusLine(name: string, result: Awaited<ReturnType<typeof statusServic
   const last = status.lastCycleMs != null ? formatDuration(status.lastCycleMs) : "-";
   const current = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined)?.[0];
   const phase = current
-    ? ` | ${current.key} ${current.kind} ${formatDuration(Number(current.ageMs ?? 0))}`
+    ? ` | ${current.label ?? `${current.key} ${current.kind}`} ${formatDuration(Number(current.ageMs ?? 0))}`
     : status.phase
       ? ` | ${status.phase}${status.activity ? ` ${status.activity}` : ""}`
       : "";
@@ -1179,6 +1179,24 @@ function printDetailedStatusWithFlags(
   }
   const needs = status.needsYou?.count ?? 0;
   console.log(`  Ziki needs you: ${needs}${needs ? ` → ${status.needsYou?.link}` : ""}`);
+  if (status.agents) {
+    for (const agent of status.agents as Array<Record<string, any>>) {
+      const current = agent.current
+        ? `${agent.current.label ?? agent.current.key} (${Math.round(Number(agent.current.ageMs ?? 0) / 1000)}s)`
+        : agent.claim
+          ? `claim #${agent.claim} (${agent.claimStatus})`
+          : "idle";
+      console.log(`  agent ${agent.name} [${agent.level}]: ${current}${agent.stale ? " · STALE HEARTBEAT" : ""}`);
+    }
+  }
+  if (status.capacity) {
+    console.log(
+      `  effective limits: agents ${status.capacity.agentCeiling} · delivery ${status.capacity.delivery} · review ${status.capacity.review} · aux ${status.capacity.aux} · follow-up ${status.capacity.followup} · claims ${status.capacity.activeClaims}` +
+        ` · daily deliveries ${status.profileLimits?.maxDeliveriesPerDay ?? "none"}` +
+        ` · daily reviews ${status.profileLimits?.maxReviewsPerDay ?? "none"}` +
+        ` · per-cycle aux ${status.profileLimits?.maxAuxPerCycle ?? "none"}`
+    );
+  }
   if (status.inFlight) {
     console.log(
       `  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.followUps ?? 0} follow-up · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`
@@ -1211,7 +1229,9 @@ function printDetailedStatusWithFlags(
     }
     const inFlight = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined) ?? [];
     for (const task of inFlight) {
-      console.log(`    ~ ${task.kind} ${task.key} (${Math.round(Number(task.ageMs ?? 0) / 1000)}s)`);
+      console.log(
+        `    ~ ${task.kind} ${task.key}${task.label ? ` (${task.label})` : ""} (${Math.round(Number(task.ageMs ?? 0) / 1000)}s)`
+      );
     }
   }
 }

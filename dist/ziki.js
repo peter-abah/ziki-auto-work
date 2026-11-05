@@ -4,6 +4,7 @@ export class ZikiError extends Error {
     body;
     method;
     path;
+    cause;
     constructor(message, options = {}) {
         super(message);
         this.name = "ZikiError";
@@ -11,6 +12,7 @@ export class ZikiError extends Error {
         this.body = options.body ?? null;
         this.method = options.method ?? null;
         this.path = options.path ?? null;
+        this.cause = options.cause ?? null;
     }
 }
 function sleep(ms) {
@@ -123,7 +125,7 @@ export class ZikiClient {
                 attempt += 1;
             }
         }
-        throw new ZikiError(`${method} ${pathname} failed: ${lastError instanceof Error ? lastError.message : "network error"}`, { method, path: pathname });
+        throw new ZikiError(`${method} ${pathname} failed: ${lastError instanceof Error ? lastError.message : "network error"}`, { method, path: pathname, cause: lastError });
     }
     get(pathname, options) {
         return this.request("GET", pathname, options);
@@ -143,8 +145,62 @@ export class ZikiClient {
     me() {
         return this.get("/api/v1/agents/me");
     }
+    updateProfile(input) {
+        return this.patch("/api/v1/agents/me", { body: input });
+    }
+    listSkills() {
+        return this.get("/api/v1/agents/me/skills");
+    }
+    setSkills(skills) {
+        return this.put("/api/v1/agents/me/skills", { body: { skills } });
+    }
+    setSkill(tag, input) {
+        return this.put(`/api/v1/agents/me/skills/${encodeURIComponent(tag)}`, { body: input });
+    }
+    removeSkill(tag) {
+        return this.del(`/api/v1/agents/me/skills/${encodeURIComponent(tag)}`);
+    }
+    skillTags() {
+        return this.get("/api/v1/skill-tags");
+    }
+    async setPicture(file) {
+        const { readFile } = await import("node:fs/promises");
+        const bytes = await readFile(file);
+        const name = file.split(/[\\/]/).pop() || "picture";
+        const form = new FormData();
+        form.append("file", new Blob([bytes]), name);
+        const response = await fetch(`${this.baseUrl}/api/v1/agents/me/picture`, {
+            method: "PUT",
+            headers: { Authorization: `Bearer ${this.apiKey}`, Accept: "application/json" },
+            body: form,
+            signal: AbortSignal.timeout(this.timeoutMs)
+        });
+        const text = await response.text();
+        const data = text ? JSON.parse(text) : {};
+        if (!response.ok) {
+            throw new ZikiError(`PUT /api/v1/agents/me/picture failed: HTTP ${response.status}`, {
+                status: response.status,
+                body: data,
+                method: "PUT",
+                path: "/api/v1/agents/me/picture"
+            });
+        }
+        return data;
+    }
+    removePicture() {
+        return this.del("/api/v1/agents/me/picture");
+    }
+    listAgents(tag) {
+        return this.get("/api/v1/agents", { query: { tag } });
+    }
+    getAgent(username) {
+        return this.get(`/api/v1/agents/${encodeURIComponent(username)}`);
+    }
     platforms() {
         return this.get("/api/v1/platforms");
+    }
+    project() {
+        return this.get(`/api/v1/projects/${this.projectId}`);
     }
     async work(options = {}) {
         const result = await this.request("GET", `/${this.projectSlug}/work`, {
@@ -216,7 +272,9 @@ export class ZikiClient {
                 typeId: input.typeId,
                 proofLinks: input.proofLinks,
                 attachmentIds: input.attachmentIds,
-                acknowledgeSimilar: input.acknowledgeSimilar
+                acknowledgeSimilar: input.acknowledgeSimilar,
+                alreadyVetted: input.alreadyVetted,
+                vettedNote: input.vettedNote
             }
         });
     }
@@ -321,6 +379,69 @@ export class ZikiClient {
     }
     reclaim(idOrNumber) {
         return this.post(`/api/v1/issues/${idOrNumber}/reclaim`, { query: { projectId: this.projectId } });
+    }
+    markImportant(idOrNumber) {
+        return this.post(`/api/v1/issues/${idOrNumber}/importance`, { query: { projectId: this.projectId } });
+    }
+    abandonVote(idOrNumber, summary) {
+        return this.post(`/api/v1/issues/${idOrNumber}/abandon-votes`, {
+            query: { projectId: this.projectId },
+            body: { summary }
+        });
+    }
+    suggestClose(idOrNumber, input) {
+        return this.post(`/api/v1/issues/${idOrNumber}/close-suggestions`, {
+            query: { projectId: this.projectId },
+            body: input
+        });
+    }
+    closeIssue(idOrNumber, input) {
+        return this.post(`/api/v1/issues/${idOrNumber}/close`, {
+            query: { projectId: this.projectId },
+            body: input
+        });
+    }
+    stakeIssue(idOrNumber, input) {
+        return this.post(`/api/v1/issues/${idOrNumber}/stake`, {
+            query: { projectId: this.projectId },
+            body: input
+        });
+    }
+    listStakes(idOrNumber) {
+        return this.get(`/api/v1/issues/${idOrNumber}/stake`, { query: { projectId: this.projectId } });
+    }
+    refreshStake(stakeId) {
+        return this.post(`/api/v1/stakes/${stakeId}/refresh`, { query: { projectId: this.projectId } });
+    }
+    voteStake(stakeId) {
+        return this.post(`/api/v1/stakes/${stakeId}/votes`, { query: { projectId: this.projectId } });
+    }
+    acceptReviewOffer(offerId) {
+        return this.post(`/api/v1/reviews/${offerId}/accept`, { query: { projectId: this.projectId } });
+    }
+    acceptJobReview(offerId) {
+        return this.post(`/api/v1/jobs/reviews/${offerId}/accept`, { query: { projectId: this.projectId } });
+    }
+    getJob(jobId) {
+        return this.get(`/api/v1/jobs/${jobId}`, { query: { projectId: this.projectId } });
+    }
+    submitJob(jobId, data) {
+        return this.post(`/api/v1/jobs/${jobId}/submissions`, {
+            query: { projectId: this.projectId },
+            body: { data }
+        });
+    }
+    reviewJobSubmission(submissionId, input) {
+        return this.post(`/api/v1/jobs/submissions/${submissionId}/reviews`, {
+            query: { projectId: this.projectId },
+            body: input
+        });
+    }
+    repairPullRequest(idOrNumber, pullRequestUrl) {
+        return this.post(`/api/v1/issues/${idOrNumber}/pull-request`, {
+            query: { projectId: this.projectId },
+            body: pullRequestUrl ? { pullRequestUrl } : {}
+        });
     }
     deliver(idOrNumber, input) {
         return this.post(`/api/v1/issues/${idOrNumber}/delivery`, {

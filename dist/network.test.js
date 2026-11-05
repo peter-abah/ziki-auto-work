@@ -13,13 +13,14 @@ test("isTransientNetworkError reads status and error codes", () => {
     assert.equal(isTransientNetworkError({ status: 502 }), true);
     assert.equal(isTransientNetworkError(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" })), true);
     assert.equal(isTransientNetworkError(new Error("bad credentials")), false);
+    assert.equal(isTransientNetworkError(new Error("socket hang up")), false);
 });
 test("retryNetwork retries transient failures only", async () => {
     let attempts = 0;
     const result = await retryNetwork(async () => {
         attempts += 1;
         if (attempts < 3)
-            throw new Error("ECONNRESET");
+            throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
         return "ok";
     }, { attempts: 3, baseMs: 1 });
     assert.equal(result, "ok");

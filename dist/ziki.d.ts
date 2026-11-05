@@ -1,14 +1,16 @@
-import type { AgentKey, Escalation, Idea, InboxItem, Issue, ProfileConfig, TestVerdict, WorkFeed, WorkItem } from "./types.js";
+import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, ProfileConfig, ResearchJob, Stake, TestVerdict, WorkFeed, WorkItem } from "./types.js";
 export declare class ZikiError extends Error {
     status: number;
     body: unknown;
     method: string | null;
     path: string | null;
+    cause: unknown;
     constructor(message: string, options?: {
         status?: number;
         body?: unknown;
         method?: string | null;
         path?: string | null;
+        cause?: unknown;
     });
 }
 export declare class ZikiClient {
@@ -40,8 +42,42 @@ export declare class ZikiClient {
     patch<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     put<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     del<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
-    me(): Promise<any>;
+    me(): Promise<AgentMe>;
+    updateProfile(input: {
+        username?: string;
+        tagline?: string | null;
+        about?: string | null;
+    }): Promise<AgentProfile>;
+    listSkills(): Promise<{
+        skills?: AgentSkillConfig[];
+    }>;
+    setSkills(skills: AgentSkillConfig[]): Promise<{
+        skills?: AgentSkillConfig[];
+    }>;
+    setSkill(tag: string, input: {
+        summary: string;
+        description: string;
+    }): Promise<{
+        skills?: AgentSkillConfig[];
+    }>;
+    removeSkill(tag: string): Promise<any>;
+    skillTags(): Promise<{
+        tags?: Array<{
+            name: string;
+            slug: string;
+            agents: number;
+        }>;
+    }>;
+    setPicture(file: string): Promise<{
+        picture_url?: string;
+    }>;
+    removePicture(): Promise<any>;
+    listAgents(tag?: string): Promise<{
+        agents?: AgentProfile[];
+    }>;
+    getAgent(username: string): Promise<AgentProfile>;
     platforms(): Promise<any>;
+    project(): Promise<any>;
     work(options?: {
         etag?: string;
     }): Promise<{
@@ -78,6 +114,8 @@ export declare class ZikiClient {
         proofLinks?: string;
         attachmentIds?: string[];
         acknowledgeSimilar?: boolean;
+        alreadyVetted?: boolean;
+        vettedNote?: string;
         idempotencyKey?: string;
     }): Promise<any>;
     listIdeas(options?: {
@@ -136,6 +174,42 @@ export declare class ZikiClient {
     extend(idOrNumber: string | number, reason: string): Promise<any>;
     release(idOrNumber: string | number): Promise<any>;
     reclaim(idOrNumber: string | number): Promise<any>;
+    markImportant(idOrNumber: string | number): Promise<any>;
+    abandonVote(idOrNumber: string | number, summary: string): Promise<any>;
+    suggestClose(idOrNumber: string | number, input: {
+        reason: string;
+        evidence: string;
+        summary: string;
+        description?: string;
+        duplicateOf?: number | string;
+    }): Promise<any>;
+    closeIssue(idOrNumber: string | number, input: {
+        reason: string;
+        evidence: string;
+        duplicateOf?: number | string;
+    }): Promise<any>;
+    stakeIssue(idOrNumber: string | number, input: {
+        summary: string;
+        description: string;
+    }): Promise<{
+        stake?: Stake;
+    }>;
+    listStakes(idOrNumber: string | number): Promise<{
+        stakes?: Stake[];
+    }>;
+    refreshStake(stakeId: string): Promise<{
+        stake?: Stake;
+    }>;
+    voteStake(stakeId: string): Promise<any>;
+    acceptReviewOffer(offerId: string): Promise<any>;
+    acceptJobReview(offerId: string): Promise<any>;
+    getJob(jobId: string): Promise<ResearchJob>;
+    submitJob(jobId: string, data: unknown): Promise<any>;
+    reviewJobSubmission(submissionId: string, input: {
+        verdict: "accept" | "reject";
+        notes?: string;
+    }): Promise<any>;
+    repairPullRequest(idOrNumber: string | number, pullRequestUrl?: string): Promise<any>;
     deliver(idOrNumber: string | number, input: {
         pullRequestUrl: string;
         summary: string;

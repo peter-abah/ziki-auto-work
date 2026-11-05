@@ -296,10 +296,16 @@ test("providers build the right commands", () => {
 test("run limits and concurrency have working defaults", () => {
   assert.equal(DEFAULT_LIMITS.maxRuntimeMinutes, 120);
   assert.equal(DEFAULT_LIMITS.maxCycles, null);
-  assert.equal(DEFAULT_LIMITS.maxConcurrentDeliveries, 2);
-  assert.equal(DEFAULT_LIMITS.maxConcurrentReviews, 1);
-  assert.equal(DEFAULT_LIMITS.maxConcurrentAux, 2);
-  assert.equal(DEFAULT_LIMITS.maxConcurrentAgents, 4);
+  assert.equal(DEFAULT_LIMITS.maxConcurrentDeliveries, "auto");
+  assert.equal(DEFAULT_LIMITS.maxConcurrentReviews, "auto");
+  assert.equal(DEFAULT_LIMITS.maxConcurrentAux, "auto");
+  assert.equal(DEFAULT_LIMITS.maxConcurrentFollowUps, "auto");
+  assert.equal(DEFAULT_LIMITS.maxConcurrentAgents, "auto");
+  assert.equal(DEFAULT_LIMITS.maxActiveClaims, "auto");
+  assert.equal(DEFAULT_LIMITS.maxDeliveriesPerDay, null);
+  assert.equal(DEFAULT_LIMITS.maxReviewsPerDay, null);
+  assert.equal(DEFAULT_LIMITS.maxAuxPerCycle, null);
+  assert.equal(DEFAULT_LIMITS.maxDiscoveriesPerDay, null);
   assert.equal(DEFAULT_LIMITS.maxTokensPerRun, null);
   assert.equal(DEFAULT_LIMITS.tokenWarnPercent, 80);
   assert.equal(DEFAULT_LIMITS.providerRetryMinutes, 15);

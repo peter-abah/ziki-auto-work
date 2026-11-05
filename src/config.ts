@@ -21,11 +21,11 @@ import { PROVIDER_IDS } from "./providers/index.js";
 export const PROVIDERS: ProviderName[] = PROVIDER_IDS;
 
 export const DEFAULT_LIMITS: LimitsConfig = {
-  maxDeliveriesPerDay: 10,
-  maxReviewsPerDay: 20,
-  maxDiscoveriesPerDay: 5,
-  maxAuxPerCycle: 4,
-  maxActiveClaims: 2,
+  maxDeliveriesPerDay: null,
+  maxReviewsPerDay: null,
+  maxDiscoveriesPerDay: null,
+  maxAuxPerCycle: null,
+  maxActiveClaims: "auto",
   maxAttemptsPerTask: 3,
   maxNetworkRetries: 5,
   networkRetryMinutes: 1,
@@ -35,12 +35,12 @@ export const DEFAULT_LIMITS: LimitsConfig = {
   maxCycles: null,
   stopAt: null,
   maxDeliveriesTotal: null,
-  maxConcurrentDeliveries: 2,
-  maxConcurrentFollowUps: 1,
-  maxConcurrentReviews: 1,
-  maxConcurrentAux: 2,
+  maxConcurrentDeliveries: "auto",
+  maxConcurrentFollowUps: "auto",
+  maxConcurrentReviews: "auto",
+  maxConcurrentAux: "auto",
   maxConcurrentDiscovery: 1,
-  maxConcurrentAgents: 4,
+  maxConcurrentAgents: "auto",
   maxTokensPerRun: null,
   tokenWarnPercent: 80,
   providerRetryMinutes: 15
@@ -66,7 +66,9 @@ export const DEFAULT_WORKFLOW: WorkflowConfig = {
   maxLines: 400,
   branchPrefix: "fix",
   commitTypes: ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
-  requireTests: true
+  requireTests: true,
+  autoVoteBids: "agent",
+  autoUpvoteComments: "agent"
 };
 
 export const DEFAULT_ENV_FILES = [".env", ".env.local"];
@@ -319,6 +321,44 @@ export function validateConfig(config: Config): ValidationResult {
     }
     if (!profile?.limits || typeof profile.limits !== "object") {
       errors.push(`${prefix}.limits is required`);
+    } else {
+      const capacityKeys = [
+        "maxDeliveriesPerDay",
+        "maxReviewsPerDay",
+        "maxDiscoveriesPerDay",
+        "maxAuxPerCycle",
+        "maxActiveClaims",
+        "maxConcurrentDeliveries",
+        "maxConcurrentFollowUps",
+        "maxConcurrentReviews",
+        "maxConcurrentAux",
+        "maxConcurrentDiscovery",
+        "maxConcurrentAgents"
+      ] as const;
+      for (const key of capacityKeys) {
+        const value = (profile.limits as unknown as Record<string, unknown>)[key];
+        if (value === undefined || value === null || value === "auto") continue;
+        if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+          errors.push(`${prefix}.limits.${key} must be a non-negative number, "auto" or null`);
+        }
+      }
+    }
+    if (profile?.repo?.mergeMode !== undefined && !["handoff", "never", "auto"].includes(profile.repo.mergeMode)) {
+      errors.push(`${prefix}.repo.mergeMode must be "handoff", "never" or "auto"`);
+    }
+    if (profile?.repo?.mergeMethod !== undefined && !["merge", "squash", "rebase"].includes(profile.repo.mergeMethod)) {
+      errors.push(`${prefix}.repo.mergeMethod must be "merge", "squash" or "rebase"`);
+    }
+    if (profile?.agentProfile?.skills !== undefined) {
+      if (!Array.isArray(profile.agentProfile.skills)) {
+        errors.push(`${prefix}.agentProfile.skills must be an array`);
+      } else {
+        profile.agentProfile.skills.forEach((skill, index) => {
+          requireString(skill?.tag, `${prefix}.agentProfile.skills[${index}].tag`, errors);
+          requireString(skill?.summary, `${prefix}.agentProfile.skills[${index}].summary`, errors);
+          requireString(skill?.description, `${prefix}.agentProfile.skills[${index}].description`, errors);
+        });
+      }
     }
     const workflow = profile?.workflow;
     if (!workflow || typeof workflow !== "object") {
@@ -335,6 +375,12 @@ export function validateConfig(config: Config): ValidationResult {
       }
       if (!Array.isArray(workflow.commitTypes) || !workflow.commitTypes.length) {
         errors.push(`${prefix}.workflow.commitTypes must be a non-empty array`);
+      }
+      for (const key of ["autoVoteBids", "autoUpvoteComments"] as const) {
+        const value = workflow[key];
+        if (value !== undefined && !["off", "agent", "heuristic"].includes(value)) {
+          errors.push(`${prefix}.workflow.${key} must be "off", "agent" or "heuristic"`);
+        }
       }
     }
     if (profile?.repo?.envFiles !== undefined && !Array.isArray(profile.repo.envFiles)) {
@@ -371,6 +417,14 @@ export function resolveModel(profile: ProfileConfig, role: Role): string | null 
   const models = profile.executor.models ?? {};
   if (role === "followup") return models.followup ?? models.worker ?? profile.executor.model ?? null;
   return models[role] ?? profile.executor.model ?? null;
+}
+
+export function resolveMergeMode(profile: ProfileConfig): "handoff" | "never" | "auto" {
+  return profile.repo.mergeMode ?? "handoff";
+}
+
+export function resolveMergeMethod(profile: ProfileConfig): "merge" | "squash" | "rebase" {
+  return profile.repo.mergeMethod ?? "squash";
 }
 
 export function resolvePromptDir(profile: ProfileConfig): string {

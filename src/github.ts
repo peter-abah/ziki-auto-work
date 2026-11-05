@@ -421,6 +421,43 @@ export class GitHub {
     }
   }
 
+  async unresolvedReviewThreads(url: string): Promise<
+    Array<{ id: string; path?: string; line?: number | null; author?: string; body: string }>
+  > {
+    const number = this.prNumber(url);
+    const [owner, repo] = this.profile.repo.githubRepo.split("/");
+    if (!number || !owner || !repo) return [];
+    const query = [
+      "query($owner:String!,$repo:String!,$number:Int!){",
+      "repository(owner:$owner,name:$repo){pullRequest(number:$number){",
+      "reviewThreads(first:100){nodes{id isResolved comments(first:20){nodes{body path line author{login}}}}}}}}}"
+    ].join("");
+    const result = await this.gh(
+      ["api", "graphql", "-f", `query=${query}`, "-F", `owner=${owner}`, "-F", `repo=${repo}`, "-F", `number=${number}`],
+      { retry: true, timeoutMs: 120_000 }
+    );
+    if (!result.ok) return [];
+    try {
+      const data = JSON.parse(result.stdout) as any;
+      const nodes = data?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+      return nodes
+        .filter((thread: any) => thread?.isResolved === false)
+        .map((thread: any) => {
+          const comment = thread.comments?.nodes?.[0];
+          return {
+            id: String(thread.id ?? ""),
+            path: typeof comment?.path === "string" ? comment.path : undefined,
+            line: typeof comment?.line === "number" ? comment.line : null,
+            author: typeof comment?.author?.login === "string" ? comment.author.login : undefined,
+            body: String(comment?.body ?? "")
+          };
+        })
+        .filter((thread: { body: string }) => thread.body.trim());
+    } catch {
+      return [];
+    }
+  }
+
   async failedCheckLogs(status: GitHubPrStatus, maxRuns = 3): Promise<Array<{ name: string; log: string }>> {
     const failed = status.checkRuns
       .filter((check: PrCheck) => ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"].includes((check.conclusion ?? "").toUpperCase()))
@@ -443,6 +480,12 @@ export class GitHub {
   async updatePrBody(url: string, body: string): Promise<void> {
     const result = await this.gh(["pr", "edit", url, "--body", body], { timeoutMs: 120_000 });
     if (!result.ok) throw new Error(result.stderr || result.stdout || "gh pr edit failed");
+  }
+
+  async mergePr(url: string, method: "merge" | "squash" | "rebase" = "squash"): Promise<void> {
+    const flag = method === "merge" ? "--merge" : method === "rebase" ? "--rebase" : "--squash";
+    const result = await this.gh(["pr", "merge", url, flag], { timeoutMs: 300_000, retry: true });
+    if (!result.ok) throw new Error(result.stderr || result.stdout || "gh pr merge failed");
   }
 
   async closePr(url: string, comment?: string): Promise<void> {

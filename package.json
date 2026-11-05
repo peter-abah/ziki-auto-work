@@ -29,7 +29,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist/config.test.js dist/scheduler.test.js dist/state.test.js dist/rules.test.js dist/env.test.js dist/discover.test.js dist/notify.test.js dist/run-report.test.js dist/service.test.js dist/usage.test.js dist/provider-errors.test.js dist/providers.test.js dist/network.test.js dist/shim.test.js dist/pr-body.test.js dist/pr-context.test.js",
+    "test": "node --test dist/config.test.js dist/scheduler.test.js dist/state.test.js dist/rules.test.js dist/env.test.js dist/discover.test.js dist/notify.test.js dist/run-report.test.js dist/service.test.js dist/usage.test.js dist/provider-errors.test.js dist/providers.test.js dist/network.test.js dist/shim.test.js dist/pr-body.test.js dist/pr-context.test.js dist/capacity.test.js dist/queue.test.js dist/decisions.test.js dist/merge.test.js dist/ziki.test.js dist/feed.test.js dist/pr-comments.test.js dist/votes.test.js dist/agent.test.js dist/work-key.test.js",
     "prepublishOnly": "npm run check && npm test",
     "prepack": "npm run build",
     "pretest": "node bin/pretest.mjs",

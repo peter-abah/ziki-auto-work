@@ -82,6 +82,10 @@ Do not hardcode a local Flutter path.
 {{prTemplate}}
 ```
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}

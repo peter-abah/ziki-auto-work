@@ -81,3 +81,39 @@ test("TaskPool.list reports in-flight kind and age for status", async () => {
   gate.release();
   await pool.drain(1000);
 });
+
+test("TaskPool keeps a human label alongside the raw dedupe key", async () => {
+  const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+  const gate = gated();
+  assert.equal(pool.reserve("ready_issue:cmw2", "delivery", gate.run, "#2624 typing-indicator"), true);
+  assert.equal(pool.reserve("ready_issue:cmw2", "delivery", gate.run, "#2624 duplicate"), false);
+  const [task] = pool.list();
+  assert.equal(task!.key, "ready_issue:cmw2");
+  assert.equal(task!.label, "#2624 typing-indicator");
+  gate.release();
+  await pool.drain(1000);
+  assert.equal(pool.total(), 0);
+});
+
+test("TaskPool accepts an unlabelled task", () => {
+  const pool = new TaskPool({ delivery: 1, followup: 1, review: 1, aux: 1, discovery: 1, owner: 1, agents: 1 });
+  const gate = gated();
+  pool.reserve("key", "aux", gate.run);
+  assert.equal(pool.list()[0]!.label, undefined);
+  gate.release();
+});
+
+test("formatLiveTask prefers the label and falls back to the raw key", async () => {
+  const { formatLiveTask } = await import("./live-status.js");
+  assert.equal(formatLiveTask({ label: "#2631 review", key: "test_fix:1", kind: "review", ageMs: 120_000 }), "#2631 review 2m");
+  assert.equal(formatLiveTask({ key: "test_fix:1", kind: "review", ageMs: 120_000 }), "test_fix:1 review 2m");
+});
+
+test("TaskPool records which agent runs a task", async () => {
+  const pool = new TaskPool({ delivery: 1, followup: 1, review: 1, aux: 1, discovery: 1, owner: 1, agents: 1 });
+  const gate = gated();
+  pool.reserve("key", "delivery", gate.run, "#1 fix", "Muadib");
+  assert.equal(pool.list()[0]!.agent, "Muadib");
+  gate.release();
+  await pool.drain(1000);
+});
