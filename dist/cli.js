@@ -1031,7 +1031,11 @@ function statusLine(name, result) {
     const lastRun = status.lastRun
         ? ` | last run: ${status.lastRun.cycles}c/${status.lastRun.deliveries}d${status.lastRun.clean ? "" : " (incomplete)"}`
         : "";
-    return `${name} | ${state}${phase} | ${spent}/${limit}${network} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}`;
+    const health = status.health;
+    const healthText = health && health.state !== "healthy"
+        ? ` | health ${health.state}:${health.blockers?.[0]?.code ?? "issue"}`
+        : "";
+    return `${name} | ${state}${phase} | ${spent}/${limit}${network} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}${healthText}`;
 }
 async function status(flags) {
     const config = await loadConfig();
@@ -1084,6 +1088,17 @@ function printDetailedStatusWithFlags(flags, name, result) {
     }
     const needs = status.needsYou?.count ?? 0;
     console.log(`  Ziki needs you: ${needs}${needs ? ` → ${status.needsYou?.link}` : ""}`);
+    if (status.health) {
+        const health = status.health;
+        console.log(`  health: ${health.state}${status.stateDir ? ` · state ${status.stateDir}` : ""}`);
+        for (const blocker of health.blockers ?? []) {
+            const agents = Array.isArray(blocker.agents) && blocker.agents.length ? ` (${blocker.agents.join(", ")})` : "";
+            console.log(`    - ${blocker.severity} ${blocker.component}:${blocker.code} — ${blocker.message}${agents}`);
+            if (blocker.details?.setupUrl)
+                console.log(`      setup: ${blocker.details.setupUrl}`);
+            console.log(`      attempts ${blocker.attempts} · next retry ${blocker.nextRetryAt ?? "none"}`);
+        }
+    }
     if (status.agents) {
         for (const agent of status.agents) {
             const current = agent.current

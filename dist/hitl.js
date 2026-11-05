@@ -80,6 +80,7 @@ export async function escalate(client, profile, profilePaths, state, options) {
 }
 export async function poll(client, profile, profilePaths, state, options = {}) {
     const resolved = [];
+    const errors = [];
     for (const escalation of openEscalations(state)) {
         try {
             const owner = options.clientForName?.(escalation.agentName) ?? null;
@@ -102,6 +103,7 @@ export async function poll(client, profile, profilePaths, state, options = {}) {
             }
         }
         catch (error) {
+            errors.push(error);
             options.logger?.warn(`Could not poll escalation ${escalation.id}: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
@@ -120,21 +122,30 @@ export async function poll(client, profile, profilePaths, state, options = {}) {
         }
     }
     catch (error) {
+        errors.push(error);
         options.logger?.warn(`Could not read inbox: ${error instanceof Error ? error.message : String(error)}`);
     }
     await writeNeedsHuman(state, profile, profilePaths);
-    return { resolved, inbox };
+    return { resolved, inbox, errors };
 }
 export async function writeNeedsHuman(state, profile, profilePaths) {
     const open = openEscalations(state);
+    const healthBlockers = Object.values(state.health?.blockers ?? {});
     const lines = [
         "# Auto-work needs you",
         "",
         `Updated: ${new Date().toISOString()}`,
         "",
-        open.length ? "" : "Nothing is waiting on you.",
+        !open.length && !healthBlockers.length ? "Nothing is waiting on you." : "",
         ""
     ];
+    if (healthBlockers.length) {
+        lines.push("## Blocked loop", "");
+        for (const blocker of healthBlockers) {
+            lines.push(`- **${blocker.severity}** \`${blocker.component}:${blocker.code}\` — ${blocker.message}`, ...(blocker.agents?.length ? [`  Agents: ${blocker.agents.join(", ")}`] : []), ...(typeof blocker.details?.setupUrl === "string" ? [`  Setup: ${blocker.details.setupUrl}`] : []), ...(typeof blocker.details?.helpUrl === "string" ? [`  Help: ${blocker.details.helpUrl}`] : []), `  Last attempt: ${blocker.lastAttemptAt} · attempts: ${blocker.attempts}`);
+        }
+        lines.push("");
+    }
     for (const escalation of open) {
         lines.push(`## ${escalation.type} · #${escalation.issueNumber ?? "?"} ${escalation.issueTitle ?? ""}`.trim(), "", escalation.body, "", `- Answer in Ziki: ${escalationUrl(profile, escalation.issueNumber)}`, `- Escalation id: \`${escalation.id}\``, `- Opened: ${escalation.createdAt}`, "");
     }

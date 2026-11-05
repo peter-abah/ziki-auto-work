@@ -18,7 +18,8 @@ import type {
   StopReason,
   TaskState,
   WorkFeed,
-  WorkItem
+  WorkItem,
+  HealthComponent
 } from "./types.js";
 import {
   DEFAULT_PR_TRACKING,
@@ -96,6 +97,16 @@ import { mergeWorkItemFeeds } from "./feed.js";
 import type { AgentFeed } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import { deploymentEnvironment, workTargetKey } from "./work-key.js";
+import {
+  blockerId,
+  classifyError,
+  clearBlocker,
+  healthLabel,
+  nextRetryDelay,
+  reportBlocker,
+  summarizeHealth
+} from "./health.js";
+import type { HealthReport } from "./health.js";
 import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
 import type { Capacity } from "./capacity.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
@@ -181,9 +192,11 @@ function renderLive(ctx: Context): { line: string; key: string } {
   const tokens = ctx.state.run.tokens;
   const tokenText = `tokens ${formatTokens(tokens.total)}${tokens.estimated ? " est" : ""}`;
   const agentText = `agents ${tasks.length}/${ctx.capacity.totalKeys}`;
+  const healthText = healthLabel(ctx.state.health);
+  const visibleActivity = healthText === "healthy" ? activity : healthText;
   return {
-    line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${agentText} · ${tokenText}`,
-    key: `${ctx.phase}|${first?.key ?? ""}|${first?.label ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
+    line: `${ctx.profileName} · ${visibleActivity} · ${elapsed}/${limit} · Ziki:${needs} · ${agentText} · ${tokenText}`,
+    key: `${ctx.phase}|${first?.key ?? ""}|${first?.label ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}|${healthText}`
   };
 }
 
@@ -667,6 +680,82 @@ function history(ctx: Context, entry: Omit<HistoryEntry, "at">): void {
   void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => {});
 }
 
+function blockerText(blocker: { message: string; agents?: string[]; details?: Record<string, unknown> }): string {
+  const agents = blocker.agents?.length ? `\nAgents: ${blocker.agents.join(", ")}` : "";
+  const setup = typeof blocker.details?.setupUrl === "string" ? `\nSetup: ${blocker.details.setupUrl}` : "";
+  const help = typeof blocker.details?.helpUrl === "string" ? `\nHelp: ${blocker.details.helpUrl}` : "";
+  return `${blocker.message}${agents}${setup}${help}`;
+}
+
+async function applyHealth(ctx: Context, report: HealthReport): Promise<void> {
+  const update = reportBlocker(ctx.state.health, report);
+  if (!update.blocker.notifiedAt || update.changed) {
+    update.blocker.notifiedAt = new Date().toISOString();
+    await notifyProfile(
+      ctx.profile,
+      `auto-work: ${update.blocker.severity} ${update.blocker.code}`,
+      blockerText(update.blocker),
+      ctx.logger
+    ).catch(() => {});
+  }
+  if (update.changed) {
+    history(ctx, {
+      type: "health",
+      detail: `${update.blocker.component}:${update.blocker.code} ${update.blocker.severity}`,
+      data: { agents: update.blocker.agents, message: update.blocker.message, created: update.created }
+    });
+  }
+  await writeNeedsHuman(ctx.state, ctx.profile, ctx.profilePaths).catch(() => {});
+}
+
+async function clearHealth(ctx: Context, component: HealthComponent, code?: string): Promise<void> {
+  const removed = clearBlocker(ctx.state.health, component, code);
+  if (!removed.length) return;
+  history(ctx, {
+    type: "health",
+    detail: `recovered ${component}${code ? `:${code}` : ""}`,
+    data: { blockers: removed.map((blocker) => blocker.id) }
+  });
+  ctx.logger.info(`Health recovered: ${component}${code ? `:${code}` : ""}`);
+  await writeNeedsHuman(ctx.state, ctx.profile, ctx.profilePaths).catch(() => {});
+}
+
+interface FeedFailure {
+  agent: string;
+  error: unknown;
+}
+
+async function recordFeedHealth(ctx: Context, failures: FeedFailure[]): Promise<void> {
+  const groups = new Map<string, { report: HealthReport; agents: string[]; perAgent: Record<string, unknown> }>();
+  for (const failure of failures) {
+    const report = classifyError(failure.error, "feed");
+    const key = blockerId(report.component, report.code);
+    const group = groups.get(key);
+    if (!group) {
+      groups.set(key, { report, agents: [failure.agent], perAgent: { [failure.agent]: report.details ?? report.message } });
+    } else {
+      group.agents.push(failure.agent);
+      group.perAgent[failure.agent] = report.details ?? report.message;
+    }
+  }
+  if (!groups.size) {
+    await clearHealth(ctx, "feed");
+    await clearHealth(ctx, "agent", "profile_incomplete");
+    return;
+  }
+  for (const group of groups.values()) {
+    await applyHealth(ctx, {
+      ...group.report,
+      agents: [...new Set(group.agents)].sort(),
+      details: { ...(group.report.details ?? {}), perAgent: group.perAgent }
+    });
+  }
+  for (const blocker of Object.values(ctx.state.health.blockers)) {
+    if (blocker.component !== "feed" && !(blocker.component === "agent" && blocker.code === "profile_incomplete")) continue;
+    if (!groups.has(blocker.id)) await clearHealth(ctx, blocker.component, blocker.code);
+  }
+}
+
 function taskUsage(ctx: Context, issue: Issue | null, usage: TokenUsage | null | undefined): void {
   if (!usage) return;
   ctx.state.run.tokens = addUsage(ctx.state.run.tokens, usage);
@@ -700,10 +789,18 @@ function taskUsage(ctx: Context, issue: Issue | null, usage: TokenUsage | null |
 async function handleProviderLimit(ctx: Context, result: { providerLimit?: "quota" | "rate-limit" | "context" | null }): Promise<boolean> {
   if (!result.providerLimit) {
     ctx.rateLimitCount = 0;
+    await clearHealth(ctx, "provider", "rate_limit");
     return false;
   }
   if (result.providerLimit === "quota") {
     ctx.providerLimit = "quota";
+    await applyHealth(ctx, {
+      component: "provider",
+      code: "quota",
+      severity: "blocked",
+      message: "The provider account has no quota/credits left.",
+      retryMs: 5 * 60_000
+    });
     if (!ctx.providerLimitNotified) {
       ctx.providerLimitNotified = true;
       await notifyProfile(
@@ -718,6 +815,13 @@ async function handleProviderLimit(ctx: Context, result: { providerLimit?: "quot
   if (result.providerLimit === "rate-limit") {
     const minutes = ctx.profile.limits.providerRetryMinutes ?? 15;
     ctx.rateLimitCount += 1;
+    await applyHealth(ctx, {
+      component: "provider",
+      code: "rate_limit",
+      severity: "degraded",
+      message: "The provider rate limit was hit; waiting before retrying.",
+      retryMs: minutes * 60_000
+    });
     ctx.rateLimitUntil = Date.now() + minutes * 60 * 1000;
     ctx.logger.warn(`Provider rate limit hit; backing off ${minutes} minutes (${ctx.rateLimitCount}/3)`);
     if (ctx.rateLimitCount >= 3) {
@@ -900,6 +1004,8 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
     queue: ctx.queue?.counts ?? null,
     capacity: ctx.capacity,
     profileLimits: ctx.profile.limits,
+    health: summarizeHealth(ctx.state.health),
+    stateDir: ctx.profilePaths.stateDir,
     feedAgents: ctx.feedAgentCounts,
     zikiWorkflow: {
       maxActiveClaims: zikiClaimLimit(ctx),
@@ -1048,11 +1154,12 @@ async function save(ctx: Context): Promise<void> {
   });
 }
 
-async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
+async function fetchMergedFeed(ctx: Context): Promise<{ feed: WorkFeed | null; failures: FeedFailure[] }> {
   const agents = [...ctx.clients.workers, ...ctx.clients.managers];
-  if (!agents.length) return null;
+  if (!agents.length) return { feed: null, failures: [] };
 
   const feeds: AgentFeed[] = [];
+  const failures: FeedFailure[] = [];
   for (const agent of agents) {
     try {
       const etag = ctx.state.feedEtags[agent.name];
@@ -1070,14 +1177,14 @@ async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
       feeds.push({ agent: agent.name, feed: result.data });
       if (result.etag) ctx.state.feedEtags[agent.name] = result.etag;
     } catch (error) {
+      failures.push({ agent: agent.name, error });
       ctx.logger.warn(`Work feed failed for ${agent.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   const merged = mergeWorkItemFeeds(feeds);
   ctx.feedAgentCounts = merged.counts;
-  if (!merged.base) return null;
-  return { ...merged.base, items: merged.items };
+  return { feed: merged.base ? { ...merged.base, items: merged.items } : null, failures };
 }
 
 async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
@@ -1110,9 +1217,11 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
       ideas: ideas.map((idea) => ({ id: idea.id, number: idea.number, title: idea.title, status: idea.status })) as Idea[]
     };
     await writeFile(file, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+    await clearHealth(ctx, "platform");
     return data;
   } catch (error) {
     ctx.logger.warn(`Platform set refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    await applyHealth(ctx, classifyError(error, "platform"));
     return cached ?? { fetchedAt: null, issues: [], ideas: [] };
   }
 }
@@ -3379,7 +3488,14 @@ async function syncAgentProfile(ctx: Context): Promise<void> {
   }
 }
 
-async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean; paused?: boolean; stopped?: boolean; noFeed?: boolean }> {
+async function runCycle(ctx: Context): Promise<{
+  ok?: boolean;
+  dryRun?: boolean;
+  paused?: boolean;
+  stopped?: boolean;
+  noFeed?: boolean;
+  blocked?: boolean;
+}> {
   const started = Date.now();
   ctx.state.cycles += 1;
   ctx.cycleStats = { deliveries: 0, reviews: 0, aux: 0, errors: 0 };
@@ -3391,29 +3507,49 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
     ctx.logger.info("Paused; waiting for resume");
     return { paused: true };
   }
+  const healthState = summarizeHealth(ctx.state.health);
+  if (healthState.state === "blocked" && nextRetryDelay(ctx.state.health) !== null) {
+    setPhase(ctx, "blocked");
+    return { blocked: true };
+  }
 
   setPhase(ctx, "poll");
-  await poll(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
+  const polled = await poll(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
     logger: ctx.logger,
     markInboxRead: !ctx.dryRun,
     clientForName: (name) => clientByName(ctx, name)?.client ?? null
   });
+  if (polled.errors.length) {
+    const report = classifyError(polled.errors[0], "inbox");
+    if (report.code !== "profile_incomplete") await applyHealth(ctx, report);
+  } else {
+    await clearHealth(ctx, "inbox");
+  }
 
   setPhase(ctx, "feed");
   const maxAge = ctx.profile.memoryRefreshMinutes;
   const loadedAt = ctx.memory?.loadedAt ? new Date(ctx.memory.loadedAt).getTime() : 0;
   if (!ctx.memory || Date.now() - loadedAt > maxAge * 60 * 1000) {
-    ctx.memory = await loadMemoryContext(ctx.primary.client, ctx.profilePaths, { maxAgeMinutes: maxAge });
-    ctx.memoryText = formatMemoryForPrompt(ctx.memory);
-    ctx.logger.info("Memory refreshed", { notes: ctx.memory.ownNotes.length });
+    try {
+      ctx.memory = await loadMemoryContext(ctx.primary.client, ctx.profilePaths, { maxAgeMinutes: maxAge });
+      ctx.memoryText = formatMemoryForPrompt(ctx.memory);
+      ctx.logger.info("Memory refreshed", { notes: ctx.memory.ownNotes.length });
+      await clearHealth(ctx, "memory");
+    } catch (error) {
+      await applyHealth(ctx, classifyError(error, "memory"));
+    }
   }
 
-  const feed = await fetchMergedFeed(ctx);
-  if (!feed) {
+  const feedResult = await fetchMergedFeed(ctx);
+  await recordFeedHealth(ctx, feedResult.failures);
+  if (!feedResult.feed) {
     ctx.logger.warn("No work feed available this cycle");
+    ctx.state.lastCycleMs = Date.now() - started;
+    await save(ctx);
+    await notifyNeedsYou(ctx);
     return { noFeed: true };
   }
-  ctx.feed = feed;
+  ctx.feed = feedResult.feed;
 
   for (const task of Object.values(ctx.state.tasks)) {
     if (task.status === "working" && Date.now() - new Date(task.updatedAt).getTime() > 60 * 60 * 1000) {
@@ -3426,7 +3562,7 @@ async function runCycle(ctx: Context): Promise<{ ok?: boolean; dryRun?: boolean;
   const platformNumbers = new Set(ctx.platform.issues.map((issue) => issue.number));
   const platformIdeaNumbers = new Set(ctx.platform.ideas.map((idea) => idea.number));
   ctx.queue = buildQueue({
-    feed,
+    feed: feedResult.feed,
     profile: ctx.profile,
     platformNumbers,
     platformIdeaNumbers,
@@ -3851,6 +3987,58 @@ function limitReached(ctx: Context): "max-cycles" | "max-deliveries" | "until" |
   return null;
 }
 
+async function preflightHealth(ctx: Context): Promise<void> {
+  const incomplete: Array<{ agent: string; missing: string[]; setupUrl: string | null; helpUrl: string | null }> = [];
+  for (const agent of [...ctx.clients.workers, ...ctx.clients.managers]) {
+    try {
+      const me = await agent.client.me();
+      const profile = me.profile;
+      const missing: string[] = [];
+      if (!profile?.tagline) missing.push("tagline");
+      if (!profile?.about) missing.push("about");
+      if (!(profile?.skills?.length)) missing.push("skills");
+      if (missing.length) {
+        incomplete.push({
+          agent: agent.name,
+          missing,
+          setupUrl: null,
+          helpUrl: me.profile_help_url ?? null
+        });
+      }
+    } catch (error) {
+      await applyHealth(ctx, { ...classifyError(error, "agent"), agents: [agent.name] });
+    }
+  }
+  if (incomplete.length) {
+    await applyHealth(ctx, {
+      component: "agent",
+      code: "profile_incomplete",
+      severity: "blocked",
+      message: "Ziki requires every agent profile to have a tagline, an About me and at least one skill.",
+      agents: incomplete.map((entry) => entry.agent),
+      details: {
+        missing: ["tagline", "about", "skills"],
+        perAgent: Object.fromEntries(incomplete.map((entry) => [entry.agent, entry])),
+        helpUrl: incomplete.find((entry) => entry.helpUrl)?.helpUrl ?? null
+      },
+      retryMs: 5 * 60_000
+    });
+  } else {
+    await clearHealth(ctx, "agent", "profile_incomplete");
+  }
+  if (ctx.zikiWorkflow) {
+    await clearHealth(ctx, "config", "project_workflow");
+  } else {
+    await applyHealth(ctx, {
+      component: "config",
+      code: "project_workflow",
+      severity: "warning",
+      message: "Could not read the Ziki project workflow; claim limits are unknown.",
+      retryMs: 5 * 60_000
+    });
+  }
+}
+
 export async function runLoop(options: {
   profileName?: string;
   foreground?: boolean;
@@ -3961,6 +4149,8 @@ export async function runLoop(options: {
     runLimits
   });
   await syncAgentProfile(ctx);
+  await preflightHealth(ctx);
+  await save(ctx).catch(() => {});
   await writeStatus(ctx, { running: true });
 
   let stopReason: StopReason = null;
@@ -4042,7 +4232,9 @@ export async function runLoop(options: {
         await ctx.pool.drain(120_000);
         break;
       }
-      await Promise.race([ctx.pool.waitForAny(), sleep(ctx.profile.pollSeconds * 1000, controller.signal)]);
+      const retry = nextRetryDelay(ctx.state.health);
+      const waitMs = Math.max(ctx.profile.pollSeconds * 1000, retry ?? 0);
+      await Promise.race([ctx.pool.waitForAny(), sleep(waitMs, controller.signal)]);
     } while (!controller.signal.aborted);
   } catch (error) {
     stopReason = "error";

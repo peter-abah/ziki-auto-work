@@ -13,7 +13,9 @@ and open issues, test and acceptance reviews, idle and stranded work, merges and
 reconciliations, ideas, confirmations, closes, sense checks, importance marks,
 estimates, investigations, comments, stakes, PR and deployment reports, link
 repairs, releases, research jobs, bid votes and awards, and categorization.
-Unknown kinds are surfaced in status instead of being silently dropped.
+Unknown kinds and infrastructure blockers are surfaced in `status.health`
+instead of being silently dropped. Profile, auth, inbox, platform, provider
+and network failures are persisted, notified once, and retried with backoff.
 
 Capacity is adaptive, not rigid. Concurrency defaults to `"auto"` and follows
 the agents you configured; daily and per-cycle work caps default to `null`

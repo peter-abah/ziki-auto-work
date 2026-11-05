@@ -20,6 +20,7 @@ src/
   ziki.ts            typed Ziki API client
   queue.ts           all latest work kinds, prioritisation and platform matching
   feed.ts            merges every agent's work feed without dropping agent-specific items
+  health.ts          loop blockers, severity, retries and recovery state
   pr-comments.ts     structured PR comment/mention policy for follow-up
   votes.ts           explicit vote policy for bids and comments
   work-key.ts        deployment environment and per-target work keys

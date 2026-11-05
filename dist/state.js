@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { mutexFor } from "./mutex.js";
 import { emptyUsage } from "./usage.js";
+import { emptyHealth } from "./health.js";
 export function emptyState() {
     return {
         version: 1,
@@ -34,7 +35,8 @@ export function emptyState() {
         },
         lastCycle: null,
         lastRun: null,
-        activePids: []
+        activePids: [],
+        health: emptyHealth()
     };
 }
 function todayKey(date = new Date()) {
@@ -46,7 +48,12 @@ export async function loadState(profilePaths) {
     try {
         const parsed = JSON.parse(await readFile(profilePaths.stateFile, "utf8"));
         const base = emptyState();
-        return { ...base, ...parsed, run: { ...base.run, ...(parsed.run ?? {}) } };
+        return {
+            ...base,
+            ...parsed,
+            run: { ...base.run, ...(parsed.run ?? {}) },
+            health: parsed.health ? { ...base.health, ...parsed.health, blockers: parsed.health.blockers ?? {} } : base.health
+        };
     }
     catch {
         return emptyState();
