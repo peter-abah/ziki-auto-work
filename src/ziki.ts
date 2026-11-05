@@ -41,23 +41,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function retryAfterMs(response: Response, attempt: number): number {
+function retryAfterMs(response: Response, attempt: number, maxMs = Infinity): number {
   const retry = response.headers.get("retry-after");
   if (retry) {
     const seconds = Number(retry);
-    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    if (Number.isFinite(seconds)) return Math.min(maxMs, Math.max(0, seconds * 1000));
     const date = Date.parse(retry);
-    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+    if (Number.isFinite(date)) return Math.min(maxMs, Math.max(0, date - Date.now()));
   }
   const reset = response.headers.get("ratelimit-reset");
   if (reset) {
     const value = Number(reset);
     if (Number.isFinite(value)) {
       const ms = value > 1e12 ? value - Date.now() : value * 1000 - Date.now();
-      if (ms > 0) return ms;
+      if (ms > 0) return Math.min(maxMs, ms);
     }
   }
-  return Math.min(60_000, 1000 * 2 ** attempt);
+  return Math.min(maxMs, 60_000, 1000 * 2 ** attempt);
 }
 
 export class ZikiClient {
@@ -103,6 +103,8 @@ export class ZikiClient {
       idempotencyKey?: string;
       raw?: boolean;
       retries?: number;
+      timeoutMs?: number;
+      maxRetryAfterMs?: number;
     } = {}
   ): Promise<T> {
     const url = this.url(pathname, options.query ?? {});
@@ -123,7 +125,7 @@ export class ZikiClient {
             ...(options.headers ?? {})
           },
           body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-          signal: AbortSignal.timeout(this.timeoutMs)
+          signal: AbortSignal.timeout(options.timeoutMs ?? this.timeoutMs)
         });
 
         if (response.status === 304 && options.raw) {
@@ -131,7 +133,7 @@ export class ZikiClient {
         }
 
         if ((response.status === 429 || response.status >= 500) && attempt < retries) {
-          await sleep(retryAfterMs(response, attempt));
+          await sleep(retryAfterMs(response, attempt, options.maxRetryAfterMs ?? Infinity));
           attempt += 1;
           continue;
         }
@@ -481,8 +483,14 @@ export class ZikiClient {
     return this.post(`/api/v1/offers/${offerId}/accept`, { query: { projectId: this.projectId } });
   }
 
-  heartbeat(idOrNumber: string | number): Promise<any> {
-    return this.post(`/api/v1/issues/${idOrNumber}/heartbeat`, { query: { projectId: this.projectId } });
+  heartbeat(
+    idOrNumber: string | number,
+    options: { timeoutMs?: number; retries?: number; maxRetryAfterMs?: number } = {}
+  ): Promise<any> {
+    return this.post(`/api/v1/issues/${idOrNumber}/heartbeat`, {
+      query: { projectId: this.projectId },
+      ...options
+    });
   }
 
   extend(idOrNumber: string | number, reason: string): Promise<any> {

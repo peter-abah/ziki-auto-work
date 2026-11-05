@@ -30,6 +30,7 @@ import { resolveCapacity } from "./capacity.js";
 import { mergeWorkItemFeeds } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import { deploymentEnvironment, workTargetKey } from "./work-key.js";
+import { applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue } from "./heartbeat.js";
 import { blockerId, classifyError, clearBlocker, healthLabel, nextRetryDelay, reportBlocker, summarizeHealth } from "./health.js";
 import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
@@ -1017,31 +1018,30 @@ async function loadPlatformSets(ctx) {
 }
 async function heartbeatPass(ctx) {
     const now = Date.now();
-    const live = Object.values(ctx.state.tasks).filter((task) => ["claimed", "working", "waiting_human", "delivered"].includes(task.status) ||
-        (task.status === "queued" && Boolean(task.claimId)));
-    for (const task of live) {
-        if (!task.agentName || !task.id)
-            continue;
-        const last = task.lastHeartbeatAt ? new Date(task.lastHeartbeatAt).getTime() : 0;
-        if (now - last < 10 * 60 * 1000)
-            continue;
+    const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now));
+    if (!live.length)
+        return;
+    const results = await Promise.allSettled(live.map(async (task) => {
         const agent = clientByName(ctx, task.agentName);
-        if (!agent)
+        if (!agent || !task.id)
+            throw new Error("agent key is not available");
+        await agent.client.heartbeat(task.id, { timeoutMs: 15_000, retries: 0, maxRetryAfterMs: 15_000 });
+        return { task, agent };
+    }));
+    for (let index = 0; index < results.length; index += 1) {
+        const task = live[index];
+        const result = results[index];
+        if (result.status === "fulfilled") {
+            applyHeartbeatSuccess(task, now);
+            ctx.logger.info(`Heartbeat #${task.number}`, { agent: result.value.agent.name });
             continue;
-        try {
-            await agent.client.heartbeat(task.id);
-            task.lastHeartbeatAt = new Date().toISOString();
-            ctx.logger.info(`Heartbeat #${task.number}`, { agent: agent.name });
         }
-        catch (error) {
-            ctx.logger.warn(`Heartbeat failed for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
-            if ([409, 410].includes(error.status ?? 0) && task.status !== "waiting_human") {
-                task.claimId = undefined;
-                if (task.status !== "delivered")
-                    task.status = "queued";
-                task.lastError = "claim lost";
-            }
-        }
+        const failure = applyHeartbeatFailure(task, result.reason, now);
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        ctx.logger.warn(`Heartbeat failed for #${task.number}: ${message}`, {
+            claimLost: failure.claimLost,
+            retryMinutes: failure.retryMs / 60_000
+        });
     }
 }
 async function withScratch(ctx, label, fn) {
@@ -1613,6 +1613,14 @@ async function processTestFix(ctx, item, preferred) {
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
     const issue = normalizeIssue(data);
     if (!issue?.pullRequestUrl) {
+        markRecent(ctx, item.key);
+        return;
+    }
+    const reviewable = issue.status === "done" ||
+        ["requires_review", "accepted"].includes(issue.substatus) ||
+        ["done", "accepted"].includes(issue.status);
+    if (!reviewable) {
+        ctx.logger.info(`Skipping review of #${issue.number}: it is ${issue.status}/${issue.substatus}, not awaiting review`);
         markRecent(ctx, item.key);
         return;
     }
