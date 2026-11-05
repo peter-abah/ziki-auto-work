@@ -178,6 +178,31 @@ export interface TokenUsage {
     estimated?: boolean;
 }
 export type ProviderLimit = "quota" | "rate-limit" | "context" | null;
+export type HealthSeverity = "warning" | "degraded" | "blocked";
+export type HealthComponent = "feed" | "inbox" | "platform" | "memory" | "provider" | "github" | "repo" | "config" | "agent" | "state";
+export interface HealthBlocker {
+    id: string;
+    component: HealthComponent;
+    code: string;
+    severity: HealthSeverity;
+    message: string;
+    agents?: string[];
+    details?: Record<string, unknown>;
+    since: string;
+    lastAttemptAt: string;
+    attempts: number;
+    nextRetryAt: string | null;
+    notifiedAt: string | null;
+}
+export interface LoopHealth {
+    state: "healthy" | "degraded" | "blocked";
+    blockers: Record<string, HealthBlocker>;
+    lastCheckAt: string | null;
+}
+export interface HealthSummary {
+    state: LoopHealth["state"];
+    blockers: HealthBlocker[];
+}
 export interface RunState {
     startedAt: string | null;
     limits: RunLimitConfig | null;
@@ -216,6 +241,7 @@ export interface RunSummary {
     }>;
     lastActivityAt: string | null;
     tokens: TokenUsage;
+    health?: HealthSummary;
 }
 export interface LastCycleSummary {
     at: string;
@@ -640,10 +666,11 @@ export interface State {
     lastCycle: LastCycleSummary | null;
     lastRun: RunSummary | null;
     activePids: number[];
+    health: LoopHealth;
 }
 export interface HistoryEntry {
     at: string;
-    type: "claim" | "bid" | "award" | "accept" | "delivery" | "review" | "merge_review" | "discovery" | "aux" | "escalation" | "failure" | "decision" | "unsupported" | "stop";
+    type: "claim" | "bid" | "award" | "accept" | "delivery" | "review" | "merge_review" | "discovery" | "aux" | "escalation" | "failure" | "decision" | "unsupported" | "health" | "stop";
     issue?: number | string | null;
     idea?: number | string | null;
     detail?: string;

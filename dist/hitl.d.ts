@@ -24,5 +24,6 @@ export declare function poll(client: ZikiClient, profile: ProfileConfig, profile
 }): Promise<{
     resolved: EscalationRecord[];
     inbox?: unknown;
+    errors: unknown[];
 }>;
 export declare function writeNeedsHuman(state: State, profile: ProfileConfig, profilePaths: ProfilePaths): Promise<void>;

@@ -3,6 +3,7 @@ import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "no
 import type { HistoryEntry, ProfilePaths, State, TaskState } from "./types.js";
 import { mutexFor } from "./mutex.js";
 import { emptyUsage } from "./usage.js";
+import { emptyHealth } from "./health.js";
 
 export function emptyState(): State {
   return {
@@ -36,7 +37,8 @@ export function emptyState(): State {
     },
     lastCycle: null,
     lastRun: null,
-    activePids: []
+    activePids: [],
+    health: emptyHealth()
   };
 }
 
@@ -49,7 +51,12 @@ export async function loadState(profilePaths: ProfilePaths): Promise<State> {
   try {
     const parsed = JSON.parse(await readFile(profilePaths.stateFile, "utf8")) as Partial<State>;
     const base = emptyState();
-    return { ...base, ...parsed, run: { ...base.run, ...(parsed.run ?? {}) } };
+    return {
+      ...base,
+      ...parsed,
+      run: { ...base.run, ...(parsed.run ?? {}) },
+      health: parsed.health ? { ...base.health, ...parsed.health, blockers: parsed.health.blockers ?? {} } : base.health
+    };
   } catch {
     return emptyState();
   }

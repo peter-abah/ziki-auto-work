@@ -232,6 +232,45 @@ export interface TokenUsage {
 
 export type ProviderLimit = "quota" | "rate-limit" | "context" | null;
 
+export type HealthSeverity = "warning" | "degraded" | "blocked";
+export type HealthComponent =
+  | "feed"
+  | "inbox"
+  | "platform"
+  | "memory"
+  | "provider"
+  | "github"
+  | "repo"
+  | "config"
+  | "agent"
+  | "state";
+
+export interface HealthBlocker {
+  id: string;
+  component: HealthComponent;
+  code: string;
+  severity: HealthSeverity;
+  message: string;
+  agents?: string[];
+  details?: Record<string, unknown>;
+  since: string;
+  lastAttemptAt: string;
+  attempts: number;
+  nextRetryAt: string | null;
+  notifiedAt: string | null;
+}
+
+export interface LoopHealth {
+  state: "healthy" | "degraded" | "blocked";
+  blockers: Record<string, HealthBlocker>;
+  lastCheckAt: string | null;
+}
+
+export interface HealthSummary {
+  state: LoopHealth["state"];
+  blockers: HealthBlocker[];
+}
+
 export interface RunState {
   startedAt: string | null;
   limits: RunLimitConfig | null;
@@ -266,6 +305,7 @@ export interface RunSummary {
   issues: Array<{ number: number | string; title?: string | null; status: string; pr?: string | null }>;
   lastActivityAt: string | null;
   tokens: TokenUsage;
+  health?: HealthSummary;
 }
 
 export interface LastCycleSummary {
@@ -700,6 +740,7 @@ export interface State {
   lastCycle: LastCycleSummary | null;
   lastRun: RunSummary | null;
   activePids: number[];
+  health: LoopHealth;
 }
 
 export interface HistoryEntry {
@@ -718,6 +759,7 @@ export interface HistoryEntry {
     | "failure"
     | "decision"
     | "unsupported"
+    | "health"
     | "stop";
   issue?: number | string | null;
   idea?: number | string | null;

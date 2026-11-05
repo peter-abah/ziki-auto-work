@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Mutex } from "./mutex.js";
-import { emptyState, saveState, setTask } from "./state.js";
+import { emptyState, loadState, saveState, setTask } from "./state.js";
 import type { ProfilePaths } from "./types.js";
 
 test("Mutex serializes concurrent work", async () => {
@@ -56,6 +56,22 @@ test("setTask mutations survive concurrent saves", async () => {
     };
     assert.equal(parsed.tasks["issue-1"]?.status, "working");
     assert.equal(parsed.tasks["issue-1"]?.agentName, "bot");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("empty state has healthy health and old state files load a default health block", async () => {
+  assert.equal(emptyState().health.state, "healthy");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "auto-work-health-"));
+  const profilePaths = { stateDir: dir, stateFile: path.join(dir, "state.json") } as ProfilePaths;
+  try {
+    await writeFile(profilePaths.stateFile, JSON.stringify({ version: 1, cycles: 3 }), "utf8");
+    const loaded = await loadState(profilePaths);
+    assert.equal(loaded.cycles, 3);
+    assert.equal(loaded.health.state, "healthy");
+    assert.deepEqual(loaded.health.blockers, {});
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

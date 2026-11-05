@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import type { ProfileConfig, ProfilePaths, RunSummary, State, StopReason } from "./types.js";
 import { inboxUrl } from "./urls.js";
 import { emptyUsage } from "./usage.js";
+import { summarizeHealth } from "./health.js";
 
 export function buildRunSummary(options: {
   state: State;
@@ -48,7 +49,8 @@ export function buildRunSummary(options: {
     needsYouLink: inboxUrl(profile),
     issues: touched,
     tokens: state.run.tokens ?? emptyUsage(),
-    lastActivityAt
+    lastActivityAt,
+    health: summarizeHealth(state.health)
   };
 }
 
@@ -80,6 +82,13 @@ export function formatRunSummary(summary: RunSummary, options: { files?: boolean
     `Tokens:        ${tokens.total.toLocaleString()} (${tokens.input.toLocaleString()} in / ${tokens.output.toLocaleString()} out)${tokens.estimated ? " estimated" : ""}${tokens.costUsd !== undefined ? ` · $${tokens.costUsd.toFixed(4)}` : ""}`
   );
   lines.push(`Interrupted:   ${summary.interrupted}`);
+  if (summary.health && summary.health.state !== "healthy") {
+    lines.push(`Health:        ${summary.health.state}`);
+    for (const blocker of summary.health.blockers.slice(0, 5)) {
+      const agents = blocker.agents?.length ? ` (${blocker.agents.join(", ")})` : "";
+      lines.push(`  - ${blocker.component}:${blocker.code} — ${blocker.message}${agents}`);
+    }
+  }
 
   const deliveries = summary.issues.filter((issue) => issue.status === "delivered");
   if (deliveries.length) {
