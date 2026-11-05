@@ -15,8 +15,8 @@
       "maxAuxPerCycle": null,
       "maxActiveClaims": "auto",
       "maxAttemptsPerTask": 3,
-        "maxNetworkRetries": 5,
-        "networkRetryMinutes": 1,
+      "maxNetworkRetries": 5,
+      "networkRetryMinutes": 1,
       "maxCyclesBeforeDiscovery": 6,
       "maxOpenEscalations": 5,
       "maxRuntimeMinutes": 120,
@@ -189,6 +189,7 @@
       "discovery": {
         "enabled": true,
         "parityFile": "examples/zedu-desktop/parity.md",
+        "focus": "Find real desktop gaps, mocks and cross-platform breakage.",
         "maxIdeasPerRun": 3,
         "maxCyclesBeforeRun": 6
       }

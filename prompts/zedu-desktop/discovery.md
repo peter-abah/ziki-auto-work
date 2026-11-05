@@ -15,9 +15,10 @@ web app (`zeduchat/zedu-fe`) and work correctly on every desktop platform.
 - Repo: `{{repoUrl}}`
 - Repo dir: `{{repoDir}}`
 - Checks: {{checks}}
-- Parity map:
+- Focus: {{focus}}
+- Parity map / project context:
 
-{{parity}}
+{{context}}
 
 - Durable context from Ziki:
 

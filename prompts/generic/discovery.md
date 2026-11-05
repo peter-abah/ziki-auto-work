@@ -11,9 +11,10 @@ not already tracked, and report them so the loop can fix them.
 - Repo dir: `{{repoDir}}`
 - Platform: `{{platform}}`
 - Checks: {{checks}}
-- Parity/context:
+- Focus: {{focus}}
+- Discovery context:
 
-{{parity}}
+{{context}}
 
 - Durable context from Ziki:
 
@@ -31,8 +32,9 @@ not already tracked, and report them so the loop can fix them.
 
 1. Read the repository's `AGENTS.md` and `CONTRIBUTING.md`, the parity map, and
    the project layout.
-2. Look for missing features, mocked or hardcoded behaviour, cross-platform
-   breakage, and real bugs you can point to in code or reproduce.
+2. Look for missing features, mocked or hardcoded behaviour, contract drift,
+   platform-specific breakage where relevant, and real bugs you can point to in
+   code or reproduce.
 3. Prefer issues small enough for one PR (≤5 files) with clear evidence.
 4. Find at most **{{maxIdeas}}** new ideas. Quality over quantity.
 5. For each idea, give concrete evidence: file paths and lines, the symptom, and

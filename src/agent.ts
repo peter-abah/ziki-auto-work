@@ -344,6 +344,8 @@ export async function runDiscovery(options: {
   memoryText: string;
   repoDir: string;
   parity: string;
+  context?: string;
+  focus?: string;
   existingIssues: string;
   existingIdeas?: string;
   maxIdeas: number;
@@ -352,7 +354,7 @@ export async function runDiscovery(options: {
   onExit?: (pid: number) => void;
 }): Promise<AgentResult> {
   const { profile, profilePaths, memoryText, repoDir, parity, existingIssues, maxIdeas, logger } = options;
-  const { resultPath, logPath } = resultPaths(profilePaths, "discovery", "parity");
+  const { resultPath, logPath } = resultPaths(profilePaths, "discovery", "run");
   const template = await loadPrompt(profile, "discovery");
   const prompt = render(template, {
     projectName: projectName(profile),
@@ -361,6 +363,8 @@ export async function runDiscovery(options: {
     repoDir,
     platform: profile.ziki.platform,
     parity,
+    context: options.context || parity,
+    focus: options.focus || "(none configured)",
     existingIssues,
     existingIdeas: options.existingIdeas || "(none)",
     maxIdeas,

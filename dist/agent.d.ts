@@ -43,6 +43,8 @@ export declare function runDiscovery(options: {
     memoryText: string;
     repoDir: string;
     parity: string;
+    context?: string;
+    focus?: string;
     existingIssues: string;
     existingIdeas?: string;
     maxIdeas: number;

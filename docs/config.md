@@ -76,7 +76,13 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "fixFailingChecks": true,
         "fixReviewComments": true
       },
-      "discovery": { "enabled": true, "parityFile": "PARITY.md", "maxIdeasPerRun": 3 },
+      "discovery": {
+        "enabled": true,
+        "focus": "Find real web correctness, contract-drift and missing-test gaps.",
+        "contextFiles": ["docs/ARCHITECTURE.md", "openapi.yaml"],
+        "maxIdeasPerRun": 3,
+        "maxCyclesBeforeRun": 60
+      },
       "workflow": {
         "maxFiles": 5,
         "maxLines": 400,
@@ -225,7 +231,23 @@ Issues already tagged with the platform are included regardless.
 
 ## discovery
 
-`enabled`, optional `parityFile`, `maxIdeasPerRun`, `maxCyclesBeforeRun`.
+Work discovery is a periodic ideation pass: the agent reads the repository,
+configured context files, existing Ziki issues/ideas and recent work, then files
+evidence-backed ideas. It does not claim, fix or review anything itself.
+
+- `enabled`: turn the pass on or off. New `init` profiles enable it by default;
+  `--no-discovery` disables it. It is no longer tied to `parityFile`.
+- `contextFiles`: optional list of docs/specs to read. Relative paths are tried
+  in the repo worktree, then the package root; absolute paths are used as-is.
+  Backend examples: `openapi.yaml`, `docs/ARCHITECTURE.md`,
+  `docs/DATABASE.md`.
+- `focus`: optional plain-language brief for what discovery should look for.
+- `parityFile`: optional, backward-compatible. It is just one context file,
+  useful for web-vs-desktop parity profiles. It is **not** required for
+  discovery.
+- `maxIdeasPerRun`, `maxCyclesBeforeRun`.
+- `alreadyVetted`, `vettedNote`: explicit owner-approved vetted ideas; see
+  below.
 
 ## providers
 

@@ -166,6 +166,8 @@ export interface PrTrackingConfig {
 export interface DiscoveryConfig {
   enabled: boolean;
   parityFile?: string;
+  contextFiles?: string[];
+  focus?: string;
   maxIdeasPerRun?: number;
   maxCyclesBeforeRun?: number;
   alreadyVetted?: boolean;

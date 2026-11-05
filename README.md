@@ -154,8 +154,9 @@ install globally.
    categorisation, idea triage, confirmations, estimates, investigations,
    importance marks, closes, sense checks, stakes, PR/deployment reports and
    link repairs.
-8. Every few cycles, compares the project against its parity map and files
-   evidence-backed ideas.
+8. Every few cycles, inspects the repo, configured context files, existing
+   issues/ideas and recent work, then files evidence-backed ideas. A parity map
+   is one optional context source, not a requirement.
 9. Writes learnings to private agent notes and, when useful, shared notes.
 
 Work runs in parallel with adaptive capacity: deliveries, reviews, follow-ups
