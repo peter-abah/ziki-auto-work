@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { contractKey, formatApiErrorDetails, recordRejected, repairApiBody, stripRejectedFields } from "./api-repair.js";
 export class ZikiError extends Error {
     status;
     body;
@@ -46,6 +47,8 @@ export class ZikiClient {
     projectSlug;
     agentName;
     timeoutMs;
+    contracts;
+    repair;
     constructor(options) {
         this.baseUrl = (options.baseUrl ?? "https://ziki.dev").replace(/\/$/, "");
         this.apiKey = options.apiKey;
@@ -53,6 +56,8 @@ export class ZikiClient {
         this.projectSlug = options.projectSlug;
         this.agentName = options.agentName ?? "agent";
         this.timeoutMs = options.timeoutMs ?? 60_000;
+        this.contracts = options.contracts;
+        this.repair = options.repair;
     }
     url(pathname, query = {}) {
         const url = new URL(`${this.baseUrl}${pathname.startsWith("/") ? pathname : `/${pathname}`}`);
@@ -64,6 +69,61 @@ export class ZikiClient {
         return url;
     }
     async request(method, pathname, options = {}) {
+        const key = contractKey(method, pathname);
+        let body = stripRejectedFields(options.body, this.contracts?.[key]?.rejected ?? []);
+        let deterministicRepairs = 0;
+        let agentRepairs = 0;
+        for (;;) {
+            try {
+                return await this.requestOnce(method, pathname, { ...options, body });
+            }
+            catch (error) {
+                if (!(error instanceof ZikiError))
+                    throw error;
+                if (deterministicRepairs < 2) {
+                    const repaired = repairApiBody(body, error.body);
+                    if (repaired?.changed) {
+                        body = repaired.body;
+                        if (this.contracts)
+                            recordRejected(this.contracts, key, repaired.rejected);
+                        deterministicRepairs += 1;
+                        continue;
+                    }
+                }
+                if (agentRepairs < 1 && this.repair && body !== undefined && [400, 422].includes(error.status)) {
+                    agentRepairs += 1;
+                    let repaired = null;
+                    try {
+                        repaired = await this.repair({
+                            method,
+                            path: pathname,
+                            status: error.status,
+                            body,
+                            errorBody: error.body,
+                            contractKey: key
+                        });
+                    }
+                    catch {
+                        repaired = null;
+                    }
+                    if (repaired?.body !== undefined) {
+                        body = repaired.body;
+                        continue;
+                    }
+                    if (repaired?.abandon) {
+                        throw new ZikiError(`${error.message} (repair abandoned: ${repaired.abandon})`, {
+                            status: error.status,
+                            body: error.body,
+                            method,
+                            path: pathname
+                        });
+                    }
+                }
+                throw error;
+            }
+        }
+    }
+    async requestOnce(method, pathname, options = {}) {
         const url = this.url(pathname, options.query ?? {});
         const retries = options.retries ?? 3;
         let attempt = 0;
@@ -104,7 +164,7 @@ export class ZikiClient {
                 if (!response.ok) {
                     const record = data;
                     const message = String(record?.message ?? record?.error ?? `HTTP ${response.status}`);
-                    throw new ZikiError(`${method} ${pathname} failed: ${message}`, {
+                    throw new ZikiError(`${method} ${pathname} failed: ${message}${formatApiErrorDetails(data)}`, {
                         status: response.status,
                         body: data,
                         method,
@@ -267,7 +327,6 @@ export class ZikiClient {
                 title: input.title,
                 summary: input.summary,
                 description: input.description,
-                platform: input.platform,
                 areaId: input.areaId,
                 typeId: input.typeId,
                 proofLinks: input.proofLinks,
@@ -570,13 +629,15 @@ export class ZikiClient {
         return this.get("/api/v1/agents/me/points");
     }
 }
-export function clientForAgent(agent, profile) {
+export function clientForAgent(agent, profile, options = {}) {
     return new ZikiClient({
         baseUrl: profile.ziki.baseUrl,
         apiKey: agent.key,
         projectId: profile.ziki.projectId,
         projectSlug: profile.ziki.projectSlug,
-        agentName: agent.name
+        agentName: agent.name,
+        contracts: options.contracts,
+        repair: options.repair
     });
 }
 export function normalizeIssue(data) {

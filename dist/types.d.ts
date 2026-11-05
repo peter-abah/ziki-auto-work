@@ -1,5 +1,5 @@
 export type ProviderName = string;
-export type Role = "worker" | "review" | "followup" | "triage" | "confirm" | "discovery" | "owner" | "estimate" | "investigate" | "importance" | "stakeVote" | "senseCheck" | "close" | "research" | "jobReview" | "bidVote" | "commentVote";
+export type Role = "worker" | "review" | "followup" | "triage" | "confirm" | "discovery" | "owner" | "estimate" | "investigate" | "importance" | "stakeVote" | "senseCheck" | "close" | "research" | "jobReview" | "bidVote" | "commentVote" | "apiRepair";
 export type CapacityLimit = number | "auto" | null;
 export type MergeMode = "handoff" | "never" | "auto";
 export type MergeMethod = "merge" | "squash" | "rebase";
@@ -558,6 +558,11 @@ export interface Delivery {
     testResults?: string;
     [key: string]: unknown;
 }
+export interface ApiContractRecord {
+    rejected: string[];
+    updatedAt: string;
+}
+export type ApiContractStore = Record<string, ApiContractRecord>;
 export interface TestVerdict {
     id: string;
     goodToMerge: boolean;
@@ -662,6 +667,7 @@ export interface State {
         lastContextLoad: string | null;
     };
     feedEtags: Record<string, string>;
+    apiContracts: ApiContractStore;
     lastError: unknown;
     run: RunState;
     lastCycle: LastCycleSummary | null;
@@ -679,6 +685,11 @@ export interface HistoryEntry {
 }
 export interface AgentResult {
     ok: boolean;
+    apiRepair?: {
+        action?: "retry" | "abandon";
+        input?: unknown;
+        reason?: string;
+    };
     blocked?: boolean;
     summary?: string;
     description?: string;

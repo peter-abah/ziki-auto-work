@@ -290,6 +290,51 @@ Do not leave \`{{...}}\` placeholders. The orchestrator will use \`prBody\` as-i
 `;
     return runAgent({ profile, profilePaths, role: "worker", prompt, cwd: worktree, resultPath, logPath, logger, onSpawn: options.onSpawn, onExit: options.onExit });
 }
+export async function runApiRepair(options) {
+    const { profile, profilePaths, context } = options;
+    const { resultPath, logPath } = resultPaths(profilePaths, "apiRepair", context.contractKey);
+    const prompt = [
+        "A Ziki API request failed validation. Repair the request payload and return JSON only.",
+        "",
+        `Operation: ${context.method} ${context.path}`,
+        `Status: ${context.status}`,
+        "",
+        "## Error body",
+        "```json",
+        JSON.stringify(context.errorBody, null, 2).slice(0, 6000),
+        "```",
+        "",
+        "## Attempted request body",
+        "```json",
+        JSON.stringify(context.body, null, 2).slice(0, 6000),
+        "```",
+        "",
+        "## Rules",
+        "- Preserve the user's intent and the operation.",
+        "- Remove or correct only the fields the API rejected.",
+        "- Do not invent endpoints, keys, secrets or unrelated fields.",
+        "- If the payload cannot be repaired safely, abandon it with a clear reason.",
+        "",
+        "Return exactly one JSON object, either:",
+        '{"ok":true,"apiRepair":{"action":"retry","input":{...}}}',
+        "or",
+        '{"ok":true,"apiRepair":{"action":"abandon","reason":"..."}}'
+    ].join("\n");
+    const result = await runAgent({
+        profile,
+        profilePaths,
+        role: "apiRepair",
+        prompt,
+        cwd: options.repoDir,
+        resultPath,
+        logPath,
+        logger: options.logger,
+        timeoutMs: 5 * 60_000,
+        onSpawn: options.onSpawn,
+        onExit: options.onExit
+    });
+    return result.apiRepair ? { ...result, ok: true, blocked: false } : result;
+}
 export async function runDiscovery(options) {
     const { profile, profilePaths, memoryText, repoDir, parity, existingIssues, maxIdeas, logger } = options;
     const { resultPath, logPath } = resultPaths(profilePaths, "discovery", "run");

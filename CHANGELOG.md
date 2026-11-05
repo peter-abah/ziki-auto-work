@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added an adaptive Ziki API layer. Validation failures now strip unknown or
+  rejected fields, repair oversized values, cache the learned contract per
+  endpoint, and retry. Full Ziki error details are logged instead of the opaque
+  `Invalid input.` message.
+- If deterministic repair cannot fix a `400`/`422`, an `apiRepair` agent gets
+  the operation, attempted payload and error body, and may return a corrected
+  payload or abandon the action with a reason.
+- Discovery now uses the live minimal create-idea payload (no unsupported
+  `platform` field) and sanitizes idea summaries to plain 20–300 character text.
+- Added tests for contract keys, unknown-field stripping, truncation, repair
+  callbacks, the minimal idea payload, and summary sanitization.
+
 - Failed work now releases its Ziki claim before being requeued or marked failed.
   Previously a retryable failure (notably “agent made no changes”) kept the
   claim, counted against `maxActiveClaims`, and could leave the loop idle with

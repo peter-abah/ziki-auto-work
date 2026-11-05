@@ -1,4 +1,4 @@
-import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, ProfileConfig, ResearchJob, Stake, TestVerdict, WorkFeed, WorkItem } from "./types.js";
+import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, ProfileConfig, ResearchJob, Stake, TestVerdict, WorkFeed, WorkItem, ApiContractStore } from "./types.js";
 export declare class ZikiError extends Error {
     status: number;
     body: unknown;
@@ -13,6 +13,19 @@ export declare class ZikiError extends Error {
         cause?: unknown;
     });
 }
+export interface ApiRepairContext {
+    method: string;
+    path: string;
+    status: number;
+    body: unknown;
+    errorBody: unknown;
+    contractKey: string;
+}
+export interface ApiRepairResult {
+    body?: unknown;
+    abandon?: string;
+}
+export type ApiRepairHandler = (context: ApiRepairContext) => Promise<ApiRepairResult | null>;
 export declare class ZikiClient {
     baseUrl: string;
     apiKey: string;
@@ -20,6 +33,8 @@ export declare class ZikiClient {
     projectSlug: string;
     agentName: string;
     timeoutMs: number;
+    contracts?: ApiContractStore;
+    repair?: ApiRepairHandler;
     constructor(options: {
         baseUrl?: string;
         apiKey: string;
@@ -27,6 +42,8 @@ export declare class ZikiClient {
         projectSlug: string;
         agentName?: string;
         timeoutMs?: number;
+        contracts?: ApiContractStore;
+        repair?: ApiRepairHandler;
     });
     private url;
     request<T = any>(method: string, pathname: string, options?: {
@@ -39,6 +56,7 @@ export declare class ZikiClient {
         timeoutMs?: number;
         maxRetryAfterMs?: number;
     }): Promise<T>;
+    private requestOnce;
     get<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     post<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     patch<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
@@ -110,7 +128,6 @@ export declare class ZikiClient {
         title: string;
         summary: string;
         description: string;
-        platform?: string;
         areaId?: string;
         typeId?: string;
         proofLinks?: string;
@@ -314,7 +331,10 @@ export declare class ZikiClient {
     }): Promise<any>;
     points(): Promise<any>;
 }
-export declare function clientForAgent(agent: AgentKey, profile: ProfileConfig): ZikiClient;
+export declare function clientForAgent(agent: AgentKey, profile: ProfileConfig, options?: {
+    contracts?: ApiContractStore;
+    repair?: ApiRepairHandler;
+}): ZikiClient;
 export declare function normalizeIssue(data: any): Issue | null;
 export declare function normalizeIdea(data: any): Idea | null;
 export declare function normalizeWorkItem(item: WorkItem): WorkItem;

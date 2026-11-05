@@ -13,8 +13,10 @@ import type {
   Stake,
   TestVerdict,
   WorkFeed,
-  WorkItem
+  WorkItem,
+  ApiContractStore
 } from "./types.js";
+import { contractKey, formatApiErrorDetails, recordRejected, repairApiBody, stripRejectedFields } from "./api-repair.js";
 
 export class ZikiError extends Error {
   status: number;
@@ -60,6 +62,22 @@ function retryAfterMs(response: Response, attempt: number, maxMs = Infinity): nu
   return Math.min(maxMs, 60_000, 1000 * 2 ** attempt);
 }
 
+export interface ApiRepairContext {
+  method: string;
+  path: string;
+  status: number;
+  body: unknown;
+  errorBody: unknown;
+  contractKey: string;
+}
+
+export interface ApiRepairResult {
+  body?: unknown;
+  abandon?: string;
+}
+
+export type ApiRepairHandler = (context: ApiRepairContext) => Promise<ApiRepairResult | null>;
+
 export class ZikiClient {
   baseUrl: string;
   apiKey: string;
@@ -67,6 +85,8 @@ export class ZikiClient {
   projectSlug: string;
   agentName: string;
   timeoutMs: number;
+  contracts?: ApiContractStore;
+  repair?: ApiRepairHandler;
 
   constructor(options: {
     baseUrl?: string;
@@ -75,6 +95,8 @@ export class ZikiClient {
     projectSlug: string;
     agentName?: string;
     timeoutMs?: number;
+    contracts?: ApiContractStore;
+    repair?: ApiRepairHandler;
   }) {
     this.baseUrl = (options.baseUrl ?? "https://ziki.dev").replace(/\/$/, "");
     this.apiKey = options.apiKey;
@@ -82,6 +104,8 @@ export class ZikiClient {
     this.projectSlug = options.projectSlug;
     this.agentName = options.agentName ?? "agent";
     this.timeoutMs = options.timeoutMs ?? 60_000;
+    this.contracts = options.contracts;
+    this.repair = options.repair;
   }
 
   private url(pathname: string, query: Record<string, unknown> = {}): URL {
@@ -94,6 +118,75 @@ export class ZikiClient {
   }
 
   async request<T = any>(
+    method: string,
+    pathname: string,
+    options: {
+      query?: Record<string, unknown>;
+      body?: unknown;
+      headers?: Record<string, string>;
+      idempotencyKey?: string;
+      raw?: boolean;
+      retries?: number;
+      timeoutMs?: number;
+      maxRetryAfterMs?: number;
+    } = {}
+  ): Promise<T> {
+    const key = contractKey(method, pathname);
+    let body = stripRejectedFields(options.body, this.contracts?.[key]?.rejected ?? []);
+    let deterministicRepairs = 0;
+    let agentRepairs = 0;
+
+    for (;;) {
+      try {
+        return await this.requestOnce<T>(method, pathname, { ...options, body });
+      } catch (error) {
+        if (!(error instanceof ZikiError)) throw error;
+
+        if (deterministicRepairs < 2) {
+          const repaired = repairApiBody(body, error.body);
+          if (repaired?.changed) {
+            body = repaired.body;
+            if (this.contracts) recordRejected(this.contracts, key, repaired.rejected);
+            deterministicRepairs += 1;
+            continue;
+          }
+        }
+
+        if (agentRepairs < 1 && this.repair && body !== undefined && [400, 422].includes(error.status)) {
+          agentRepairs += 1;
+          let repaired: ApiRepairResult | null = null;
+          try {
+            repaired = await this.repair({
+              method,
+              path: pathname,
+              status: error.status,
+              body,
+              errorBody: error.body,
+              contractKey: key
+            });
+          } catch {
+            repaired = null;
+          }
+          if (repaired?.body !== undefined) {
+            body = repaired.body;
+            continue;
+          }
+          if (repaired?.abandon) {
+            throw new ZikiError(`${error.message} (repair abandoned: ${repaired.abandon})`, {
+              status: error.status,
+              body: error.body,
+              method,
+              path: pathname
+            });
+          }
+        }
+
+        throw error;
+      }
+    }
+  }
+
+  private async requestOnce<T = any>(
     method: string,
     pathname: string,
     options: {
@@ -151,7 +244,7 @@ export class ZikiClient {
         if (!response.ok) {
           const record = data as Record<string, unknown> | null;
           const message = String(record?.message ?? record?.error ?? `HTTP ${response.status}`);
-          throw new ZikiError(`${method} ${pathname} failed: ${message}`, {
+          throw new ZikiError(`${method} ${pathname} failed: ${message}${formatApiErrorDetails(data)}`, {
             status: response.status,
             body: data,
             method,
@@ -337,7 +430,6 @@ export class ZikiClient {
     title: string;
     summary: string;
     description: string;
-    platform?: string;
     areaId?: string;
     typeId?: string;
     proofLinks?: string;
@@ -354,7 +446,6 @@ export class ZikiClient {
         title: input.title,
         summary: input.summary,
         description: input.description,
-        platform: input.platform,
         areaId: input.areaId,
         typeId: input.typeId,
         proofLinks: input.proofLinks,
@@ -776,13 +867,19 @@ export class ZikiClient {
   }
 }
 
-export function clientForAgent(agent: AgentKey, profile: ProfileConfig): ZikiClient {
+export function clientForAgent(
+  agent: AgentKey,
+  profile: ProfileConfig,
+  options: { contracts?: ApiContractStore; repair?: ApiRepairHandler } = {}
+): ZikiClient {
   return new ZikiClient({
     baseUrl: profile.ziki.baseUrl,
     apiKey: agent.key,
     projectId: profile.ziki.projectId,
     projectSlug: profile.ziki.projectSlug,
-    agentName: agent.name
+    agentName: agent.name,
+    contracts: options.contracts,
+    repair: options.repair
   });
 }
 

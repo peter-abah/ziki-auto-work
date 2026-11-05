@@ -51,7 +51,7 @@ import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
 import type { TaskKind } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
-import type { ZikiClient } from "./ziki.js";
+import type { ApiRepairContext, ApiRepairResult, ZikiClient } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import type { PrComment } from "./github.js";
 import { formatPrContext } from "./pr-context.js";
@@ -62,6 +62,7 @@ import { prepareWorktree, prepareReviewWorktree, cleanupWorktree } from "./workt
 import {
   runWorker,
   runDiscovery,
+  runApiRepair,
   runReview,
   runFollowUp,
   runConfirm,
@@ -117,6 +118,7 @@ import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./vot
 import type { Capacity } from "./capacity.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
 import { formatLoopContext } from "./loop-context.js";
+import { sanitizeIdeaSummary } from "./idea-input.js";
 import type { LoopContextInput } from "./loop-context.js";
 import type { GitHubPrStatus, PrComment as PrReviewComment } from "./github.js";
 import type { OwnerDecision } from "./types.js";
@@ -3436,13 +3438,10 @@ async function discoveryPass(ctx: Context): Promise<void> {
   const ideas = (result.ideas ?? []).slice(0, ctx.profile.discovery.maxIdeasPerRun ?? 3);
   for (const idea of ideas) {
     if (!idea?.title || !idea?.description) continue;
-    let summary = idea.summary || idea.title;
-    if (summary.length < 20) summary = `${summary} — platform parity gap.`;
     const baseInput = {
       title: idea.title.slice(0, 200),
-      summary: summary.slice(0, 300),
+      summary: sanitizeIdeaSummary(idea.summary, idea.title),
       description: idea.description.slice(0, 5000),
-      platform: ctx.profile.ziki.platform,
       idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
       acknowledgeSimilar: false
     };
@@ -4003,8 +4002,23 @@ async function createContext(
   options: { dryRun: boolean; runLimits: RunLimitConfig }
 ): Promise<Context> {
   const { profile, profileName, keys } = loaded;
+  const repair = async (context: ApiRepairContext): Promise<ApiRepairResult | null> => {
+    if (options.dryRun) return null;
+    const result = await runApiRepair({
+      profile,
+      profilePaths: loaded.profilePaths,
+      repoDir: path.join(loaded.profilePaths.reposDir, "repo"),
+      context,
+      logger
+    });
+    const repaired = result.apiRepair;
+    if (!result.ok || !repaired) return null;
+    if (repaired.action === "abandon") return { abandon: repaired.reason ?? "agent abandoned the repair" };
+    if (repaired.action === "retry" && repaired.input !== undefined) return { body: repaired.input };
+    return null;
+  };
   const toClients = (agents: AgentKey[]): AgentClient[] =>
-    agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile) }));
+    agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile, { contracts: state.apiContracts, repair }) }));
   const clients = {
     workers: toClients(keys.workers),
     managers: toClients(keys.managers)

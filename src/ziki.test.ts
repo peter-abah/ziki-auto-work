@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ZikiClient } from "./ziki.js";
+import type { ApiContractStore } from "./types.js";
 
 interface Call {
   method: string;
@@ -107,4 +108,83 @@ test("convertIdea sends a valid JSON body", async () => {
   const { client, calls } = fakeClient();
   await client.convertIdea("idea_1");
   assert.deepEqual(calls[0]!.body, {});
+});
+
+test("createIdea does not send unsupported platform metadata", async () => {
+  const { client, calls } = fakeClient();
+  await client.createIdea({
+    title: "Desktop search is decorative",
+    summary: "The top search bar is a static decoration with no input or tap handler.",
+    description: "The search container has no TextField or gesture handler."
+  });
+  const body = calls[0]!.body as Record<string, unknown>;
+  assert.equal("platform" in body, false);
+});
+
+test("unknown validation fields are dropped, recorded and retried", async () => {
+  const calls: unknown[] = [];
+  let call = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = init?.body ? JSON.parse(String(init.body)) : null;
+    calls.push(body);
+    call += 1;
+    if (call === 1) {
+      return new Response(
+        JSON.stringify({
+          error: "invalid_request",
+          message: "Invalid input.",
+          details: [{ code: "unrecognized_keys", keys: ["platform"], path: [] }]
+        }),
+        { status: 422, headers: { "content-type": "application/json" } }
+      );
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  const contracts: ApiContractStore = {};
+  const client = new ZikiClient({
+    baseUrl: "https://ziki.test",
+    apiKey: "key",
+    projectId: "project_1",
+    projectSlug: "demo",
+    agentName: "agent",
+    contracts
+  });
+  await client.post("/api/v1/ideas", { body: { title: "x", platform: "desktop" } });
+  assert.deepEqual(calls[0], { title: "x", platform: "desktop" });
+  assert.deepEqual(calls[1], { title: "x" });
+  assert.deepEqual(contracts["POST /api/v1/ideas"]?.rejected, ["platform"]);
+
+  await client.post("/api/v1/ideas", { body: { title: "y", platform: "desktop" } });
+  assert.deepEqual(calls[2], { title: "y" });
+});
+
+test("an agent repair callback can correct an otherwise rejected payload", async () => {
+  const calls: unknown[] = [];
+  let call = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = init?.body ? JSON.parse(String(init.body)) : null;
+    calls.push(body);
+    call += 1;
+    if (call === 1) {
+      return new Response(
+        JSON.stringify({
+          error: "invalid_request",
+          message: "Invalid input.",
+          details: [{ code: "too_small", path: ["summary"], message: "Summary is too short." }]
+        }),
+        { status: 422, headers: { "content-type": "application/json" } }
+      );
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  const client = new ZikiClient({
+    baseUrl: "https://ziki.test",
+    apiKey: "key",
+    projectId: "project_1",
+    projectSlug: "demo",
+    agentName: "agent",
+    repair: async () => ({ body: { title: "x", summary: "A sufficiently detailed summary for the API." } })
+  });
+  await client.post("/api/v1/ideas", { body: { title: "x", summary: "short" } });
+  assert.deepEqual(calls[1], { title: "x", summary: "A sufficiently detailed summary for the API." });
 });

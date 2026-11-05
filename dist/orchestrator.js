@@ -13,7 +13,7 @@ import { loadDiscoveryContext } from "./discovery-context.js";
 import { actionablePrComments } from "./pr-comments.js";
 import { preparePrBody } from "./pr-body.js";
 import { prepareWorktree, prepareReviewWorktree, cleanupWorktree } from "./worktree.js";
-import { runWorker, runDiscovery, runReview, runFollowUp, runConfirm, runTriage, runOwner, runEstimate, runInvestigate, runImportance, runStakeVote, runSenseCheck, runClose, runResearch, runJobReview, runBidVote, runCommentVote, killActiveAgents } from "./agent.js";
+import { runWorker, runDiscovery, runApiRepair, runReview, runFollowUp, runConfirm, runTriage, runOwner, runEstimate, runInvestigate, runImportance, runStakeVote, runSenseCheck, runClose, runResearch, runJobReview, runBidVote, runCommentVote, killActiveAgents } from "./agent.js";
 import { killProcessTree } from "./platform/process.js";
 import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memory.js";
 import { escalate, poll, writeNeedsHuman } from "./hitl.js";
@@ -39,6 +39,7 @@ import { blockerId, classifyError, clearBlocker, healthLabel, nextRetryDelay, re
 import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
 import { formatLoopContext } from "./loop-context.js";
+import { sanitizeIdeaSummary } from "./idea-input.js";
 const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
 const TERMINAL = new Set(["resolved", "closed"]);
 function setPhase(ctx, phase, activity = null) {
@@ -3121,14 +3122,10 @@ async function discoveryPass(ctx) {
     for (const idea of ideas) {
         if (!idea?.title || !idea?.description)
             continue;
-        let summary = idea.summary || idea.title;
-        if (summary.length < 20)
-            summary = `${summary} — platform parity gap.`;
         const baseInput = {
             title: idea.title.slice(0, 200),
-            summary: summary.slice(0, 300),
+            summary: sanitizeIdeaSummary(idea.summary, idea.title),
             description: idea.description.slice(0, 5000),
-            platform: ctx.profile.ziki.platform,
             idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
             acknowledgeSimilar: false
         };
@@ -3671,7 +3668,26 @@ function dispatch(ctx) {
 }
 async function createContext(loaded, state, logger, options) {
     const { profile, profileName, keys } = loaded;
-    const toClients = (agents) => agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile) }));
+    const repair = async (context) => {
+        if (options.dryRun)
+            return null;
+        const result = await runApiRepair({
+            profile,
+            profilePaths: loaded.profilePaths,
+            repoDir: path.join(loaded.profilePaths.reposDir, "repo"),
+            context,
+            logger
+        });
+        const repaired = result.apiRepair;
+        if (!result.ok || !repaired)
+            return null;
+        if (repaired.action === "abandon")
+            return { abandon: repaired.reason ?? "agent abandoned the repair" };
+        if (repaired.action === "retry" && repaired.input !== undefined)
+            return { body: repaired.input };
+        return null;
+    };
+    const toClients = (agents) => agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile, { contracts: state.apiContracts, repair }) }));
     const clients = {
         workers: toClients(keys.workers),
         managers: toClients(keys.managers)
