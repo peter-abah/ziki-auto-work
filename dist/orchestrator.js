@@ -18,6 +18,9 @@ import { killProcessTree } from "./platform/process.js";
 import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memory.js";
 import { escalate, poll, writeNeedsHuman } from "./hitl.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
+import { rotatedKinds } from "./fair-queue.js";
+import { countGoodVerdicts, reviewGate, verdictsNeeded } from "./review-gate.js";
+import { errorMessage, isNoopZikiError, NOOP_PATTERNS } from "./noop.js";
 import { scanSecrets, protectedFiles } from "./checks.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
@@ -502,8 +505,8 @@ function agentHooks(ctx) {
 function counter(ctx) {
     return counterFor(ctx.state);
 }
-function markRecent(ctx, key) {
-    ctx.state.recentFeedKeys[key] = Date.now();
+function markRecent(ctx, key, ms = 30 * 60_000) {
+    ctx.state.recentFeedKeys[key] = Date.now() - (30 * 60_000 - ms);
 }
 function history(ctx, entry) {
     void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => { });
@@ -1677,17 +1680,36 @@ async function processTestFix(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return;
     }
+    const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
+    let goodVerdicts = 0;
+    try {
+        const tests = await ctx.primary.client.listTestResults(issue.id);
+        goodVerdicts = countGoodVerdicts(tests.verdicts ?? []);
+    }
+    catch {
+        goodVerdicts = 0;
+    }
+    const gate = reviewGate({
+        status,
+        goodVerdicts,
+        verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow)
+    });
+    if (!gate.ok || !status) {
+        ctx.logger.info(`Skipping review of #${issue.number}: ${gate.reason}`);
+        history(ctx, { type: "decision", issue: issue.number, detail: `review skipped: ${gate.reason}` });
+        markRecent(ctx, item.key, gate.recentMs);
+        return;
+    }
     const holder = issue.holder?.agentName ?? null;
     const reviewer = preferred ?? pickWorker(ctx, [holder ?? ""]) ?? pickManager(ctx, [holder ?? ""]);
     if (!reviewer) {
         markRecent(ctx, item.key);
         return;
     }
-    const status = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
     const reviewComments = (await ctx.github.prReviewComments(issue.pullRequestUrl).catch(() => []))
         .map((comment) => ({ ...comment, kind: "review" }));
-    const checkLogs = status ? await ctx.github.failedCheckLogs(status).catch(() => []) : [];
-    const prContext = status ? formatPrContext(status, reviewComments, checkLogs) : "(PR status unavailable)";
+    const checkLogs = await ctx.github.failedCheckLogs(status).catch(() => []);
+    const prContext = formatPrContext(status, reviewComments, checkLogs);
     const issueContext = (issue.comments ?? [])
         .slice(-10)
         .map((comment) => `- ${comment.authorName ?? comment.by ?? "someone"}: ${comment.body}`)
@@ -1723,13 +1745,24 @@ async function processTestFix(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return;
     }
-    await reviewer.client.submitTestResult(issue.id, {
-        goodToMerge: result.goodToMerge === true,
-        summary: result.summary ?? (result.goodToMerge ? "Good to merge." : "Not good to merge."),
-        description: result.description ?? "",
-        files: fileEvidence(result.files),
-        headSha: result.headSha ?? issue.pullRequestHeadSha ?? undefined
-    });
+    try {
+        await reviewer.client.submitTestResult(issue.id, {
+            goodToMerge: result.goodToMerge === true,
+            summary: result.summary ?? (result.goodToMerge ? "Good to merge." : "Not good to merge."),
+            description: result.description ?? "",
+            files: fileEvidence(result.files),
+            headSha: result.headSha ?? issue.pullRequestHeadSha ?? undefined
+        });
+    }
+    catch (error) {
+        if (isNoopZikiError(error, NOOP_PATTERNS.review)) {
+            ctx.logger.info(`Review of #${issue.number} is no longer needed: ${errorMessage(error)}`);
+            history(ctx, { type: "decision", issue: issue.number, detail: `review skipped: ${errorMessage(error)}` });
+            markRecent(ctx, item.key);
+            return;
+        }
+        throw error;
+    }
     counter(ctx).reviews += 1;
     ctx.state.run.reviews += 1;
     ctx.cycleStats.reviews += 1;
@@ -2320,7 +2353,22 @@ async function processOpenIssue(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
+    if (issue.status !== "requires_confirmation" && issue.substatus !== "requires_confirmation") {
+        history(ctx, { type: "decision", issue: issue.number, detail: "open skipped: issue is not awaiting confirmation" });
+        markRecent(ctx, item.key);
+        return false;
+    }
+    try {
+        await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
+    }
+    catch (error) {
+        if (isNoopZikiError(error, NOOP_PATTERNS.open)) {
+            history(ctx, { type: "decision", issue: issue.number, detail: `open skipped: ${errorMessage(error)}` });
+            markRecent(ctx, item.key);
+            return false;
+        }
+        throw error;
+    }
     history(ctx, { type: "aux", issue: issue.number, detail: "opened issue" });
     markRecent(ctx, item.key);
     return true;
@@ -2346,7 +2394,17 @@ async function processReclaim(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
+    try {
+        await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
+    }
+    catch (error) {
+        if (isNoopZikiError(error, NOOP_PATTERNS.reclaim)) {
+            history(ctx, { type: "decision", issue: issue.number, detail: `reclaim skipped: ${errorMessage(error)}` });
+            markRecent(ctx, item.key);
+            return false;
+        }
+        throw error;
+    }
     history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed stale work" });
     markRecent(ctx, item.key);
     return true;
@@ -2840,7 +2898,17 @@ async function processReviewIdle(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    await manager.client.reclaim(issue.id);
+    try {
+        await manager.client.reclaim(issue.id);
+    }
+    catch (error) {
+        if (isNoopZikiError(error, NOOP_PATTERNS.reclaim)) {
+            history(ctx, { type: "decision", issue: issue.number, detail: `idle reclaim skipped: ${errorMessage(error)}` });
+            markRecent(ctx, item.key);
+            return false;
+        }
+        throw error;
+    }
     history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed idle work" });
     markRecent(ctx, item.key);
     return true;
@@ -3465,7 +3533,13 @@ function dispatch(ctx) {
     const capacity = ctx.capacity;
     ctx.auxThisCycle = 0;
     reportUnsupported(ctx);
-    if (pool.canStart("owner")) {
+    let discoveryPending = discoveryDue(ctx) && !pool.has("discovery");
+    if (discoveryPending && pool.canStart("discovery")) {
+        pool.reserve("discovery", "discovery", () => discoveryPass(ctx), "discovery");
+        discoveryPending = false;
+    }
+    const canStart = (kind) => pool.canStart(kind) && pool.total() + (discoveryPending ? 1 : 0) < pool.limits.agents;
+    if (canStart("owner")) {
         const pair = nextDispatch(ctx, ctx.queue?.owner);
         if (pair) {
             const target = itemTargetKey(pair.item);
@@ -3482,7 +3556,7 @@ function dispatch(ctx) {
             }, `owner ${truncate(pair.item.title, 40)}`, pair.agent.name);
         }
     }
-    while (pool.canStart("followup")) {
+    while (canStart("followup")) {
         const task = Object.values(ctx.state.tasks).find((entry) => {
             if (!prFollowUpDue(ctx, entry))
                 return false;
@@ -3508,7 +3582,7 @@ function dispatch(ctx) {
         }, followUpLabel(task), task.agentName);
     }
     const maxClaims = Math.min(capacity.activeClaims, zikiClaimLimit(ctx) ?? capacity.activeClaims);
-    while (pool.canStart("delivery") && pool.count("delivery") < capacity.delivery) {
+    while (canStart("delivery") && pool.count("delivery") < capacity.delivery) {
         if (!underCap(counter(ctx).deliveries, limits.maxDeliveriesPerDay))
             break;
         if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal)
@@ -3530,7 +3604,7 @@ function dispatch(ctx) {
             }
         }, taskLabel(pair.item), pair.agent.name);
     }
-    while (pool.canStart("review") && pool.count("review") < capacity.review) {
+    while (canStart("review") && pool.count("review") < capacity.review) {
         if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay))
             break;
         const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
@@ -3549,10 +3623,17 @@ function dispatch(ctx) {
             }
         }, kindLabel(pair.item, "review"), pair.agent.name);
     }
-    while (pool.canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
-        const pair = nextDispatch(ctx, ctx.queue?.aux);
+    while (canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
+        const entries = ctx.queue?.aux ?? [];
+        let pair = null;
+        for (const kind of rotatedKinds(entries, ctx.auxLastKind)) {
+            pair = nextDispatch(ctx, entries.filter((entry) => entry.kind === kind));
+            if (pair)
+                break;
+        }
         if (!pair)
             break;
+        ctx.auxLastKind = pair.item.kind;
         ctx.auxThisCycle += 1;
         const target = itemTargetKey(pair.item);
         ctx.reservedAgents.add(pair.agent.name);
@@ -3567,9 +3648,6 @@ function dispatch(ctx) {
                 ctx.reservedTargets.delete(target);
             }
         }, kindLabel(pair.item, "aux"), pair.agent.name);
-    }
-    if (pool.canStart("discovery") && discoveryDue(ctx) && !pool.has("discovery")) {
-        pool.reserve("discovery", "discovery", () => discoveryPass(ctx), "discovery");
     }
 }
 function underCap(value, cap) {
@@ -3640,6 +3718,7 @@ async function createContext(loaded, state, logger, options) {
         mutex: new Mutex(),
         runLimits: options.runLimits,
         auxThisCycle: 0,
+        auxLastKind: null,
         reservedAgents: new Set(),
         cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 },
         lastNeedsYouCount: null,

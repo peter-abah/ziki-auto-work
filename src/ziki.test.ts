@@ -102,3 +102,9 @@ test("createIdea sends alreadyVetted only when given", async () => {
   const plain = calls[1]!.body as Record<string, unknown>;
   assert.equal("alreadyVetted" in plain, false);
 });
+
+test("convertIdea sends a valid JSON body", async () => {
+  const { client, calls } = fakeClient();
+  await client.convertIdea("idea_1");
+  assert.deepEqual(calls[0]!.body, {});
+});

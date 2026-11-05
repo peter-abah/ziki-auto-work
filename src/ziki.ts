@@ -410,7 +410,7 @@ export class ZikiClient {
   }
 
   convertIdea(idOrNumber: string | number): Promise<any> {
-    return this.post(`/api/v1/ideas/${idOrNumber}/convert`, { query: { projectId: this.projectId } });
+    return this.post(`/api/v1/ideas/${idOrNumber}/convert`, { query: { projectId: this.projectId }, body: {} });
   }
 
   rejectIdea(idOrNumber: string | number, body: Record<string, unknown> = {}): Promise<any> {

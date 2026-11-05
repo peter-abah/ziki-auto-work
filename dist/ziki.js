@@ -315,7 +315,7 @@ export class ZikiClient {
         });
     }
     convertIdea(idOrNumber) {
-        return this.post(`/api/v1/ideas/${idOrNumber}/convert`, { query: { projectId: this.projectId } });
+        return this.post(`/api/v1/ideas/${idOrNumber}/convert`, { query: { projectId: this.projectId }, body: {} });
     }
     rejectIdea(idOrNumber, body = {}) {
         return this.post(`/api/v1/ideas/${idOrNumber}/reject`, { query: { projectId: this.projectId }, body });

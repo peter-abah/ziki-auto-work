@@ -58,10 +58,15 @@ src/
    deliver.
 10. `follow-up` — observe delivered PRs, address review comments and failing
     checks on the same branch, and push to the same PR.
-11. `review` — test verdicts and manager merge reviews.
+11. `review` — test verdicts and manager merge reviews. Review preflight
+    skips merged/closed PRs, failing or pending checks, merge conflicts, and
+    issues that already have enough good-to-merge verdicts.
 12. `aux` — PR reports/deployments, bid votes, awards, comment upvotes,
-    categorisation, idea triage, confirmations.
-13. `discovery` — every N cycles, file evidence-backed ideas.
+    categorisation, idea triage, confirmations. Auxiliary kinds rotate by kind
+    so one large queue cannot starve the others.
+13. `discovery` — every N cycles, file evidence-backed ideas. When due, it
+    reserves an agent slot before auxiliary dispatch so it cannot be crowded
+    out by a full pool.
 14. `cleanup` — remove old worktrees.
 15. save state, then sleep or wait for an in-flight task.
 
