@@ -5,17 +5,13 @@ import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.
 import { PROVIDER_IDS } from "./providers/index.js";
 export const PROVIDERS = PROVIDER_IDS;
 export const DEFAULT_LIMITS = {
-    maxDeliveriesPerDay: null,
-    maxReviewsPerDay: null,
-    maxDiscoveriesPerDay: null,
-    maxAuxPerCycle: null,
     maxActiveClaims: "auto",
-    maxAttemptsPerTask: 3,
+    maxAttemptsPerTask: null,
     maxNetworkRetries: 5,
     networkRetryMinutes: 1,
     maxCyclesBeforeDiscovery: 6,
-    maxOpenEscalations: 5,
-    maxRuntimeMinutes: 120,
+    maxOpenEscalations: null,
+    maxRuntimeMinutes: null,
     maxCycles: null,
     stopAt: null,
     maxDeliveriesTotal: null,
@@ -30,7 +26,7 @@ export const DEFAULT_LIMITS = {
     providerRetryMinutes: 15
 };
 export const DEFAULT_RUN_LIMITS = {
-    maxRuntimeMinutes: 120,
+    maxRuntimeMinutes: null,
     maxCycles: null,
     stopAt: null,
     maxDeliveriesTotal: null
@@ -297,10 +293,6 @@ export function validateConfig(config) {
         }
         else {
             const capacityKeys = [
-                "maxDeliveriesPerDay",
-                "maxReviewsPerDay",
-                "maxDiscoveriesPerDay",
-                "maxAuxPerCycle",
                 "maxActiveClaims",
                 "maxConcurrentDeliveries",
                 "maxConcurrentFollowUps",

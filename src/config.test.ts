@@ -294,7 +294,9 @@ test("providers build the right commands", () => {
 });
 
 test("run limits and concurrency have working defaults", () => {
-  assert.equal(DEFAULT_LIMITS.maxRuntimeMinutes, 120);
+  assert.equal(DEFAULT_LIMITS.maxRuntimeMinutes, null);
+  assert.equal(DEFAULT_LIMITS.maxAttemptsPerTask, null);
+  assert.equal(DEFAULT_LIMITS.maxOpenEscalations, null);
   assert.equal(DEFAULT_LIMITS.maxCycles, null);
   assert.equal(DEFAULT_LIMITS.maxConcurrentDeliveries, "auto");
   assert.equal(DEFAULT_LIMITS.maxConcurrentReviews, "auto");
@@ -302,10 +304,6 @@ test("run limits and concurrency have working defaults", () => {
   assert.equal(DEFAULT_LIMITS.maxConcurrentFollowUps, "auto");
   assert.equal(DEFAULT_LIMITS.maxConcurrentAgents, "auto");
   assert.equal(DEFAULT_LIMITS.maxActiveClaims, "auto");
-  assert.equal(DEFAULT_LIMITS.maxDeliveriesPerDay, null);
-  assert.equal(DEFAULT_LIMITS.maxReviewsPerDay, null);
-  assert.equal(DEFAULT_LIMITS.maxAuxPerCycle, null);
-  assert.equal(DEFAULT_LIMITS.maxDiscoveriesPerDay, null);
   assert.equal(DEFAULT_LIMITS.maxTokensPerRun, null);
   assert.equal(DEFAULT_LIMITS.tokenWarnPercent, 80);
   assert.equal(DEFAULT_LIMITS.providerRetryMinutes, 15);
@@ -321,11 +319,11 @@ test("validateConfig allows working-only profiles and warns", () => {
 });
 
 test("deepMerge keeps limit defaults when a profile overrides one field", () => {
-  const merged = deepMerge({ limits: { ...DEFAULT_LIMITS } }, { limits: { maxDeliveriesPerDay: 3 } }) as {
+  const merged = deepMerge({ limits: { ...DEFAULT_LIMITS } }, { limits: { maxCycles: 3 } }) as {
     limits: typeof DEFAULT_LIMITS;
   };
-  assert.equal(merged.limits.maxDeliveriesPerDay, 3);
-  assert.equal(merged.limits.maxRuntimeMinutes, 120);
+  assert.equal(merged.limits.maxCycles, 3);
+  assert.equal(merged.limits.maxRuntimeMinutes, null);
 });
 
 test("workflow defaults are present and validated", () => {

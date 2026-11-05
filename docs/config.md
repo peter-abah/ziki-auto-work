@@ -93,17 +93,13 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "autoUpvoteComments": "agent"
       },
       "limits": {
-        "maxDeliveriesPerDay": null,
-        "maxReviewsPerDay": null,
-        "maxDiscoveriesPerDay": null,
-        "maxAuxPerCycle": null,
         "maxActiveClaims": "auto",
-        "maxAttemptsPerTask": 3,
+        "maxAttemptsPerTask": null,
         "maxNetworkRetries": 5,
         "networkRetryMinutes": 1,
         "maxCyclesBeforeDiscovery": 6,
-        "maxOpenEscalations": 5,
-        "maxRuntimeMinutes": 120,
+        "maxOpenEscalations": null,
+        "maxRuntimeMinutes": null,
         "maxCycles": null,
         "stopAt": null,
         "maxDeliveriesTotal": null,
@@ -279,15 +275,21 @@ The worker prompt receives these as `{{workflowRules}}`, plus
 
 ## limits
 
-Daily caps, active claims, retry attempts, discovery cadence and open
-escalation cap.
+Active claims, retry attempts, discovery cadence and optional open
+escalation cap. There are no daily work caps.
 
 Run limits:
 
-- `maxRuntimeMinutes`: default 120; `null` disables the time limit.
+- `maxRuntimeMinutes`: `null` by default; set a value or pass `--max-runtime` to impose a time limit.
 - `maxCycles`: stop after N cycles **in the current run**; `null` disables. The loop keeps a separate cumulative cycle counter for status/reporting.
 - `stopAt`: ISO timestamp deadline; `null` disables.
 - `maxDeliveriesTotal`: stop after N deliveries in this run; `null` disables.
+
+Retries and escalations:
+
+- `maxAttemptsPerTask`: `null` by default; a number caps task retries.
+- `maxOpenEscalations`: `null` by default; a number caps open escalations.
+- `maxNetworkRetries`: transient network retry attempts (default 5).
 
 Token limits:
 
@@ -298,13 +300,6 @@ Token limits:
 These can be overridden per start with `--max-runtime`, `--max-cycles`,
 `--until`, `--max-deliveries`, or `--forever`.
 
-Work caps (defaults deliberately unbounded; set a number to impose a cap):
-
-- `maxDeliveriesPerDay`: `null` by default (no artificial daily cap).
-- `maxReviewsPerDay`: `null` by default.
-- `maxDiscoveriesPerDay`: `null` by default.
-- `maxAuxPerCycle`: `null` by default.
-
 Concurrency accepts a number, `"auto"`, or `null`:
 
 - `maxConcurrentDeliveries` (default `"auto"`): workers available, bounded by `maxConcurrentAgents`.
@@ -312,7 +307,7 @@ Concurrency accepts a number, `"auto"`, or `null`:
 - `maxConcurrentAux` (default `"auto"`): all agent keys, bounded by `maxConcurrentAgents`.
 - `maxConcurrentFollowUps` (default `"auto"`): workers available.
 - `maxActiveClaims` (default `"auto"`): one per worker.
-- `maxConcurrentDiscovery` (default 1).
+- `maxConcurrentDiscovery` (default 1; discovery uses one scratch worktree).
 - `maxConcurrentAgents` (default `"auto"`): total keys; the physical/provider ceiling for all in-flight tasks.
 
 `auto-work status` prints the effective limits after resolution.

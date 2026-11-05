@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Failed work now releases its Ziki claim before being requeued or marked failed.
+  Previously a retryable failure (notably “agent made no changes”) kept the
+  claim, counted against `maxActiveClaims`, and could leave the loop idle with
+  no dispatchable work.
+- PR follow-up stops and marks the task skipped when Ziki returns `404` for the
+  issue, instead of retrying `Issue not found` forever.
+- Discovery now uses the current run’s cycle count in both the dispatcher and
+  `discoveryPass`, so its cadence works correctly after a restart.
+- Removed the daily delivery/review/discovery caps and the per-cycle auxiliary
+  cap from the config schema and dispatcher. There are no daily work caps.
+- Runs have no time limit by default; `--max-runtime`/`maxRuntimeMinutes` are
+  still available when a limit is wanted.
+- `maxAttemptsPerTask` and `maxOpenEscalations` now accept `null` for unlimited
+  and default to `null`; the init template and examples no longer reintroduce
+  the old caps.
+- Removed the daily delivery/review/discovery caps and the per-cycle auxiliary
+  cap from the config schema and dispatcher. There are no daily work caps.
+- Runs have no time limit by default; `--max-runtime`/`maxRuntimeMinutes` are
+  still available when a limit is wanted.
+- `maxAttemptsPerTask` and `maxOpenEscalations` now accept `null` for unlimited
+  and default to `null`; the init template and examples no longer reintroduce
+  the old caps.
 - Run limits: `--max-cycles` now counts cycles in the current run instead of
   using the lifetime cycle total. `status`, `report` and `LAST-RUN` show the
   run cycle count alongside the lifetime total, and discovery cadence resets

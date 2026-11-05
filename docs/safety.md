@@ -67,9 +67,8 @@ block waiting for approval, which is not suitable for unattended runs.
 
 ## Caps and stop switches
 
-- Optional daily caps for deliveries, reviews, discoveries and auxiliary work
-  (`null` by default, so there is no artificial cap).
-- Per-run limits: `--max-runtime` (default 2h), `--max-cycles`, `--until`,
+- No daily work caps.
+- Optional run limits: `--max-runtime` (none by default), `--max-cycles`, `--until`,
   `--max-deliveries`, `--forever`. The loop finishes the current cycle, then
   stops and records the reason.
 - Adaptive concurrency: `maxConcurrent*` defaults to `"auto"` and follows the

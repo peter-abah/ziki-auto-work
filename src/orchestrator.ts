@@ -152,7 +152,6 @@ interface Context {
   pool: TaskPool;
   mutex: Mutex;
   runLimits: RunLimitConfig;
-  auxThisCycle: number;
   auxLastKind: string | null;
   reservedAgents: Set<string>;
   cycleStats: { deliveries: number; reviews: number; aux: number; errors: number };
@@ -291,7 +290,24 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
     await save(ctx);
     return;
   }
-  const data = await ctx.primary.client.getIssue(String(task.number ?? ""));
+  let data: unknown;
+  try {
+    data = await ctx.primary.client.getIssue(String(task.number ?? ""));
+  } catch (error) {
+    const status = Number((error as { status?: unknown } | null)?.status ?? 0);
+    if (status === 404) {
+      const agent = task.agentName ? clientByName(ctx, task.agentName) : null;
+      if (task.claimId) await releaseClaim(ctx, task, agent, "issue no longer exists");
+      task.status = "skipped";
+      task.reason = "Ziki issue no longer exists";
+      task.lastError = "Ziki issue no longer exists";
+      task.prLastCheckedAt = new Date().toISOString();
+      history(ctx, { type: "decision", issue: typeof task.number === "number" ? task.number : null, detail: "PR follow-up stopped: Ziki issue no longer exists" });
+      await save(ctx);
+      return;
+    }
+    throw error;
+  }
   const issue = normalizeIssue(data);
   if (!issue) {
     task.prLastCheckedAt = new Date().toISOString();
@@ -492,12 +508,15 @@ async function requeueCrashedTask(ctx: Context, item: QueueEntry, error: unknown
   const message = truncate(error instanceof Error ? error.message : String(error), 500);
   const task = Object.values(ctx.state.tasks).find((entry) => String(entry.number) === String(item.issueNumber));
   if (!task || !["claimed", "working"].includes(task.status)) return false;
-  const maxAttempts = ctx.profile.limits.maxAttemptsPerTask ?? 3;
-  if (task.attempts >= maxAttempts) {
+  const maxAttempts = ctx.profile.limits.maxAttemptsPerTask;
+  const agent = task.agentName ? clientByName(ctx, task.agentName) : null;
+  if (maxAttempts !== null && task.attempts >= maxAttempts) {
+    await releaseClaim(ctx, task, agent, message);
     task.status = "failed";
     task.lastError = message;
     return false;
   }
+  await releaseClaim(ctx, task, agent, message);
   task.status = "queued";
   task.lastError = message;
   return true;
@@ -1756,7 +1775,7 @@ async function handleWorkFailure(
         claimId: undefined
       });
     }
-  } else if (attempts >= maxAttempts) {
+  } else if (maxAttempts !== null && attempts >= maxAttempts) {
     const task = ctx.state.tasks[taskKey(issue)] ?? null;
     if (task) await releaseClaim(ctx, task, worker, error);
     setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined, claimId: undefined });
@@ -1768,7 +1787,9 @@ async function handleWorkFailure(
       ctx.logger
     );
   } else {
-    setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined });
+    const task = ctx.state.tasks[taskKey(issue)] ?? null;
+    if (task) await releaseClaim(ctx, task, worker, error);
+    setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined, claimId: undefined });
   }
   markRecent(ctx, item.key);
   await save(ctx);
@@ -3343,9 +3364,9 @@ async function processMergeFix(ctx: Context, item: QueueEntry, preferred?: Agent
 
 async function discoveryPass(ctx: Context): Promise<void> {
   if (!ctx.profile.discovery.enabled) return;
-  if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay)) return;
   const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
-  if (ctx.state.cycles % every !== 0) return;
+  const runCycles = cyclesThisRun(ctx.state);
+  if (runCycles <= 0 || runCycles % every !== 0) return;
 
   const existing = (ctx.platform.issues ?? [])
     .filter((issue) => ["open", "in_progress", "done", "merge", "resolved", "closed"].includes(issue.status))
@@ -3754,7 +3775,6 @@ async function runCycle(ctx: Context): Promise<{
 
 function discoveryDue(ctx: Context): boolean {
   if (!ctx.profile.discovery.enabled) return false;
-  if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay)) return false;
   const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
   const runCycles = cyclesThisRun(ctx.state);
   return runCycles > 0 && runCycles % every === 0;
@@ -3838,7 +3858,6 @@ function dispatch(ctx: Context): void {
   const limits = ctx.profile.limits;
   const pool = ctx.pool;
   const capacity = ctx.capacity;
-  ctx.auxThisCycle = 0;
 
   reportUnsupported(ctx);
 
@@ -3901,7 +3920,6 @@ function dispatch(ctx: Context): void {
 
   const maxClaims = Math.min(capacity.activeClaims, zikiClaimLimit(ctx) ?? capacity.activeClaims);
   while (canStart("delivery") && pool.count("delivery") < capacity.delivery) {
-    if (!underCap(counter(ctx).deliveries, limits.maxDeliveriesPerDay)) break;
     if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal) break;
     const atClaimCapacity = ownClaimCount(ctx) + pool.count("delivery") >= maxClaims;
     const pair = nextDispatch(ctx, ctx.queue?.work, { forDelivery: true, skipClaimAdding: atClaimCapacity });
@@ -3926,7 +3944,6 @@ function dispatch(ctx: Context): void {
   }
 
   while (canStart("review") && pool.count("review") < capacity.review) {
-    if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay)) break;
     const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
     if (!pair) break;
     const target = itemTargetKey(pair.item);
@@ -3948,7 +3965,7 @@ function dispatch(ctx: Context): void {
     );
   }
 
-  while (canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
+  while (canStart("aux") && pool.count("aux") < capacity.aux) {
     const entries = ctx.queue?.aux ?? [];
     let pair: { item: QueueEntry; agent: AgentClient } | null = null;
     for (const kind of rotatedKinds(entries, ctx.auxLastKind)) {
@@ -3957,7 +3974,6 @@ function dispatch(ctx: Context): void {
     }
     if (!pair) break;
     ctx.auxLastKind = pair.item.kind;
-    ctx.auxThisCycle += 1;
     const target = itemTargetKey(pair.item);
     ctx.reservedAgents.add(pair.agent.name);
     ctx.reservedTargets.add(target);
@@ -3978,11 +3994,6 @@ function dispatch(ctx: Context): void {
     );
   }
 
-}
-
-function underCap(value: number, cap: number | "auto" | null | undefined): boolean {
-  if (cap === null || cap === "auto" || cap === undefined) return true;
-  return value < Number(cap);
 }
 
 async function createContext(
@@ -4053,7 +4064,6 @@ async function createContext(
     }),
     mutex: new Mutex(),
     runLimits: options.runLimits,
-    auxThisCycle: 0,
     auxLastKind: null,
     reservedAgents: new Set(),
     cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 },

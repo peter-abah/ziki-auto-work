@@ -150,7 +150,26 @@ async function processPrFollowUp(ctx, task) {
         await save(ctx);
         return;
     }
-    const data = await ctx.primary.client.getIssue(String(task.number ?? ""));
+    let data;
+    try {
+        data = await ctx.primary.client.getIssue(String(task.number ?? ""));
+    }
+    catch (error) {
+        const status = Number(error?.status ?? 0);
+        if (status === 404) {
+            const agent = task.agentName ? clientByName(ctx, task.agentName) : null;
+            if (task.claimId)
+                await releaseClaim(ctx, task, agent, "issue no longer exists");
+            task.status = "skipped";
+            task.reason = "Ziki issue no longer exists";
+            task.lastError = "Ziki issue no longer exists";
+            task.prLastCheckedAt = new Date().toISOString();
+            history(ctx, { type: "decision", issue: typeof task.number === "number" ? task.number : null, detail: "PR follow-up stopped: Ziki issue no longer exists" });
+            await save(ctx);
+            return;
+        }
+        throw error;
+    }
     const issue = normalizeIssue(data);
     if (!issue) {
         task.prLastCheckedAt = new Date().toISOString();
@@ -347,12 +366,15 @@ async function requeueCrashedTask(ctx, item, error) {
     const task = Object.values(ctx.state.tasks).find((entry) => String(entry.number) === String(item.issueNumber));
     if (!task || !["claimed", "working"].includes(task.status))
         return false;
-    const maxAttempts = ctx.profile.limits.maxAttemptsPerTask ?? 3;
-    if (task.attempts >= maxAttempts) {
+    const maxAttempts = ctx.profile.limits.maxAttemptsPerTask;
+    const agent = task.agentName ? clientByName(ctx, task.agentName) : null;
+    if (maxAttempts !== null && task.attempts >= maxAttempts) {
+        await releaseClaim(ctx, task, agent, message);
         task.status = "failed";
         task.lastError = message;
         return false;
     }
+    await releaseClaim(ctx, task, agent, message);
     task.status = "queued";
     task.lastError = message;
     return true;
@@ -1490,7 +1512,7 @@ async function handleWorkFailure(ctx, issue, item, result, worker, dir) {
             });
         }
     }
-    else if (attempts >= maxAttempts) {
+    else if (maxAttempts !== null && attempts >= maxAttempts) {
         const task = ctx.state.tasks[taskKey(issue)] ?? null;
         if (task)
             await releaseClaim(ctx, task, worker, error);
@@ -1499,7 +1521,10 @@ async function handleWorkFailure(ctx, issue, item, result, worker, dir) {
         await notifyProfile(ctx.profile, `auto-work: task #${issue.number} failed`, `${truncate(error, 200)}\nauto-work status --verbose`, ctx.logger);
     }
     else {
-        setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined });
+        const task = ctx.state.tasks[taskKey(issue)] ?? null;
+        if (task)
+            await releaseClaim(ctx, task, worker, error);
+        setTask(ctx.state, issue, { status: "queued", attempts, lastError: error, worktree: undefined, claimId: undefined });
     }
     markRecent(ctx, item.key);
     await save(ctx);
@@ -3025,10 +3050,9 @@ async function processMergeFix(ctx, item, preferred) {
 async function discoveryPass(ctx) {
     if (!ctx.profile.discovery.enabled)
         return;
-    if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay))
-        return;
     const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
-    if (ctx.state.cycles % every !== 0)
+    const runCycles = cyclesThisRun(ctx.state);
+    if (runCycles <= 0 || runCycles % every !== 0)
         return;
     const existing = (ctx.platform.issues ?? [])
         .filter((issue) => ["open", "in_progress", "done", "merge", "resolved", "closed"].includes(issue.status))
@@ -3439,8 +3463,6 @@ async function runCycle(ctx) {
 function discoveryDue(ctx) {
     if (!ctx.profile.discovery.enabled)
         return false;
-    if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay))
-        return false;
     const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
     const runCycles = cyclesThisRun(ctx.state);
     return runCycles > 0 && runCycles % every === 0;
@@ -3534,7 +3556,6 @@ function dispatch(ctx) {
     const limits = ctx.profile.limits;
     const pool = ctx.pool;
     const capacity = ctx.capacity;
-    ctx.auxThisCycle = 0;
     reportUnsupported(ctx);
     let discoveryPending = discoveryDue(ctx) && !pool.has("discovery");
     if (discoveryPending && pool.canStart("discovery")) {
@@ -3586,8 +3607,6 @@ function dispatch(ctx) {
     }
     const maxClaims = Math.min(capacity.activeClaims, zikiClaimLimit(ctx) ?? capacity.activeClaims);
     while (canStart("delivery") && pool.count("delivery") < capacity.delivery) {
-        if (!underCap(counter(ctx).deliveries, limits.maxDeliveriesPerDay))
-            break;
         if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal)
             break;
         const atClaimCapacity = ownClaimCount(ctx) + pool.count("delivery") >= maxClaims;
@@ -3608,8 +3627,6 @@ function dispatch(ctx) {
         }, taskLabel(pair.item), pair.agent.name);
     }
     while (canStart("review") && pool.count("review") < capacity.review) {
-        if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay))
-            break;
         const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
         if (!pair)
             break;
@@ -3626,7 +3643,7 @@ function dispatch(ctx) {
             }
         }, kindLabel(pair.item, "review"), pair.agent.name);
     }
-    while (canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
+    while (canStart("aux") && pool.count("aux") < capacity.aux) {
         const entries = ctx.queue?.aux ?? [];
         let pair = null;
         for (const kind of rotatedKinds(entries, ctx.auxLastKind)) {
@@ -3637,7 +3654,6 @@ function dispatch(ctx) {
         if (!pair)
             break;
         ctx.auxLastKind = pair.item.kind;
-        ctx.auxThisCycle += 1;
         const target = itemTargetKey(pair.item);
         ctx.reservedAgents.add(pair.agent.name);
         ctx.reservedTargets.add(target);
@@ -3652,11 +3668,6 @@ function dispatch(ctx) {
             }
         }, kindLabel(pair.item, "aux"), pair.agent.name);
     }
-}
-function underCap(value, cap) {
-    if (cap === null || cap === "auto" || cap === undefined)
-        return true;
-    return value < Number(cap);
 }
 async function createContext(loaded, state, logger, options) {
     const { profile, profileName, keys } = loaded;
@@ -3720,7 +3731,6 @@ async function createContext(loaded, state, logger, options) {
         }),
         mutex: new Mutex(),
         runLimits: options.runLimits,
-        auxThisCycle: 0,
         auxLastKind: null,
         reservedAgents: new Set(),
         cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 },

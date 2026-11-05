@@ -85,7 +85,7 @@ queued claims, and releases undelivered claims on provider quota, context
 overflow, permanent failure and shutdown. The Ziki project's `maxActiveClaims`
 (2 for `zedu`) is read at startup and used as the hard claim ceiling.
 
-`maxRuntimeMinutes` (default 120), `maxCycles`, `stopAt`,
+`maxRuntimeMinutes` (no limit by default), `maxCycles`, `stopAt`,
 `maxDeliveriesTotal`, or an explicit stop ends the loop after the current
 cycle. `maxCycles` is counted from the start of the current run; the status and
 report show both the run cycle count and the lifetime total. Limits are chosen at `start` and recorded in `status.json` with elapsed

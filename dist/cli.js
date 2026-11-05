@@ -1142,10 +1142,7 @@ function printDetailedStatusWithFlags(flags, name, result) {
         }
     }
     if (status.capacity) {
-        console.log(`  effective limits: agents ${status.capacity.agentCeiling} · delivery ${status.capacity.delivery} · review ${status.capacity.review} · aux ${status.capacity.aux} · follow-up ${status.capacity.followup} · claims ${status.capacity.activeClaims}` +
-            ` · daily deliveries ${status.profileLimits?.maxDeliveriesPerDay ?? "none"}` +
-            ` · daily reviews ${status.profileLimits?.maxReviewsPerDay ?? "none"}` +
-            ` · per-cycle aux ${status.profileLimits?.maxAuxPerCycle ?? "none"}`);
+        console.log(`  effective limits: agents ${status.capacity.agentCeiling} · delivery ${status.capacity.delivery} · review ${status.capacity.review} · aux ${status.capacity.aux} · follow-up ${status.capacity.followup} · claims ${status.capacity.activeClaims}`);
     }
     if (result.running && status.inFlight) {
         console.log(`  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.followUps ?? 0} follow-up · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`);
