@@ -25,10 +25,6 @@ function profile(templateFile) {
         discovery: { enabled: false },
         workflow: { maxFiles: 5, maxLines: 400, branchPrefix: "fix", commitTypes: ["fix"], requireTests: true },
         limits: {
-            maxDeliveriesPerDay: 1,
-            maxReviewsPerDay: 1,
-            maxDiscoveriesPerDay: 1,
-            maxAuxPerCycle: 1,
             maxActiveClaims: 1,
             maxAttemptsPerTask: 3,
             maxNetworkRetries: 5,

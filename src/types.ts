@@ -175,16 +175,12 @@ export interface DiscoveryConfig {
 }
 
 export interface LimitsConfig {
-  maxDeliveriesPerDay: CapacityLimit;
-  maxReviewsPerDay: CapacityLimit;
-  maxDiscoveriesPerDay: CapacityLimit;
-  maxAuxPerCycle: CapacityLimit;
   maxActiveClaims: CapacityLimit;
-  maxAttemptsPerTask: number;
+  maxAttemptsPerTask: number | null;
   maxNetworkRetries: number;
   networkRetryMinutes: number;
   maxCyclesBeforeDiscovery: number;
-  maxOpenEscalations: number;
+  maxOpenEscalations: number | null;
   /** Default run limit in minutes; null means no time limit. */
   maxRuntimeMinutes?: number | null;
   /** Stop after this many cycles; null means no cycle limit. */

@@ -25,7 +25,8 @@ async function notify(command, title, body) {
 }
 export async function escalate(client, profile, profilePaths, state, options) {
     const open = openEscalations(state);
-    if (open.length >= (options.maxOpen ?? 5)) {
+    const maxOpen = options.maxOpen ?? null;
+    if (maxOpen !== null && open.length >= maxOpen) {
         options.logger?.warn(`Not escalating: ${open.length} escalations already open`);
         return { ok: false, skipped: true, error: "too_many_open" };
     }

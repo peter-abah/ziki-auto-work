@@ -3,7 +3,7 @@ import { expandHome } from "./platform/paths.js";
 export declare const PROVIDERS: ProviderName[];
 export declare const DEFAULT_LIMITS: LimitsConfig;
 export declare const DEFAULT_RUN_LIMITS: {
-    maxRuntimeMinutes: number;
+    maxRuntimeMinutes: null;
     maxCycles: null;
     stopAt: null;
     maxDeliveriesTotal: null;

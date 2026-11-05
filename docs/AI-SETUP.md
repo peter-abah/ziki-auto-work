@@ -244,7 +244,7 @@ Tell the user:
 - the provider and resolved models,
 - the checks that will run,
 - the number of items in the dry-run queue,
-- the run limit (default 2 hours) and flags: `--max-runtime`, `--max-cycles`,
+- the run limit (none by default) and flags: `--max-runtime`, `--max-cycles`,
   `--until`, `--max-deliveries`, `--forever`,
 - how they will be notified (desktop notification + `status --line`),
 - that the loop is **not running**,

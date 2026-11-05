@@ -166,11 +166,11 @@ default. State writes are serialized, so concurrent tasks do not lose updates.
 
 ## Run limits
 
-Every `start` has a limit. The default is **2 hours**. The limit is chosen at
-start time and shown in `status`; there is no live-adjust command.
+Runs have **no time limit by default**. You can impose one at start time; it is
+shown in `status` and there is no live-adjust command.
 
 ```bash
-auto-work start                        # 2 hours
+auto-work start                        # no time limit
 auto-work start --max-runtime 4h
 auto-work start --max-cycles 20
 auto-work start --until 2026-11-04T18:00:00Z

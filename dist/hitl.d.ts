@@ -9,7 +9,7 @@ export declare function escalate(client: ZikiClient, profile: ProfileConfig, pro
     agentName?: string;
     logger?: Logger;
     notifyCommand?: string | null;
-    maxOpen?: number;
+    maxOpen?: number | null;
 }): Promise<{
     ok: boolean;
     skipped?: boolean;
