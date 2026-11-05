@@ -197,6 +197,9 @@ export class ZikiClient {
     platforms() {
         return this.get("/api/v1/platforms");
     }
+    project() {
+        return this.get(`/api/v1/projects/${this.projectId}`);
+    }
     async work(options = {}) {
         const result = await this.request("GET", `/${this.projectSlug}/work`, {
             headers: options.etag ? { "If-None-Match": options.etag } : {},

@@ -261,6 +261,10 @@ export class ZikiClient {
     return this.get("/api/v1/platforms");
   }
 
+  project(): Promise<any> {
+    return this.get(`/api/v1/projects/${this.projectId}`);
+  }
+
   async work(options: { etag?: string } = {}): Promise<{ notModified: boolean; data?: WorkFeed; etag?: string }> {
     const result = await this.request<{ data: WorkFeed | null; response: Response }>("GET", `/${this.projectSlug}/work`, {
       headers: options.etag ? { "If-None-Match": options.etag } : {},

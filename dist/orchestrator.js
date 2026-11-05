@@ -24,6 +24,7 @@ import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 import { resolveCapacity } from "./capacity.js";
+import { mergeWorkItemFeeds } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
 import { formatLoopContext } from "./loop-context.js";
@@ -51,8 +52,9 @@ function renderLive(ctx) {
     const needs = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open").length;
     const tokens = ctx.state.run.tokens;
     const tokenText = `tokens ${formatTokens(tokens.total)}${tokens.estimated ? " est" : ""}`;
+    const agentText = `agents ${tasks.length}/${ctx.capacity.totalKeys}`;
     return {
-        line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${tokenText}`,
+        line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${agentText} · ${tokenText}`,
         key: `${ctx.phase}|${first?.key ?? ""}|${first?.label ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
     };
 }
@@ -365,8 +367,124 @@ function clientByName(ctx, name) {
 function agentForItem(ctx, item) {
     return clientByName(ctx, item.item._feedAgent) ?? ctx.primary;
 }
-function activeClaims(ctx) {
-    return Object.values(ctx.state.tasks).filter((task) => ["claimed", "working"].includes(task.status));
+const CLAIM_ADDING_WORK = new Set(["offer", "ready_issue"]);
+const OWNER_LEVEL_AUX = new Set([
+    "idea",
+    "convert_idea",
+    "reject_idea",
+    "confirm_issue",
+    "close_issue",
+    "sense_check",
+    "vote_importance",
+    "estimate_reward",
+    "review_comment",
+    "vote_stake",
+    "award_bid",
+    "review_bid",
+    "categorize"
+]);
+function isManagerAgent(ctx, agent) {
+    return Boolean(agent && ctx.clients.managers.some((entry) => entry.name === agent.name));
+}
+function managerFor(ctx, preferred, exclude = []) {
+    const excluded = new Set(exclude.filter(Boolean));
+    if (preferred && isManagerAgent(ctx, preferred) && !excluded.has(preferred.name))
+        return preferred;
+    return ctx.clients.managers.find((agent) => !excluded.has(agent.name)) ?? null;
+}
+function agentHoldsClaim(ctx, name) {
+    return Object.values(ctx.state.tasks).some((task) => task.agentName === name && Boolean(task.claimId) && ["claimed", "working", "queued"].includes(task.status));
+}
+function agentIsFree(ctx, agent) {
+    return !ctx.reservedAgents.has(agent.name);
+}
+function resolveAgent(ctx, item, options = {}) {
+    const preferred = clientByName(ctx, item.item._feedAgent);
+    const usable = (agent) => {
+        if (!agent || !agentIsFree(ctx, agent))
+            return false;
+        if (options.forDelivery &&
+            item.kind !== "active_claim" &&
+            item.kind !== "review_offer" &&
+            item.kind !== "job_review_offer" &&
+            agentHoldsClaim(ctx, agent.name)) {
+            return false;
+        }
+        return true;
+    };
+    const role = item.item.minimumRole;
+    if (item.kind === "offer") {
+        if (claimCapacityReached(ctx))
+            return null;
+        return usable(preferred) ? preferred : null;
+    }
+    if (item.kind === "active_claim" || item.kind === "review_offer" || item.kind === "job_review_offer") {
+        return usable(preferred) ? preferred : null;
+    }
+    if (role === "manager" || role === "merger") {
+        if (usable(preferred) && isManagerAgent(ctx, preferred))
+            return preferred;
+        return ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+    }
+    if (OWNER_LEVEL_AUX.has(item.kind)) {
+        for (const agent of [ctx.primary, preferred, ...ctx.clients.workers, ...ctx.clients.managers]) {
+            if (usable(agent))
+                return agent;
+        }
+        return null;
+    }
+    if (usable(preferred))
+        return preferred;
+    return ctx.clients.workers.find((agent) => usable(agent)) ?? ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+}
+function nextDispatch(ctx, bucket, options = {}) {
+    for (const item of bucket ?? []) {
+        if (ctx.pool.has(item.key) || item.item.canAct === false)
+            continue;
+        if (options.skipOwnerLevel && OWNER_LEVEL_AUX.has(item.kind))
+            continue;
+        if (options.skipClaimAdding && CLAIM_ADDING_WORK.has(item.kind))
+            continue;
+        const agent = resolveAgent(ctx, item, options);
+        if (agent)
+            return { item, agent };
+    }
+    return null;
+}
+function zikiClaimLimit(ctx) {
+    const value = Number(ctx.zikiWorkflow?.maxActiveClaims);
+    return Number.isFinite(value) && value > 0 ? value : null;
+}
+function ownClaimCount(ctx) {
+    return Object.values(ctx.state.tasks).filter((task) => Boolean(task.claimId) && ["claimed", "working", "queued", "waiting_human"].includes(task.status)).length;
+}
+function claimCapacityReached(ctx) {
+    const limit = zikiClaimLimit(ctx);
+    return limit !== null && ownClaimCount(ctx) >= limit;
+}
+async function releaseClaim(ctx, task, agent, reason) {
+    if (!task.claimId)
+        return;
+    const actor = agent ?? (task.agentName ? clientByName(ctx, task.agentName) : null);
+    if (actor) {
+        try {
+            await actor.client.release(task.id ?? task.number ?? "");
+        }
+        catch (error) {
+            ctx.logger.warn(`Could not release claim for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    task.claimId = undefined;
+    task.lastError = reason;
+}
+async function releaseUndeliveredClaims(ctx, reason) {
+    for (const task of Object.values(ctx.state.tasks)) {
+        if (!task.claimId)
+            continue;
+        if (!["queued", "claimed", "working", "waiting_human"].includes(task.status))
+            continue;
+        await releaseClaim(ctx, task, null, reason);
+    }
 }
 function pickWorker(ctx, exclude = []) {
     const excluded = new Set(exclude.filter(Boolean));
@@ -635,6 +753,28 @@ async function buildStatus(ctx, extra = {}) {
         queue: ctx.queue?.counts ?? null,
         capacity: ctx.capacity,
         profileLimits: ctx.profile.limits,
+        feedAgents: ctx.feedAgentCounts,
+        zikiWorkflow: {
+            maxActiveClaims: zikiClaimLimit(ctx),
+            stakeLimit: Number(ctx.zikiWorkflow?.stakeLimit) || null
+        },
+        agents: [...ctx.clients.workers, ...ctx.clients.managers].map((agent) => {
+            const owned = tasks.filter((task) => task.agentName === agent.name);
+            const current = owned.find((task) => ["claimed", "working"].includes(task.status)) ?? owned.find((task) => task.status === "queued" && task.claimId);
+            const poolTask = ctx.pool.list().find((task) => task.agent === agent.name);
+            const last = current?.lastHeartbeatAt ? new Date(current.lastHeartbeatAt).getTime() : 0;
+            const stale = Boolean(current && !["delivered"].includes(current.status) && (!last || Date.now() - last > 15 * 60 * 1000));
+            return {
+                name: agent.name,
+                level: isManagerAgent(ctx, agent) ? "manager" : "working",
+                busy: Boolean(poolTask),
+                current: poolTask ? { key: poolTask.key, kind: poolTask.kind, label: poolTask.label, ageMs: poolTask.ageMs } : null,
+                claim: current?.number ?? null,
+                claimStatus: current?.status ?? null,
+                lastHeartbeatAt: current?.lastHeartbeatAt ?? null,
+                stale
+            };
+        }),
         unsupportedKinds: [...ctx.unsupportedKinds],
         tasks: {
             total: tasks.length,
@@ -757,11 +897,10 @@ async function save(ctx) {
     });
 }
 async function fetchMergedFeed(ctx) {
-    const agents = [ctx.clients.workers[0], ctx.clients.managers[0]].filter(Boolean);
+    const agents = [...ctx.clients.workers, ...ctx.clients.managers];
     if (!agents.length)
         return null;
-    const merged = new Map();
-    let base = null;
+    const feeds = [];
     for (const agent of agents) {
         try {
             const etag = ctx.state.feedEtags[agent.name];
@@ -778,15 +917,7 @@ async function fetchMergedFeed(ctx) {
             if (!result.data)
                 continue;
             ctx.feedCache[agent.name] = result.data;
-            if (!base)
-                base = result.data;
-            for (const item of result.data.items ?? []) {
-                item._feedAgent = agent.name;
-                const previous = merged.get(item.key);
-                if (!previous || (item.actions?.length ?? 0) > (previous.actions?.length ?? 0)) {
-                    merged.set(item.key, item);
-                }
-            }
+            feeds.push({ agent: agent.name, feed: result.data });
             if (result.etag)
                 ctx.state.feedEtags[agent.name] = result.etag;
         }
@@ -794,9 +925,11 @@ async function fetchMergedFeed(ctx) {
             ctx.logger.warn(`Work feed failed for ${agent.name}: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
-    if (!base)
+    const merged = mergeWorkItemFeeds(feeds);
+    ctx.feedAgentCounts = merged.counts;
+    if (!merged.base)
         return null;
-    return { ...base, items: [...merged.values()] };
+    return { ...merged.base, items: merged.items };
 }
 async function loadPlatformSets(ctx) {
     const file = ctx.profilePaths.desktopCacheFile;
@@ -838,7 +971,8 @@ async function loadPlatformSets(ctx) {
 }
 async function heartbeatPass(ctx) {
     const now = Date.now();
-    const live = Object.values(ctx.state.tasks).filter((task) => ["claimed", "working", "waiting_human"].includes(task.status));
+    const live = Object.values(ctx.state.tasks).filter((task) => ["claimed", "working", "waiting_human", "delivered"].includes(task.status) ||
+        (task.status === "queued" && Boolean(task.claimId)));
     for (const task of live) {
         if (!task.agentName || !task.id)
             continue;
@@ -856,8 +990,9 @@ async function heartbeatPass(ctx) {
         catch (error) {
             ctx.logger.warn(`Heartbeat failed for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
             if ([409, 410].includes(error.status ?? 0) && task.status !== "waiting_human") {
-                task.status = "queued";
                 task.claimId = undefined;
+                if (task.status !== "delivered")
+                    task.status = "queued";
                 task.lastError = "claim lost";
             }
         }
@@ -927,19 +1062,19 @@ async function writeOwnerResult(ctx, requestId, request, result) {
 }
 async function processWorkItem(ctx, item, preferredWorker) {
     if (item.kind === "review_offer") {
-        await processReviewOffer(ctx, item);
+        await processReviewOffer(ctx, item, preferredWorker);
         return;
     }
     if (item.kind === "job_review_offer") {
-        await processJobReviewOffer(ctx, item);
+        await processJobReviewOffer(ctx, item, preferredWorker);
         return;
     }
     if (item.kind === "open_issue") {
-        await processOpenIssue(ctx, item);
+        await processOpenIssue(ctx, item, preferredWorker);
         return;
     }
     if (item.kind === "reclaim_issue") {
-        await processReclaim(ctx, item);
+        await processReclaim(ctx, item, preferredWorker);
         return;
     }
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
@@ -1057,7 +1192,16 @@ async function processWorkItem(ctx, item, preferredWorker) {
     taskUsage(ctx, issue, result.tokens);
     if (await handleProviderLimit(ctx, result)) {
         await cleanupWorktree(ctx.github, dir);
-        setTask(ctx.state, issue, { status: "queued", lastError: result.error ?? "provider limit", worktree: undefined });
+        const task = ctx.state.tasks[taskKey(issue)] ?? null;
+        if (result.providerLimit === "quota" && task) {
+            await releaseClaim(ctx, task, worker, "provider quota exhausted; claim released");
+        }
+        setTask(ctx.state, issue, {
+            status: "queued",
+            claimId: result.providerLimit === "quota" ? undefined : task?.claimId,
+            lastError: result.error ?? `provider ${result.providerLimit ?? "limit"}`,
+            worktree: undefined
+        });
         markRecent(ctx, item.key);
         await save(ctx);
         return;
@@ -1222,9 +1366,23 @@ async function handleWorkFailure(ctx, issue, item, result, worker, dir) {
         if (escalation.ok) {
             history(ctx, { type: "escalation", issue: issue.number, detail: environmentHint ?? "blocker", data: { id: escalation.escalation?.id } });
             await notifyNeedsYou(ctx);
+            if (result.providerLimit === "context") {
+                const task = ctx.state.tasks[taskKey(issue)] ?? null;
+                if (task)
+                    await releaseClaim(ctx, task, worker, "context overflow; claim released for a human");
+                setTask(ctx.state, issue, {
+                    status: "waiting_human",
+                    attempts,
+                    claimId: undefined,
+                    lastError: error,
+                    worktree: undefined
+                });
+            }
         }
         if (!escalation.ok) {
-            await worker.client.release(issue.id).catch(() => { });
+            const task = ctx.state.tasks[taskKey(issue)] ?? null;
+            if (task)
+                await releaseClaim(ctx, task, worker, error);
             setTask(ctx.state, issue, {
                 status: "queued",
                 attempts,
@@ -1235,8 +1393,10 @@ async function handleWorkFailure(ctx, issue, item, result, worker, dir) {
         }
     }
     else if (attempts >= maxAttempts) {
-        setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined });
-        await worker.client.release(issue.id).catch(() => { });
+        const task = ctx.state.tasks[taskKey(issue)] ?? null;
+        if (task)
+            await releaseClaim(ctx, task, worker, error);
+        setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined, claimId: undefined });
         await recordTaskNote(worker.client, issue, "failed", error, result.tail ?? "", ctx.state, worker.name);
         await notifyProfile(ctx.profile, `auto-work: task #${issue.number} failed`, `${truncate(error, 200)}\nauto-work status --verbose`, ctx.logger);
     }
@@ -1311,6 +1471,10 @@ async function ensureBidAndAward(ctx, issue, preferred) {
     const worker = preferred ?? pickWorker(ctx);
     if (!worker)
         return null;
+    if (claimCapacityReached(ctx)) {
+        ctx.logger.info(`Not bidding on #${issue.number}: ${ownClaimCount(ctx)}/${zikiClaimLimit(ctx)} Ziki claims already active for this owner`);
+        return null;
+    }
     const awarder = pickManager(ctx) ?? worker;
     let bids = [];
     try {
@@ -1479,7 +1643,7 @@ async function processTestFix(ctx, item, preferred) {
     ctx.logger.info(`Reviewed #${issue.number}`, { goodToMerge: result.goodToMerge, reviewer: reviewer.name });
     await save(ctx);
 }
-async function processAccept(ctx, item) {
+async function processAccept(ctx, item, preferred) {
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
     const issue = normalizeIssue(data);
     if (!issue) {
@@ -1487,7 +1651,7 @@ async function processAccept(ctx, item) {
         return;
     }
     const holder = issue.holder?.agentName ?? null;
-    const manager = pickManager(ctx, [holder ?? ""]);
+    const manager = managerFor(ctx, preferred, [holder ?? ""]);
     if (!manager) {
         ctx.logger.debug(`Skipping merge review for #${issue.number}: no manager/merger agent configured`);
         markRecent(ctx, item.key);
@@ -1533,7 +1697,7 @@ async function processAccept(ctx, item) {
     ctx.logger.info(`Accepted #${issue.number}`, { manager: manager.name });
     await save(ctx);
 }
-async function processAuxItem(ctx, item) {
+async function processAuxItem(ctx, item, preferred) {
     if (item.item.canAct === false) {
         markRecent(ctx, item.key);
         return false;
@@ -1542,76 +1706,76 @@ async function processAuxItem(ctx, item) {
         let did = false;
         switch (item.kind) {
             case "report_pr_status":
-                did = await processPrReport(ctx, item);
+                did = await processPrReport(ctx, item, preferred);
                 break;
             case "report_deployment":
-                did = await processDeploymentReport(ctx, item);
+                did = await processDeploymentReport(ctx, item, preferred);
                 break;
             case "review_bid":
-                did = await processBidVote(ctx, item);
+                did = await processBidVote(ctx, item, preferred);
                 break;
             case "award_bid":
-                did = await processAward(ctx, item);
+                did = await processAward(ctx, item, preferred);
                 break;
             case "review_comment":
-                did = await processCommentUpvote(ctx, item);
+                did = await processCommentUpvote(ctx, item, preferred);
                 break;
             case "categorize":
-                did = await processCategorize(ctx, item);
+                did = await processCategorize(ctx, item, preferred);
                 break;
             case "idea":
-                did = await processIdeaVerdict(ctx, item);
+                did = await processIdeaVerdict(ctx, item, preferred);
                 break;
             case "confirm_issue":
-                did = await processConfirm(ctx, item);
+                did = await processConfirm(ctx, item, preferred);
                 break;
             case "open_issue":
-                did = await processOpenIssue(ctx, item);
+                did = await processOpenIssue(ctx, item, preferred);
                 break;
             case "refresh_stake":
-                did = await processRefreshStake(ctx, item);
+                did = await processRefreshStake(ctx, item, preferred);
                 break;
             case "reclaim_issue":
-                did = await processReclaim(ctx, item);
+                did = await processReclaim(ctx, item, preferred);
                 break;
             case "await_release":
-                did = await processAwaitRelease(ctx, item);
+                did = await processAwaitRelease(ctx, item, preferred);
                 break;
             case "repair_pull_request":
-                did = await processRepairPullRequest(ctx, item);
+                did = await processRepairPullRequest(ctx, item, preferred);
                 break;
             case "convert_idea":
-                did = await processConvertIdea(ctx, item);
+                did = await processConvertIdea(ctx, item, preferred);
                 break;
             case "reject_idea":
-                did = await processRejectIdea(ctx, item);
+                did = await processRejectIdea(ctx, item, preferred);
                 break;
             case "estimate_reward":
-                did = await processEstimate(ctx, item);
+                did = await processEstimate(ctx, item, preferred);
                 break;
             case "investigate_issue":
-                did = await processInvestigate(ctx, item);
+                did = await processInvestigate(ctx, item, preferred);
                 break;
             case "vote_importance":
-                did = await processImportance(ctx, item);
+                did = await processImportance(ctx, item, preferred);
                 break;
             case "vote_stake":
-                did = await processStakeVote(ctx, item);
+                did = await processStakeVote(ctx, item, preferred);
                 break;
             case "sense_check":
-                did = await processSenseCheck(ctx, item);
+                did = await processSenseCheck(ctx, item, preferred);
                 break;
             case "close_issue":
-                did = await processClose(ctx, item);
+                did = await processClose(ctx, item, preferred);
                 break;
             case "research_job":
-                did = await processResearchJob(ctx, item);
+                did = await processResearchJob(ctx, item, preferred);
                 break;
             case "review_offer":
-                did = await processReviewOffer(ctx, item);
+                did = await processReviewOffer(ctx, item, preferred);
                 break;
             case "job_review_offer":
-                did = await processJobReviewOffer(ctx, item);
+                did = await processJobReviewOffer(ctx, item, preferred);
                 break;
             default:
                 ctx.logger.warn(`Unhandled Ziki work kind "${item.kind}" for #${item.issueNumber ?? item.ideaNumber ?? "?"}; skipping`);
@@ -1635,7 +1799,7 @@ async function processAuxItem(ctx, item) {
         return false;
     }
 }
-async function processPrReport(ctx, item) {
+async function processPrReport(ctx, item, preferred) {
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
     const issue = normalizeIssue(data);
     if (!issue?.pullRequestUrl) {
@@ -1643,7 +1807,7 @@ async function processPrReport(ctx, item) {
         return false;
     }
     const holder = issue.holder?.agentName ?? null;
-    const reporter = pickManager(ctx, [holder ?? ""]) ?? pickWorker(ctx, [holder ?? ""]);
+    const reporter = managerFor(ctx, preferred, [holder ?? ""]) ?? pickWorker(ctx, [holder ?? ""]);
     if (!reporter) {
         markRecent(ctx, item.key);
         return false;
@@ -1661,7 +1825,7 @@ async function processPrReport(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processDeploymentReport(ctx, item) {
+async function processDeploymentReport(ctx, item, preferred) {
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
     const issue = normalizeIssue(data);
     if (!issue) {
@@ -1678,7 +1842,7 @@ async function processDeploymentReport(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    const reporter = pickManager(ctx) ?? pickWorker(ctx);
+    const reporter = managerFor(ctx, preferred) ?? pickWorker(ctx);
     if (!reporter) {
         markRecent(ctx, item.key);
         return false;
@@ -1719,7 +1883,7 @@ async function isInDefaultBranch(ctx, sha) {
         return false;
     }
 }
-async function processBidVote(ctx, item) {
+async function processBidVote(ctx, item, preferred) {
     const bidId = (item.actions.find((action) => action.name === "vote_bid")?.path ?? "").match(/bids\/([^/]+)\/votes/)?.[1];
     if (!bidId) {
         markRecent(ctx, item.key);
@@ -1729,14 +1893,14 @@ async function processBidVote(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    const voter = pickManager(ctx) ?? pickWorker(ctx);
+    const voter = managerFor(ctx, preferred) ?? pickWorker(ctx);
     if (!voter)
         return false;
     await voter.client.voteBid(bidId);
     markRecent(ctx, item.key);
     return true;
 }
-async function processAward(ctx, item) {
+async function processAward(ctx, item, preferred) {
     const bidId = (item.actions.find((action) => action.name === "award_bid")?.path ?? "").match(/bids\/([^/]+)\/award/)?.[1];
     if (!bidId) {
         markRecent(ctx, item.key);
@@ -1747,7 +1911,7 @@ async function processAward(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx) ?? pickWorker(ctx);
+    const manager = managerFor(ctx, preferred) ?? pickWorker(ctx);
     if (!manager)
         return false;
     try {
@@ -1761,7 +1925,7 @@ async function processAward(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processCommentUpvote(ctx, item) {
+async function processCommentUpvote(ctx, item, preferred) {
     const commentId = (item.actions.find((action) => action.name === "upvote_comment")?.path ?? "").match(/comments\/([^/]+)\/votes/)?.[1];
     if (!commentId) {
         markRecent(ctx, item.key);
@@ -1771,15 +1935,15 @@ async function processCommentUpvote(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    const voter = pickWorker(ctx) ?? pickManager(ctx);
+    const voter = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
     if (!voter)
         return false;
     await voter.client.upvoteComment(commentId);
     markRecent(ctx, item.key);
     return true;
 }
-async function processCategorize(ctx, item) {
-    const actor = pickWorker(ctx) ?? pickManager(ctx);
+async function processCategorize(ctx, item, preferred) {
+    const actor = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
     if (!actor)
         return false;
     let did = 0;
@@ -1817,15 +1981,15 @@ async function processCategorize(ctx, item) {
         history(ctx, { type: "aux", detail: "categorize", data: { count: did, by: actor.name } });
     return did > 0;
 }
-async function processIdeaVerdict(ctx, item) {
+async function processIdeaVerdict(ctx, item, preferred) {
     const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
     const idea = normalizeIdea(data);
     if (!idea) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx);
-    const voter = manager ?? pickWorker(ctx);
+    const manager = managerFor(ctx, preferred);
+    const voter = manager ?? preferred ?? pickWorker(ctx);
     if (!voter) {
         markRecent(ctx, item.key);
         return false;
@@ -1883,14 +2047,14 @@ async function processIdeaVerdict(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processConfirm(ctx, item) {
+async function processConfirm(ctx, item, preferred) {
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
     const issue = normalizeIssue(data);
     if (!issue || issue.substatus !== "requires_confirmation") {
         markRecent(ctx, item.key);
         return false;
     }
-    const confirmer = pickManagerOrWorker(ctx);
+    const confirmer = preferred ?? pickManagerOrWorker(ctx);
     if (!confirmer)
         return false;
     const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
@@ -1956,18 +2120,18 @@ function pullRequestUrlFrom(item) {
     const text = `${item.title ?? ""}\n${item.detail ?? ""}`;
     return text.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/)?.[0] ?? null;
 }
-async function processOpenIssue(ctx, item) {
+async function processOpenIssue(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    await agentForItem(ctx, item).client.openIssue(issue.id);
+    await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
     history(ctx, { type: "aux", issue: issue.number, detail: "opened issue" });
     markRecent(ctx, item.key);
     return true;
 }
-async function processRefreshStake(ctx, item) {
+async function processRefreshStake(ctx, item, preferred) {
     let stakeId = actionId(item, ["refresh_stake"], /stakes\/([^/]+)\/refresh/);
     if (!stakeId && item.issueId) {
         const stakes = await ctx.primary.client.listStakes(item.issueId).catch(() => null);
@@ -1978,28 +2142,28 @@ async function processRefreshStake(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    await agentForItem(ctx, item).client.refreshStake(stakeId);
+    await (preferred ?? agentForItem(ctx, item)).client.refreshStake(stakeId);
     markRecent(ctx, item.key);
     return true;
 }
-async function processReclaim(ctx, item) {
+async function processReclaim(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    await agentForItem(ctx, item).client.reclaim(issue.id);
+    await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
     history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed stale work" });
     markRecent(ctx, item.key);
     return true;
 }
-async function processReconcileMerged(ctx, item) {
+async function processReconcileMerged(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue?.pullRequestUrl) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickManager(ctx);
+    const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
     if (!manager) {
         markRecent(ctx, item.key);
         return false;
@@ -2021,13 +2185,13 @@ async function processReconcileMerged(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processAwaitRelease(ctx, item) {
+async function processAwaitRelease(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue?.pullRequestUrl) {
         markRecent(ctx, item.key);
         return false;
     }
-    const reporter = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
+    const reporter = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
     if (!reporter) {
         markRecent(ctx, item.key);
         return false;
@@ -2041,13 +2205,13 @@ async function processAwaitRelease(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processRepairPullRequest(ctx, item) {
+async function processRepairPullRequest(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickManager(ctx);
+    const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
     if (!manager) {
         markRecent(ctx, item.key);
         return false;
@@ -2057,7 +2221,7 @@ async function processRepairPullRequest(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processConvertIdea(ctx, item) {
+async function processConvertIdea(ctx, item, preferred) {
     const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
     const idea = normalizeIdea(data);
     if (!idea) {
@@ -2071,7 +2235,7 @@ async function processConvertIdea(ctx, item) {
         return false;
     }
     try {
-        await agentForItem(ctx, item).client.convertIdea(idea.id);
+        await (preferred ?? agentForItem(ctx, item)).client.convertIdea(idea.id);
         history(ctx, { type: "aux", idea: idea.number, detail: "converted idea" });
         markRecent(ctx, item.key);
         return true;
@@ -2083,14 +2247,14 @@ async function processConvertIdea(ctx, item) {
         return false;
     }
 }
-async function processRejectIdea(ctx, item) {
+async function processRejectIdea(ctx, item, preferred) {
     const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
     const idea = normalizeIdea(data);
     if (!idea) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx);
+    const manager = managerFor(ctx, preferred);
     if (!manager) {
         markRecent(ctx, item.key);
         return false;
@@ -2106,13 +2270,13 @@ async function processRejectIdea(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processEstimate(ctx, item) {
+async function processEstimate(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const agent = pickWorker(ctx) ?? ctx.primary;
+    const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
     const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
     const result = await withScratch(ctx, `estimate-${issue.number}`, (dir) => runEstimate({
         profile: ctx.profile,
@@ -2143,13 +2307,13 @@ async function processEstimate(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processInvestigate(ctx, item) {
+async function processInvestigate(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const agent = pickWorker(ctx) ?? ctx.primary;
+    const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
     const loopContext = await loopContextFor(ctx, { issue });
     const result = await withScratch(ctx, `investigate-${issue.number}`, (dir) => runInvestigate({
         profile: ctx.profile,
@@ -2180,13 +2344,13 @@ async function processInvestigate(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processImportance(ctx, item) {
+async function processImportance(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const agent = pickManager(ctx) ?? pickWorker(ctx);
+    const agent = managerFor(ctx, preferred) ?? pickWorker(ctx);
     if (!agent) {
         markRecent(ctx, item.key);
         return false;
@@ -2216,7 +2380,7 @@ async function processImportance(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processStakeVote(ctx, item) {
+async function processStakeVote(ctx, item, preferred) {
     const stakeIds = item.actions
         .map((action) => action.path.match(/stakes\/([^/]+)\/votes/)?.[1])
         .filter((value) => Boolean(value));
@@ -2231,7 +2395,7 @@ async function processStakeVote(ctx, item) {
     }
     const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
     const stakes = issue ? await ctx.primary.client.listStakes(issue.id).catch(() => null) : null;
-    const voter = pickManager(ctx) ?? pickWorker(ctx);
+    const voter = managerFor(ctx, preferred) ?? pickWorker(ctx);
     if (!voter) {
         markRecent(ctx, item.key);
         return false;
@@ -2266,13 +2430,13 @@ async function processStakeVote(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processSenseCheck(ctx, item) {
+async function processSenseCheck(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const agent = pickManager(ctx) ?? pickWorker(ctx);
+    const agent = managerFor(ctx, preferred) ?? pickWorker(ctx);
     if (!agent) {
         markRecent(ctx, item.key);
         return false;
@@ -2312,15 +2476,15 @@ const CLOSE_REASONS = new Set([
     "superseded",
     "withdrawn"
 ]);
-async function processClose(ctx, item) {
+async function processClose(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx);
+    const manager = managerFor(ctx, preferred);
     const actingAs = manager && item.item.minimumRole === "manager" ? "manager" : "working";
-    const agent = (actingAs === "manager" ? manager : null) ?? pickWorker(ctx) ?? manager;
+    const agent = (actingAs === "manager" ? manager : preferred) ?? pickWorker(ctx) ?? manager;
     if (!agent) {
         markRecent(ctx, item.key);
         return false;
@@ -2371,7 +2535,7 @@ async function processClose(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processResearchJob(ctx, item) {
+async function processResearchJob(ctx, item, preferred) {
     const jobId = actionId(item, [], /\/jobs\/([^/]+)\/submissions/) ??
         item.actions.map((action) => action.path.match(/\/jobs\/([^/]+)/)?.[1]).find(Boolean) ??
         item.key.split(":").pop() ??
@@ -2380,7 +2544,7 @@ async function processResearchJob(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    const agent = pickWorker(ctx) ?? ctx.primary;
+    const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
     const job = await agent.client.getJob(jobId);
     const loopContext = await loopContextFor(ctx, { includeGit: false });
     const result = await withScratch(ctx, `research-${jobId}`, (dir) => runResearch({
@@ -2407,25 +2571,25 @@ async function processResearchJob(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processReviewOffer(ctx, item) {
+async function processReviewOffer(ctx, item, preferred) {
     const offerId = actionId(item, [], /\/reviews\/([^/]+)\/accept/);
     if (!offerId) {
         markRecent(ctx, item.key);
         return false;
     }
-    const reviewer = agentForItem(ctx, item);
+    const reviewer = preferred ?? agentForItem(ctx, item);
     await reviewer.client.acceptReviewOffer(offerId);
     history(ctx, { type: "accept", issue: item.issueNumber, detail: "accepted review offer" });
     await processTestFix(ctx, item, reviewer);
     return true;
 }
-async function processJobReviewOffer(ctx, item) {
+async function processJobReviewOffer(ctx, item, preferred) {
     const offerId = actionId(item, [], /\/jobs\/reviews\/([^/]+)\/accept/);
     if (!offerId) {
         markRecent(ctx, item.key);
         return false;
     }
-    const agent = agentForItem(ctx, item);
+    const agent = preferred ?? agentForItem(ctx, item);
     await agent.client.acceptJobReview(offerId);
     const jobId = item.actions.map((action) => action.path.match(/\/jobs\/(?!reviews\/)([^/]+)/)?.[1]).find(Boolean) ??
         `${item.detail ?? ""}`.match(/\bjob[ _-]?([A-Za-z0-9_-]+)/i)?.[1] ??
@@ -2471,13 +2635,13 @@ async function processJobReviewOffer(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processReviewIdle(ctx, item) {
+async function processReviewIdle(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx);
+    const manager = managerFor(ctx, preferred);
     if (!manager) {
         markRecent(ctx, item.key);
         return false;
@@ -2493,13 +2657,13 @@ async function processReviewIdle(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processDeliverStranded(ctx, item) {
+async function processDeliverStranded(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue?.pullRequestUrl) {
         markRecent(ctx, item.key);
         return false;
     }
-    const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]);
+    const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
     if (!manager) {
         markRecent(ctx, item.key);
         return false;
@@ -2537,7 +2701,7 @@ async function processDeliverStranded(ctx, item) {
     markRecent(ctx, item.key);
     return true;
 }
-async function processMergeFix(ctx, item) {
+async function processMergeFix(ctx, item, preferred) {
     const issue = await loadIssueForItem(ctx, item);
     if (!issue?.pullRequestUrl) {
         markRecent(ctx, item.key);
@@ -2549,7 +2713,7 @@ async function processMergeFix(ctx, item) {
         markRecent(ctx, item.key);
         return false;
     }
-    const reporter = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
+    const reporter = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
     if (mode === "never") {
         ctx.logger.info(`merge_fix for #${issue.number} skipped: mergeMode is "never"`);
         history(ctx, { type: "decision", issue: issue.number, detail: "merge skipped (mergeMode never)" });
@@ -2588,7 +2752,7 @@ async function processMergeFix(ctx, item) {
     }
     await ctx.github.mergePr(issue.pullRequestUrl, resolveMergeMethod(ctx.profile));
     const merged = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
-    const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]);
+    const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
     if (merged && manager) {
         await reportPrStatusWith(ctx, manager, issue, merged).catch(() => { });
         const inDefault = await isInDefaultBranch(ctx, merged.mergeCommitSha);
@@ -2808,7 +2972,7 @@ async function ownerDecisionPass(ctx) {
             const key = stateKey(merge);
             if (ctx.state.recentFeedKeys[key])
                 continue;
-            const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickManager(ctx);
+            const manager = managerFor(ctx, null, [issue.holder?.agentName ?? ""]);
             if (!manager)
                 continue;
             try {
@@ -2988,9 +3152,6 @@ function discoveryDue(ctx) {
     const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
     return ctx.state.cycles > 0 && ctx.state.cycles % every === 0;
 }
-function nextItem(ctx, bucket) {
-    return (bucket ?? []).find((entry) => !ctx.pool.has(entry.key) && entry.item.canAct !== false) ?? null;
-}
 async function processWorkSafe(ctx, item, worker) {
     try {
         await processWorkItem(ctx, item, worker);
@@ -3020,20 +3181,20 @@ async function processWorkSafe(ctx, item, worker) {
         await save(ctx).catch(() => { });
     }
 }
-async function processReviewSafe(ctx, item) {
+async function processReviewSafe(ctx, item, preferred) {
     try {
         if (item.kind === "test_fix")
-            await processTestFix(ctx, item);
+            await processTestFix(ctx, item, preferred);
         else if (item.kind === "accept_fix")
-            await processAccept(ctx, item);
+            await processAccept(ctx, item, preferred);
         else if (item.kind === "review_idle")
-            await processReviewIdle(ctx, item);
+            await processReviewIdle(ctx, item, preferred);
         else if (item.kind === "deliver_stranded")
-            await processDeliverStranded(ctx, item);
+            await processDeliverStranded(ctx, item, preferred);
         else if (item.kind === "merge_fix")
-            await processMergeFix(ctx, item);
+            await processMergeFix(ctx, item, preferred);
         else if (item.kind === "reconcile_merged")
-            await processReconcileMerged(ctx, item);
+            await processReconcileMerged(ctx, item, preferred);
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -3083,61 +3244,91 @@ function dispatch(ctx) {
     ctx.auxThisCycle = 0;
     reportUnsupported(ctx);
     if (pool.canStart("owner")) {
-        const owner = nextItem(ctx, ctx.queue?.owner);
-        if (owner)
-            pool.reserve(owner.key, "owner", () => processOwnerItem(ctx, owner), `owner ${truncate(owner.title, 40)}`);
+        const pair = nextDispatch(ctx, ctx.queue?.owner);
+        if (pair) {
+            ctx.reservedAgents.add(pair.agent.name);
+            pool.reserve(pair.item.key, "owner", async () => {
+                try {
+                    await processOwnerItem(ctx, pair.item);
+                }
+                finally {
+                    ctx.reservedAgents.delete(pair.agent.name);
+                }
+            }, `owner ${truncate(pair.item.title, 40)}`, pair.agent.name);
+        }
     }
     while (pool.canStart("followup")) {
-        const task = Object.values(ctx.state.tasks).find((entry) => prFollowUpDue(ctx, entry));
+        const task = Object.values(ctx.state.tasks).find((entry) => prFollowUpDue(ctx, entry) && (!entry.agentName || !ctx.reservedAgents.has(entry.agentName)));
         if (!task)
             break;
-        pool.reserve(prTaskKey(task), "followup", () => processPrFollowUpSafe(ctx, task), followUpLabel(task));
+        if (task.agentName)
+            ctx.reservedAgents.add(task.agentName);
+        pool.reserve(prTaskKey(task), "followup", async () => {
+            try {
+                await processPrFollowUpSafe(ctx, task);
+            }
+            finally {
+                if (task.agentName)
+                    ctx.reservedAgents.delete(task.agentName);
+            }
+        }, followUpLabel(task), task.agentName);
     }
+    const maxClaims = Math.min(capacity.activeClaims, zikiClaimLimit(ctx) ?? capacity.activeClaims);
     while (pool.canStart("delivery") && pool.count("delivery") < capacity.delivery) {
-        if (activeClaims(ctx).length + pool.count("delivery") >= capacity.activeClaims)
-            break;
         if (!underCap(counter(ctx).deliveries, limits.maxDeliveriesPerDay))
             break;
         if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal)
             break;
-        const item = (ctx.queue?.work ?? []).find((entry) => {
-            if (!entry.issueId || pool.has(entry.key))
-                return false;
-            const task = ctx.state.tasks[entry.issueId];
-            return !task || !["waiting_human", "delivered", "done", "failed", "skipped"].includes(task.status);
-        });
-        if (!item)
+        const atClaimCapacity = ownClaimCount(ctx) + pool.count("delivery") >= maxClaims;
+        const pair = nextDispatch(ctx, ctx.queue?.work, { forDelivery: true, skipClaimAdding: atClaimCapacity });
+        if (!pair)
             break;
-        const worker = pickAvailableWorker(ctx);
-        if (!worker)
-            break;
-        ctx.reservedAgents.add(worker.name);
-        pool.reserve(item.key, "delivery", async () => {
+        ctx.reservedAgents.add(pair.agent.name);
+        pool.reserve(pair.item.key, "delivery", async () => {
             try {
-                await processWorkSafe(ctx, item, worker);
+                await processWorkSafe(ctx, pair.item, pair.agent);
             }
             finally {
-                ctx.reservedAgents.delete(worker.name);
+                ctx.reservedAgents.delete(pair.agent.name);
             }
-        }, taskLabel(item));
+        }, taskLabel(pair.item), pair.agent.name);
     }
     while (pool.canStart("review") && pool.count("review") < capacity.review) {
         if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay))
             break;
-        const item = nextItem(ctx, ctx.queue?.review);
-        if (!item)
+        const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
+        if (!pair)
             break;
-        pool.reserve(item.key, "review", () => processReviewSafe(ctx, item), kindLabel(item, "review"));
+        ctx.reservedAgents.add(pair.agent.name);
+        pool.reserve(pair.item.key, "review", async () => {
+            try {
+                await processReviewSafe(ctx, pair.item, pair.agent);
+            }
+            finally {
+                ctx.reservedAgents.delete(pair.agent.name);
+            }
+        }, kindLabel(pair.item, "review"), pair.agent.name);
     }
     while (pool.canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
-        const item = nextItem(ctx, ctx.queue?.aux);
-        if (!item)
+        const pair = nextDispatch(ctx, ctx.queue?.aux, { skipOwnerLevel: ctx.ownerActionInFlight > 0 });
+        if (!pair)
             break;
         ctx.auxThisCycle += 1;
-        pool.reserve(item.key, "aux", async () => {
-            await processAuxItem(ctx, item);
-            await save(ctx).catch(() => { });
-        }, kindLabel(item, "aux"));
+        const ownerLevel = OWNER_LEVEL_AUX.has(pair.item.kind);
+        if (ownerLevel)
+            ctx.ownerActionInFlight += 1;
+        ctx.reservedAgents.add(pair.agent.name);
+        pool.reserve(pair.item.key, "aux", async () => {
+            try {
+                await processAuxItem(ctx, pair.item, pair.agent);
+                await save(ctx).catch(() => { });
+            }
+            finally {
+                ctx.reservedAgents.delete(pair.agent.name);
+                if (ownerLevel)
+                    ctx.ownerActionInFlight = Math.max(0, ctx.ownerActionInFlight - 1);
+            }
+        }, kindLabel(pair.item, "aux"), pair.agent.name);
     }
     if (pool.canStart("discovery") && discoveryDue(ctx) && !pool.has("discovery")) {
         pool.reserve("discovery", "discovery", () => discoveryPass(ctx), "discovery");
@@ -3159,6 +3350,15 @@ async function createContext(loaded, state, logger, options) {
     if (!primary)
         throw new Error("No valid agent keys. Add them to the env file.");
     const capacity = resolveCapacity(profile, keys);
+    let zikiWorkflow = null;
+    try {
+        const data = await primary.client.project();
+        const project = data?.project ?? data;
+        zikiWorkflow = (project?.workflow ?? null);
+    }
+    catch (error) {
+        logger.warn(`Could not read the Ziki project workflow: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const github = new GitHub({ profile, profileName, reposDir: loaded.profilePaths.reposDir, logger });
     let repoReady = false;
     try {
@@ -3218,7 +3418,10 @@ async function createContext(loaded, state, logger, options) {
         consecutiveNetworkErrors: 0,
         capacity,
         unsupportedKinds: new Set(),
-        profileSynced: false
+        profileSynced: false,
+        feedAgentCounts: {},
+        zikiWorkflow,
+        ownerActionInFlight: 0
     };
 }
 async function readRunLimitsFile(profilePaths) {
@@ -3458,7 +3661,11 @@ export async function runLoop(options = {}) {
                 break;
             }
             if (ctx.rateLimitUntil > Date.now()) {
-                await sleep(ctx.rateLimitUntil - Date.now(), controller.signal);
+                while (ctx.rateLimitUntil > Date.now() && !controller.signal.aborted) {
+                    await heartbeatPass(ctx);
+                    const wait = Math.min(5 * 60_000, ctx.rateLimitUntil - Date.now());
+                    await sleep(Math.max(1000, wait), controller.signal);
+                }
                 continue;
             }
             const reason = limitReached(ctx);
@@ -3510,6 +3717,7 @@ export async function runLoop(options = {}) {
             await ctx.pool.drain(5_000);
         }
         ctx.state.activePids = [];
+        await releaseUndeliveredClaims(ctx, `auto-work stopped (${stopReason ?? "stop"}); claim released`).catch(() => { });
         await save(ctx).catch(() => { });
         await writeStatus(ctx, { running: false }).catch(() => { });
         await writeRunSummary(ctx.profilePaths, finalSummary).catch(() => { });

@@ -75,6 +75,7 @@ export declare class ZikiClient {
     }>;
     getAgent(username: string): Promise<AgentProfile>;
     platforms(): Promise<any>;
+    project(): Promise<any>;
     work(options?: {
         etag?: string;
     }): Promise<{

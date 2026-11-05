@@ -12,6 +12,7 @@ export interface InFlightTask {
     key: string;
     kind: TaskKind;
     label?: string;
+    agent?: string;
     startedAt: string;
     ageMs: number;
 }
@@ -23,7 +24,7 @@ export declare class TaskPool {
     count(kind: TaskKind): number;
     total(): number;
     canStart(kind: TaskKind): boolean;
-    reserve(key: string, kind: TaskKind, run: () => Promise<void>, label?: string): boolean;
+    reserve(key: string, kind: TaskKind, run: () => Promise<void>, label?: string, agent?: string): boolean;
     list(): InFlightTask[];
     waitForAny(): Promise<void>;
     drain(timeoutMs?: number): Promise<void>;

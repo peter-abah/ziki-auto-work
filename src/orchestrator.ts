@@ -89,6 +89,8 @@ import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 import { resolveCapacity } from "./capacity.js";
+import { mergeWorkItemFeeds } from "./feed.js";
+import type { AgentFeed } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import type { Capacity } from "./capacity.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
@@ -146,6 +148,9 @@ interface Context {
   capacity: Capacity;
   unsupportedKinds: Set<string>;
   profileSynced: boolean;
+  feedAgentCounts: Record<string, number>;
+  zikiWorkflow: Record<string, unknown> | null;
+  ownerActionInFlight: number;
 }
 
 function setPhase(ctx: Context, phase: string, activity: string | null = null): void {
@@ -170,8 +175,9 @@ function renderLive(ctx: Context): { line: string; key: string } {
   const needs = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open").length;
   const tokens = ctx.state.run.tokens;
   const tokenText = `tokens ${formatTokens(tokens.total)}${tokens.estimated ? " est" : ""}`;
+  const agentText = `agents ${tasks.length}/${ctx.capacity.totalKeys}`;
   return {
-    line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${tokenText}`,
+    line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${agentText} · ${tokenText}`,
     key: `${ctx.phase}|${first?.key ?? ""}|${first?.label ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
   };
 }
@@ -491,8 +497,140 @@ function agentForItem(ctx: Context, item: QueueEntry): AgentClient {
   return clientByName(ctx, item.item._feedAgent) ?? ctx.primary;
 }
 
-function activeClaims(ctx: Context): TaskState[] {
-  return Object.values(ctx.state.tasks).filter((task) => ["claimed", "working"].includes(task.status));
+const CLAIM_ADDING_WORK = new Set(["offer", "ready_issue"]);
+
+const OWNER_LEVEL_AUX = new Set([
+  "idea",
+  "convert_idea",
+  "reject_idea",
+  "confirm_issue",
+  "close_issue",
+  "sense_check",
+  "vote_importance",
+  "estimate_reward",
+  "review_comment",
+  "vote_stake",
+  "award_bid",
+  "review_bid",
+  "categorize"
+]);
+
+function isManagerAgent(ctx: Context, agent: AgentClient | null | undefined): boolean {
+  return Boolean(agent && ctx.clients.managers.some((entry) => entry.name === agent.name));
+}
+
+function managerFor(ctx: Context, preferred?: AgentClient | null, exclude: string[] = []): AgentClient | null {
+  const excluded = new Set(exclude.filter(Boolean));
+  if (preferred && isManagerAgent(ctx, preferred) && !excluded.has(preferred.name)) return preferred;
+  return ctx.clients.managers.find((agent) => !excluded.has(agent.name)) ?? null;
+}
+
+function agentHoldsClaim(ctx: Context, name: string): boolean {
+  return Object.values(ctx.state.tasks).some(
+    (task) => task.agentName === name && Boolean(task.claimId) && ["claimed", "working", "queued"].includes(task.status)
+  );
+}
+
+function agentIsFree(ctx: Context, agent: AgentClient): boolean {
+  return !ctx.reservedAgents.has(agent.name);
+}
+
+function resolveAgent(
+  ctx: Context,
+  item: QueueEntry,
+  options: { forDelivery?: boolean; forReview?: boolean } = {}
+): AgentClient | null {
+  const preferred = clientByName(ctx, item.item._feedAgent);
+  const usable = (agent: AgentClient | null | undefined): agent is AgentClient => {
+    if (!agent || !agentIsFree(ctx, agent)) return false;
+    if (
+      options.forDelivery &&
+      item.kind !== "active_claim" &&
+      item.kind !== "review_offer" &&
+      item.kind !== "job_review_offer" &&
+      agentHoldsClaim(ctx, agent.name)
+    ) {
+      return false;
+    }
+    return true;
+  };
+  const role = item.item.minimumRole;
+
+  if (item.kind === "offer") {
+    if (claimCapacityReached(ctx)) return null;
+    return usable(preferred) ? preferred : null;
+  }
+  if (item.kind === "active_claim" || item.kind === "review_offer" || item.kind === "job_review_offer") {
+    return usable(preferred) ? preferred : null;
+  }
+
+  if (role === "manager" || role === "merger") {
+    if (usable(preferred) && isManagerAgent(ctx, preferred)) return preferred;
+    return ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+  }
+
+  if (OWNER_LEVEL_AUX.has(item.kind)) {
+    for (const agent of [ctx.primary, preferred, ...ctx.clients.workers, ...ctx.clients.managers]) {
+      if (usable(agent)) return agent;
+    }
+    return null;
+  }
+
+  if (usable(preferred)) return preferred;
+  return ctx.clients.workers.find((agent) => usable(agent)) ?? ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+}
+
+function nextDispatch(
+  ctx: Context,
+  bucket: QueueEntry[] | undefined,
+  options: { forDelivery?: boolean; forReview?: boolean; skipOwnerLevel?: boolean; skipClaimAdding?: boolean } = {}
+): { item: QueueEntry; agent: AgentClient } | null {
+  for (const item of bucket ?? []) {
+    if (ctx.pool.has(item.key) || item.item.canAct === false) continue;
+    if (options.skipOwnerLevel && OWNER_LEVEL_AUX.has(item.kind)) continue;
+    if (options.skipClaimAdding && CLAIM_ADDING_WORK.has(item.kind)) continue;
+    const agent = resolveAgent(ctx, item, options);
+    if (agent) return { item, agent };
+  }
+  return null;
+}
+
+function zikiClaimLimit(ctx: Context): number | null {
+  const value = Number(ctx.zikiWorkflow?.maxActiveClaims);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function ownClaimCount(ctx: Context): number {
+  return Object.values(ctx.state.tasks).filter(
+    (task) => Boolean(task.claimId) && ["claimed", "working", "queued", "waiting_human"].includes(task.status)
+  ).length;
+}
+
+function claimCapacityReached(ctx: Context): boolean {
+  const limit = zikiClaimLimit(ctx);
+  return limit !== null && ownClaimCount(ctx) >= limit;
+}
+
+async function releaseClaim(ctx: Context, task: TaskState, agent: AgentClient | null, reason: string): Promise<void> {
+  if (!task.claimId) return;
+  const actor = agent ?? (task.agentName ? clientByName(ctx, task.agentName) : null);
+  if (actor) {
+    try {
+      await actor.client.release(task.id ?? task.number ?? "");
+    } catch (error) {
+      ctx.logger.warn(`Could not release claim for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  task.claimId = undefined;
+  task.lastError = reason;
+}
+
+async function releaseUndeliveredClaims(ctx: Context, reason: string): Promise<void> {
+  for (const task of Object.values(ctx.state.tasks)) {
+    if (!task.claimId) continue;
+    if (!["queued", "claimed", "working", "waiting_human"].includes(task.status)) continue;
+    await releaseClaim(ctx, task, null, reason);
+  }
 }
 
 function pickWorker(ctx: Context, exclude: string[] = []): AgentClient | null {
@@ -800,6 +938,28 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
     queue: ctx.queue?.counts ?? null,
     capacity: ctx.capacity,
     profileLimits: ctx.profile.limits,
+    feedAgents: ctx.feedAgentCounts,
+    zikiWorkflow: {
+      maxActiveClaims: zikiClaimLimit(ctx),
+      stakeLimit: Number(ctx.zikiWorkflow?.stakeLimit) || null
+    },
+    agents: [...ctx.clients.workers, ...ctx.clients.managers].map((agent) => {
+      const owned = tasks.filter((task) => task.agentName === agent.name);
+      const current = owned.find((task) => ["claimed", "working"].includes(task.status)) ?? owned.find((task) => task.status === "queued" && task.claimId);
+      const poolTask = ctx.pool.list().find((task) => task.agent === agent.name);
+      const last = current?.lastHeartbeatAt ? new Date(current.lastHeartbeatAt).getTime() : 0;
+      const stale = Boolean(current && !["delivered"].includes(current.status) && (!last || Date.now() - last > 15 * 60 * 1000));
+      return {
+        name: agent.name,
+        level: isManagerAgent(ctx, agent) ? "manager" : "working",
+        busy: Boolean(poolTask),
+        current: poolTask ? { key: poolTask.key, kind: poolTask.kind, label: poolTask.label, ageMs: poolTask.ageMs } : null,
+        claim: current?.number ?? null,
+        claimStatus: current?.status ?? null,
+        lastHeartbeatAt: current?.lastHeartbeatAt ?? null,
+        stale
+      };
+    }),
     unsupportedKinds: [...ctx.unsupportedKinds],
     tasks: {
       total: tasks.length,
@@ -927,12 +1087,10 @@ async function save(ctx: Context): Promise<void> {
 }
 
 async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
-  const agents = [ctx.clients.workers[0], ctx.clients.managers[0]].filter(Boolean) as AgentClient[];
+  const agents = [...ctx.clients.workers, ...ctx.clients.managers];
   if (!agents.length) return null;
 
-  const merged = new Map<string, WorkItem>();
-  let base: WorkFeed | null = null;
-
+  const feeds: AgentFeed[] = [];
   for (const agent of agents) {
     try {
       const etag = ctx.state.feedEtags[agent.name];
@@ -947,22 +1105,17 @@ async function fetchMergedFeed(ctx: Context): Promise<WorkFeed | null> {
       }
       if (!result.data) continue;
       ctx.feedCache[agent.name] = result.data;
-      if (!base) base = result.data;
-      for (const item of result.data.items ?? []) {
-        item._feedAgent = agent.name;
-        const previous = merged.get(item.key);
-        if (!previous || (item.actions?.length ?? 0) > (previous.actions?.length ?? 0)) {
-          merged.set(item.key, item);
-        }
-      }
+      feeds.push({ agent: agent.name, feed: result.data });
       if (result.etag) ctx.state.feedEtags[agent.name] = result.etag;
     } catch (error) {
       ctx.logger.warn(`Work feed failed for ${agent.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  if (!base) return null;
-  return { ...base, items: [...merged.values()] };
+  const merged = mergeWorkItemFeeds(feeds);
+  ctx.feedAgentCounts = merged.counts;
+  if (!merged.base) return null;
+  return { ...merged.base, items: merged.items };
 }
 
 async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
@@ -1004,7 +1157,11 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
 
 async function heartbeatPass(ctx: Context): Promise<void> {
   const now = Date.now();
-  const live = Object.values(ctx.state.tasks).filter((task) => ["claimed", "working", "waiting_human"].includes(task.status));
+  const live = Object.values(ctx.state.tasks).filter(
+    (task) =>
+      ["claimed", "working", "waiting_human", "delivered"].includes(task.status) ||
+      (task.status === "queued" && Boolean(task.claimId))
+  );
   for (const task of live) {
     if (!task.agentName || !task.id) continue;
     const last = task.lastHeartbeatAt ? new Date(task.lastHeartbeatAt).getTime() : 0;
@@ -1018,8 +1175,8 @@ async function heartbeatPass(ctx: Context): Promise<void> {
     } catch (error) {
       ctx.logger.warn(`Heartbeat failed for #${task.number}: ${error instanceof Error ? error.message : String(error)}`);
       if ([409, 410].includes((error as { status?: number }).status ?? 0) && task.status !== "waiting_human") {
-        task.status = "queued";
         task.claimId = undefined;
+        if (task.status !== "delivered") task.status = "queued";
         task.lastError = "claim lost";
       }
     }
@@ -1094,19 +1251,19 @@ async function writeOwnerResult(ctx: Context, requestId: string, request: string
 
 async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?: AgentClient): Promise<void> {
   if (item.kind === "review_offer") {
-    await processReviewOffer(ctx, item);
+    await processReviewOffer(ctx, item, preferredWorker);
     return;
   }
   if (item.kind === "job_review_offer") {
-    await processJobReviewOffer(ctx, item);
+    await processJobReviewOffer(ctx, item, preferredWorker);
     return;
   }
   if (item.kind === "open_issue") {
-    await processOpenIssue(ctx, item);
+    await processOpenIssue(ctx, item, preferredWorker);
     return;
   }
   if (item.kind === "reclaim_issue") {
-    await processReclaim(ctx, item);
+    await processReclaim(ctx, item, preferredWorker);
     return;
   }
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
@@ -1231,7 +1388,16 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   taskUsage(ctx, issue, result.tokens);
   if (await handleProviderLimit(ctx, result)) {
     await cleanupWorktree(ctx.github, dir);
-    setTask(ctx.state, issue, { status: "queued", lastError: result.error ?? "provider limit", worktree: undefined });
+    const task = ctx.state.tasks[taskKey(issue)] ?? null;
+    if (result.providerLimit === "quota" && task) {
+      await releaseClaim(ctx, task, worker, "provider quota exhausted; claim released");
+    }
+    setTask(ctx.state, issue, {
+      status: "queued",
+      claimId: result.providerLimit === "quota" ? undefined : task?.claimId,
+      lastError: result.error ?? `provider ${result.providerLimit ?? "limit"}`,
+      worktree: undefined
+    });
     markRecent(ctx, item.key);
     await save(ctx);
     return;
@@ -1423,9 +1589,21 @@ async function handleWorkFailure(
     if (escalation.ok) {
       history(ctx, { type: "escalation", issue: issue.number, detail: environmentHint ?? "blocker", data: { id: escalation.escalation?.id } });
       await notifyNeedsYou(ctx);
+      if (result.providerLimit === "context") {
+        const task = ctx.state.tasks[taskKey(issue)] ?? null;
+        if (task) await releaseClaim(ctx, task, worker, "context overflow; claim released for a human");
+        setTask(ctx.state, issue, {
+          status: "waiting_human",
+          attempts,
+          claimId: undefined,
+          lastError: error,
+          worktree: undefined
+        });
+      }
     }
     if (!escalation.ok) {
-      await worker.client.release(issue.id).catch(() => {});
+      const task = ctx.state.tasks[taskKey(issue)] ?? null;
+      if (task) await releaseClaim(ctx, task, worker, error);
       setTask(ctx.state, issue, {
         status: "queued",
         attempts,
@@ -1435,8 +1613,9 @@ async function handleWorkFailure(
       });
     }
   } else if (attempts >= maxAttempts) {
-    setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined });
-    await worker.client.release(issue.id).catch(() => {});
+    const task = ctx.state.tasks[taskKey(issue)] ?? null;
+    if (task) await releaseClaim(ctx, task, worker, error);
+    setTask(ctx.state, issue, { status: "failed", attempts, lastError: error, worktree: undefined, claimId: undefined });
     await recordTaskNote(worker.client, issue, "failed", error, result.tail ?? "", ctx.state, worker.name);
     await notifyProfile(
       ctx.profile,
@@ -1520,6 +1699,10 @@ async function ensureBidAndAward(
 ): Promise<{ agent: AgentClient; claimId: string } | null> {
   const worker = preferred ?? pickWorker(ctx);
   if (!worker) return null;
+  if (claimCapacityReached(ctx)) {
+    ctx.logger.info(`Not bidding on #${issue.number}: ${ownClaimCount(ctx)}/${zikiClaimLimit(ctx)} Ziki claims already active for this owner`);
+    return null;
+  }
   const awarder = pickManager(ctx) ?? worker;
 
   let bids: any[] = [];
@@ -1694,7 +1877,7 @@ async function processTestFix(ctx: Context, item: QueueEntry, preferred?: AgentC
   await save(ctx);
 }
 
-async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
+async function processAccept(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<void> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue) {
@@ -1702,7 +1885,7 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
     return;
   }
   const holder = issue.holder?.agentName ?? null;
-  const manager = pickManager(ctx, [holder ?? ""]);
+  const manager = managerFor(ctx, preferred, [holder ?? ""]);
   if (!manager) {
     ctx.logger.debug(`Skipping merge review for #${issue.number}: no manager/merger agent configured`);
     markRecent(ctx, item.key);
@@ -1750,7 +1933,7 @@ async function processAccept(ctx: Context, item: QueueEntry): Promise<void> {
   await save(ctx);
 }
 
-async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processAuxItem(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   if (item.item.canAct === false) {
     markRecent(ctx, item.key);
     return false;
@@ -1759,76 +1942,76 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
     let did = false;
     switch (item.kind) {
       case "report_pr_status":
-        did = await processPrReport(ctx, item);
+        did = await processPrReport(ctx, item, preferred);
         break;
       case "report_deployment":
-        did = await processDeploymentReport(ctx, item);
+        did = await processDeploymentReport(ctx, item, preferred);
         break;
       case "review_bid":
-        did = await processBidVote(ctx, item);
+        did = await processBidVote(ctx, item, preferred);
         break;
       case "award_bid":
-        did = await processAward(ctx, item);
+        did = await processAward(ctx, item, preferred);
         break;
       case "review_comment":
-        did = await processCommentUpvote(ctx, item);
+        did = await processCommentUpvote(ctx, item, preferred);
         break;
       case "categorize":
-        did = await processCategorize(ctx, item);
+        did = await processCategorize(ctx, item, preferred);
         break;
       case "idea":
-        did = await processIdeaVerdict(ctx, item);
+        did = await processIdeaVerdict(ctx, item, preferred);
         break;
       case "confirm_issue":
-        did = await processConfirm(ctx, item);
+        did = await processConfirm(ctx, item, preferred);
         break;
       case "open_issue":
-        did = await processOpenIssue(ctx, item);
+        did = await processOpenIssue(ctx, item, preferred);
         break;
       case "refresh_stake":
-        did = await processRefreshStake(ctx, item);
+        did = await processRefreshStake(ctx, item, preferred);
         break;
       case "reclaim_issue":
-        did = await processReclaim(ctx, item);
+        did = await processReclaim(ctx, item, preferred);
         break;
       case "await_release":
-        did = await processAwaitRelease(ctx, item);
+        did = await processAwaitRelease(ctx, item, preferred);
         break;
       case "repair_pull_request":
-        did = await processRepairPullRequest(ctx, item);
+        did = await processRepairPullRequest(ctx, item, preferred);
         break;
       case "convert_idea":
-        did = await processConvertIdea(ctx, item);
+        did = await processConvertIdea(ctx, item, preferred);
         break;
       case "reject_idea":
-        did = await processRejectIdea(ctx, item);
+        did = await processRejectIdea(ctx, item, preferred);
         break;
       case "estimate_reward":
-        did = await processEstimate(ctx, item);
+        did = await processEstimate(ctx, item, preferred);
         break;
       case "investigate_issue":
-        did = await processInvestigate(ctx, item);
+        did = await processInvestigate(ctx, item, preferred);
         break;
       case "vote_importance":
-        did = await processImportance(ctx, item);
+        did = await processImportance(ctx, item, preferred);
         break;
       case "vote_stake":
-        did = await processStakeVote(ctx, item);
+        did = await processStakeVote(ctx, item, preferred);
         break;
       case "sense_check":
-        did = await processSenseCheck(ctx, item);
+        did = await processSenseCheck(ctx, item, preferred);
         break;
       case "close_issue":
-        did = await processClose(ctx, item);
+        did = await processClose(ctx, item, preferred);
         break;
       case "research_job":
-        did = await processResearchJob(ctx, item);
+        did = await processResearchJob(ctx, item, preferred);
         break;
       case "review_offer":
-        did = await processReviewOffer(ctx, item);
+        did = await processReviewOffer(ctx, item, preferred);
         break;
       case "job_review_offer":
-        did = await processJobReviewOffer(ctx, item);
+        did = await processJobReviewOffer(ctx, item, preferred);
         break;
       default:
         ctx.logger.warn(`Unhandled Ziki work kind "${item.kind}" for #${item.issueNumber ?? item.ideaNumber ?? "?"}; skipping`);
@@ -1852,7 +2035,7 @@ async function processAuxItem(ctx: Context, item: QueueEntry): Promise<boolean> 
   }
 }
 
-async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processPrReport(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue?.pullRequestUrl) {
@@ -1860,7 +2043,7 @@ async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean>
     return false;
   }
   const holder = issue.holder?.agentName ?? null;
-  const reporter = pickManager(ctx, [holder ?? ""]) ?? pickWorker(ctx, [holder ?? ""]);
+  const reporter = managerFor(ctx, preferred, [holder ?? ""]) ?? pickWorker(ctx, [holder ?? ""]);
   if (!reporter) {
     markRecent(ctx, item.key);
     return false;
@@ -1878,7 +2061,7 @@ async function processPrReport(ctx: Context, item: QueueEntry): Promise<boolean>
   return true;
 }
 
-async function processDeploymentReport(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processDeploymentReport(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue) {
@@ -1897,7 +2080,7 @@ async function processDeploymentReport(ctx: Context, item: QueueEntry): Promise<
     markRecent(ctx, item.key);
     return false;
   }
-  const reporter = pickManager(ctx) ?? pickWorker(ctx);
+  const reporter = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!reporter) {
     markRecent(ctx, item.key);
     return false;
@@ -1944,7 +2127,7 @@ async function isInDefaultBranch(ctx: Context, sha: string | null): Promise<bool
   }
 }
 
-async function processBidVote(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processBidVote(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const bidId = (item.actions.find((action) => action.name === "vote_bid")?.path ?? "").match(/bids\/([^/]+)\/votes/)?.[1];
   if (!bidId) {
     markRecent(ctx, item.key);
@@ -1954,14 +2137,14 @@ async function processBidVote(ctx: Context, item: QueueEntry): Promise<boolean> 
     markRecent(ctx, item.key);
     return false;
   }
-  const voter = pickManager(ctx) ?? pickWorker(ctx);
+  const voter = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!voter) return false;
   await voter.client.voteBid(bidId);
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processAward(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processAward(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const bidId = (item.actions.find((action) => action.name === "award_bid")?.path ?? "").match(/bids\/([^/]+)\/award/)?.[1];
   if (!bidId) {
     markRecent(ctx, item.key);
@@ -1972,7 +2155,7 @@ async function processAward(ctx: Context, item: QueueEntry): Promise<boolean> {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx) ?? pickWorker(ctx);
+  const manager = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!manager) return false;
   try {
     await manager.client.awardBid(bidId);
@@ -1985,7 +2168,7 @@ async function processAward(ctx: Context, item: QueueEntry): Promise<boolean> {
   return true;
 }
 
-async function processCommentUpvote(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processCommentUpvote(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const commentId = (item.actions.find((action) => action.name === "upvote_comment")?.path ?? "").match(/comments\/([^/]+)\/votes/)?.[1];
   if (!commentId) {
     markRecent(ctx, item.key);
@@ -1995,15 +2178,15 @@ async function processCommentUpvote(ctx: Context, item: QueueEntry): Promise<boo
     markRecent(ctx, item.key);
     return false;
   }
-  const voter = pickWorker(ctx) ?? pickManager(ctx);
+  const voter = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
   if (!voter) return false;
   await voter.client.upvoteComment(commentId);
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolean> {
-  const actor = pickWorker(ctx) ?? pickManager(ctx);
+async function processCategorize(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
+  const actor = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
   if (!actor) return false;
   let did = 0;
   try {
@@ -2035,15 +2218,15 @@ async function processCategorize(ctx: Context, item: QueueEntry): Promise<boolea
   return did > 0;
 }
 
-async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processIdeaVerdict(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
   const idea = normalizeIdea(data);
   if (!idea) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx);
-  const voter = manager ?? pickWorker(ctx);
+  const manager = managerFor(ctx, preferred);
+  const voter = manager ?? preferred ?? pickWorker(ctx);
   if (!voter) {
     markRecent(ctx, item.key);
     return false;
@@ -2101,14 +2284,14 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry): Promise<boole
   return true;
 }
 
-async function processConfirm(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processConfirm(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
   if (!issue || issue.substatus !== "requires_confirmation") {
     markRecent(ctx, item.key);
     return false;
   }
-  const confirmer = pickManagerOrWorker(ctx);
+  const confirmer = preferred ?? pickManagerOrWorker(ctx);
   if (!confirmer) return false;
   const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
   const result = await withScratch(ctx, `confirm-aux-${issue.number}`, (dir) =>
@@ -2175,19 +2358,19 @@ function pullRequestUrlFrom(item: QueueEntry): string | null {
   return text.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/)?.[0] ?? null;
 }
 
-async function processOpenIssue(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processOpenIssue(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  await agentForItem(ctx, item).client.openIssue(issue.id);
+  await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
   history(ctx, { type: "aux", issue: issue.number, detail: "opened issue" });
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processRefreshStake(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processRefreshStake(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   let stakeId = actionId(item, ["refresh_stake"], /stakes\/([^/]+)\/refresh/);
   if (!stakeId && item.issueId) {
     const stakes = await ctx.primary.client.listStakes(item.issueId).catch(() => null);
@@ -2198,30 +2381,30 @@ async function processRefreshStake(ctx: Context, item: QueueEntry): Promise<bool
     markRecent(ctx, item.key);
     return false;
   }
-  await agentForItem(ctx, item).client.refreshStake(stakeId);
+  await (preferred ?? agentForItem(ctx, item)).client.refreshStake(stakeId);
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processReclaim(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processReclaim(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  await agentForItem(ctx, item).client.reclaim(issue.id);
+  await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
   history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed stale work" });
   markRecent(ctx, item.key);
   return true;
 }
 
-async function processReconcileMerged(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processReconcileMerged(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue?.pullRequestUrl) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickManager(ctx);
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
   if (!manager) {
     markRecent(ctx, item.key);
     return false;
@@ -2244,13 +2427,13 @@ async function processReconcileMerged(ctx: Context, item: QueueEntry): Promise<b
   return true;
 }
 
-async function processAwaitRelease(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processAwaitRelease(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue?.pullRequestUrl) {
     markRecent(ctx, item.key);
     return false;
   }
-  const reporter = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
+  const reporter = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
   if (!reporter) {
     markRecent(ctx, item.key);
     return false;
@@ -2265,13 +2448,13 @@ async function processAwaitRelease(ctx: Context, item: QueueEntry): Promise<bool
   return true;
 }
 
-async function processRepairPullRequest(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processRepairPullRequest(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickManager(ctx);
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
   if (!manager) {
     markRecent(ctx, item.key);
     return false;
@@ -2282,7 +2465,7 @@ async function processRepairPullRequest(ctx: Context, item: QueueEntry): Promise
   return true;
 }
 
-async function processConvertIdea(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processConvertIdea(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
   const idea = normalizeIdea(data);
   if (!idea) {
@@ -2296,7 +2479,7 @@ async function processConvertIdea(ctx: Context, item: QueueEntry): Promise<boole
     return false;
   }
   try {
-    await agentForItem(ctx, item).client.convertIdea(idea.id);
+    await (preferred ?? agentForItem(ctx, item)).client.convertIdea(idea.id);
     history(ctx, { type: "aux", idea: idea.number, detail: "converted idea" });
     markRecent(ctx, item.key);
     return true;
@@ -2308,14 +2491,14 @@ async function processConvertIdea(ctx: Context, item: QueueEntry): Promise<boole
   }
 }
 
-async function processRejectIdea(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processRejectIdea(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIdea(item.ideaId ?? item.ideaNumber ?? "");
   const idea = normalizeIdea(data);
   if (!idea) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx);
+  const manager = managerFor(ctx, preferred);
   if (!manager) {
     markRecent(ctx, item.key);
     return false;
@@ -2332,13 +2515,13 @@ async function processRejectIdea(ctx: Context, item: QueueEntry): Promise<boolea
   return true;
 }
 
-async function processEstimate(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processEstimate(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const agent = pickWorker(ctx) ?? ctx.primary;
+  const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
   const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
   const result = await withScratch(ctx, `estimate-${issue.number}`, (dir) =>
     runEstimate({
@@ -2372,13 +2555,13 @@ async function processEstimate(ctx: Context, item: QueueEntry): Promise<boolean>
   return true;
 }
 
-async function processInvestigate(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processInvestigate(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const agent = pickWorker(ctx) ?? ctx.primary;
+  const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
   const loopContext = await loopContextFor(ctx, { issue });
   const result = await withScratch(ctx, `investigate-${issue.number}`, (dir) =>
     runInvestigate({
@@ -2412,13 +2595,13 @@ async function processInvestigate(ctx: Context, item: QueueEntry): Promise<boole
   return true;
 }
 
-async function processImportance(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processImportance(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const agent = pickManager(ctx) ?? pickWorker(ctx);
+  const agent = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!agent) {
     markRecent(ctx, item.key);
     return false;
@@ -2451,7 +2634,7 @@ async function processImportance(ctx: Context, item: QueueEntry): Promise<boolea
   return true;
 }
 
-async function processStakeVote(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processStakeVote(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const stakeIds = item.actions
     .map((action) => action.path.match(/stakes\/([^/]+)\/votes/)?.[1])
     .filter((value): value is string => Boolean(value));
@@ -2465,7 +2648,7 @@ async function processStakeVote(ctx: Context, item: QueueEntry): Promise<boolean
   }
   const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
   const stakes = issue ? await ctx.primary.client.listStakes(issue.id).catch(() => null) : null;
-  const voter = pickManager(ctx) ?? pickWorker(ctx);
+  const voter = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!voter) {
     markRecent(ctx, item.key);
     return false;
@@ -2504,13 +2687,13 @@ async function processStakeVote(ctx: Context, item: QueueEntry): Promise<boolean
   return true;
 }
 
-async function processSenseCheck(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processSenseCheck(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const agent = pickManager(ctx) ?? pickWorker(ctx);
+  const agent = managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!agent) {
     markRecent(ctx, item.key);
     return false;
@@ -2554,15 +2737,15 @@ const CLOSE_REASONS = new Set([
   "withdrawn"
 ]);
 
-async function processClose(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processClose(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx);
+  const manager = managerFor(ctx, preferred);
   const actingAs: "working" | "manager" = manager && item.item.minimumRole === "manager" ? "manager" : "working";
-  const agent = (actingAs === "manager" ? manager : null) ?? pickWorker(ctx) ?? manager;
+  const agent = (actingAs === "manager" ? manager : preferred) ?? pickWorker(ctx) ?? manager;
   if (!agent) {
     markRecent(ctx, item.key);
     return false;
@@ -2615,7 +2798,7 @@ async function processClose(ctx: Context, item: QueueEntry): Promise<boolean> {
   return true;
 }
 
-async function processResearchJob(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processResearchJob(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const jobId =
     actionId(item, [], /\/jobs\/([^/]+)\/submissions/) ??
     item.actions.map((action) => action.path.match(/\/jobs\/([^/]+)/)?.[1]).find(Boolean) ??
@@ -2625,7 +2808,7 @@ async function processResearchJob(ctx: Context, item: QueueEntry): Promise<boole
     markRecent(ctx, item.key);
     return false;
   }
-  const agent = pickWorker(ctx) ?? ctx.primary;
+  const agent = preferred ?? pickWorker(ctx) ?? ctx.primary;
   const job = await agent.client.getJob(jobId);
   const loopContext = await loopContextFor(ctx, { includeGit: false });
   const result = await withScratch(ctx, `research-${jobId}`, (dir) =>
@@ -2655,26 +2838,26 @@ async function processResearchJob(ctx: Context, item: QueueEntry): Promise<boole
   return true;
 }
 
-async function processReviewOffer(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processReviewOffer(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const offerId = actionId(item, [], /\/reviews\/([^/]+)\/accept/);
   if (!offerId) {
     markRecent(ctx, item.key);
     return false;
   }
-  const reviewer = agentForItem(ctx, item);
+  const reviewer = preferred ?? agentForItem(ctx, item);
   await reviewer.client.acceptReviewOffer(offerId);
   history(ctx, { type: "accept", issue: item.issueNumber, detail: "accepted review offer" });
   await processTestFix(ctx, item, reviewer);
   return true;
 }
 
-async function processJobReviewOffer(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processJobReviewOffer(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const offerId = actionId(item, [], /\/jobs\/reviews\/([^/]+)\/accept/);
   if (!offerId) {
     markRecent(ctx, item.key);
     return false;
   }
-  const agent = agentForItem(ctx, item);
+  const agent = preferred ?? agentForItem(ctx, item);
   await agent.client.acceptJobReview(offerId);
   const jobId =
     item.actions.map((action) => action.path.match(/\/jobs\/(?!reviews\/)([^/]+)/)?.[1]).find(Boolean) ??
@@ -2724,13 +2907,13 @@ async function processJobReviewOffer(ctx: Context, item: QueueEntry): Promise<bo
   return true;
 }
 
-async function processReviewIdle(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processReviewIdle(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx);
+  const manager = managerFor(ctx, preferred);
   if (!manager) {
     markRecent(ctx, item.key);
     return false;
@@ -2747,13 +2930,13 @@ async function processReviewIdle(ctx: Context, item: QueueEntry): Promise<boolea
   return true;
 }
 
-async function processDeliverStranded(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processDeliverStranded(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue?.pullRequestUrl) {
     markRecent(ctx, item.key);
     return false;
   }
-  const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]);
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
   if (!manager) {
     markRecent(ctx, item.key);
     return false;
@@ -2790,7 +2973,7 @@ async function processDeliverStranded(ctx: Context, item: QueueEntry): Promise<b
   return true;
 }
 
-async function processMergeFix(ctx: Context, item: QueueEntry): Promise<boolean> {
+async function processMergeFix(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const issue = await loadIssueForItem(ctx, item);
   if (!issue?.pullRequestUrl) {
     markRecent(ctx, item.key);
@@ -2802,7 +2985,7 @@ async function processMergeFix(ctx: Context, item: QueueEntry): Promise<boolean>
     markRecent(ctx, item.key);
     return false;
   }
-  const reporter = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
+  const reporter = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]) ?? pickWorker(ctx, [issue.holder?.agentName ?? ""]);
 
   if (mode === "never") {
     ctx.logger.info(`merge_fix for #${issue.number} skipped: mergeMode is "never"`);
@@ -2845,7 +3028,7 @@ async function processMergeFix(ctx: Context, item: QueueEntry): Promise<boolean>
 
   await ctx.github.mergePr(issue.pullRequestUrl, resolveMergeMethod(ctx.profile));
   const merged = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
-  const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]);
+  const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
   if (merged && manager) {
     await reportPrStatusWith(ctx, manager, issue, merged).catch(() => {});
     const inDefault = await isInDefaultBranch(ctx, merged.mergeCommitSha);
@@ -3061,7 +3244,7 @@ async function ownerDecisionPass(ctx: Context): Promise<void> {
     if (merge && (["done", "accepted", "merge"].includes(issue.status) || issue.substatus === "requires_review")) {
       const key = stateKey(merge);
       if (ctx.state.recentFeedKeys[key]) continue;
-      const manager = pickManager(ctx, [issue.holder?.agentName ?? ""]) ?? pickManager(ctx);
+      const manager = managerFor(ctx, null, [issue.holder?.agentName ?? ""]);
       if (!manager) continue;
       try {
         if (!merge.answer) {
@@ -3241,10 +3424,6 @@ function discoveryDue(ctx: Context): boolean {
   return ctx.state.cycles > 0 && ctx.state.cycles % every === 0;
 }
 
-function nextItem(ctx: Context, bucket: QueueEntry[] | undefined): QueueEntry | null {
-  return (bucket ?? []).find((entry) => !ctx.pool.has(entry.key) && entry.item.canAct !== false) ?? null;
-}
-
 async function processWorkSafe(ctx: Context, item: QueueEntry, worker?: AgentClient): Promise<void> {
   try {
     await processWorkItem(ctx, item, worker);
@@ -3272,14 +3451,14 @@ async function processWorkSafe(ctx: Context, item: QueueEntry, worker?: AgentCli
   }
 }
 
-async function processReviewSafe(ctx: Context, item: QueueEntry): Promise<void> {
+async function processReviewSafe(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<void> {
   try {
-    if (item.kind === "test_fix") await processTestFix(ctx, item);
-    else if (item.kind === "accept_fix") await processAccept(ctx, item);
-    else if (item.kind === "review_idle") await processReviewIdle(ctx, item);
-    else if (item.kind === "deliver_stranded") await processDeliverStranded(ctx, item);
-    else if (item.kind === "merge_fix") await processMergeFix(ctx, item);
-    else if (item.kind === "reconcile_merged") await processReconcileMerged(ctx, item);
+    if (item.kind === "test_fix") await processTestFix(ctx, item, preferred);
+    else if (item.kind === "accept_fix") await processAccept(ctx, item, preferred);
+    else if (item.kind === "review_idle") await processReviewIdle(ctx, item, preferred);
+    else if (item.kind === "deliver_stranded") await processDeliverStranded(ctx, item, preferred);
+    else if (item.kind === "merge_fix") await processMergeFix(ctx, item, preferred);
+    else if (item.kind === "reconcile_merged") await processReconcileMerged(ctx, item, preferred);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const network = isTransientNetworkError(error);
@@ -3328,53 +3507,111 @@ function dispatch(ctx: Context): void {
   reportUnsupported(ctx);
 
   if (pool.canStart("owner")) {
-    const owner = nextItem(ctx, ctx.queue?.owner);
-    if (owner) pool.reserve(owner.key, "owner", () => processOwnerItem(ctx, owner), `owner ${truncate(owner.title, 40)}`);
+    const pair = nextDispatch(ctx, ctx.queue?.owner);
+    if (pair) {
+      ctx.reservedAgents.add(pair.agent.name);
+      pool.reserve(
+        pair.item.key,
+        "owner",
+        async () => {
+          try {
+            await processOwnerItem(ctx, pair.item);
+          } finally {
+            ctx.reservedAgents.delete(pair.agent.name);
+          }
+        },
+        `owner ${truncate(pair.item.title, 40)}`,
+        pair.agent.name
+      );
+    }
   }
 
   while (pool.canStart("followup")) {
-    const task = Object.values(ctx.state.tasks).find((entry) => prFollowUpDue(ctx, entry));
+    const task = Object.values(ctx.state.tasks).find(
+      (entry) => prFollowUpDue(ctx, entry) && (!entry.agentName || !ctx.reservedAgents.has(entry.agentName))
+    );
     if (!task) break;
-    pool.reserve(prTaskKey(task), "followup", () => processPrFollowUpSafe(ctx, task), followUpLabel(task));
+    if (task.agentName) ctx.reservedAgents.add(task.agentName);
+    pool.reserve(
+      prTaskKey(task),
+      "followup",
+      async () => {
+        try {
+          await processPrFollowUpSafe(ctx, task);
+        } finally {
+          if (task.agentName) ctx.reservedAgents.delete(task.agentName);
+        }
+      },
+      followUpLabel(task),
+      task.agentName
+    );
   }
 
+  const maxClaims = Math.min(capacity.activeClaims, zikiClaimLimit(ctx) ?? capacity.activeClaims);
   while (pool.canStart("delivery") && pool.count("delivery") < capacity.delivery) {
-    if (activeClaims(ctx).length + pool.count("delivery") >= capacity.activeClaims) break;
     if (!underCap(counter(ctx).deliveries, limits.maxDeliveriesPerDay)) break;
     if (limits.maxDeliveriesTotal != null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal) break;
-    const item = (ctx.queue?.work ?? []).find((entry) => {
-      if (!entry.issueId || pool.has(entry.key)) return false;
-      const task = ctx.state.tasks[entry.issueId];
-      return !task || !["waiting_human", "delivered", "done", "failed", "skipped"].includes(task.status);
-    });
-    if (!item) break;
-    const worker = pickAvailableWorker(ctx);
-    if (!worker) break;
-    ctx.reservedAgents.add(worker.name);
-    pool.reserve(item.key, "delivery", async () => {
-      try {
-        await processWorkSafe(ctx, item, worker);
-      } finally {
-        ctx.reservedAgents.delete(worker.name);
-      }
-    }, taskLabel(item));
+    const atClaimCapacity = ownClaimCount(ctx) + pool.count("delivery") >= maxClaims;
+    const pair = nextDispatch(ctx, ctx.queue?.work, { forDelivery: true, skipClaimAdding: atClaimCapacity });
+    if (!pair) break;
+    ctx.reservedAgents.add(pair.agent.name);
+    pool.reserve(
+      pair.item.key,
+      "delivery",
+      async () => {
+        try {
+          await processWorkSafe(ctx, pair.item, pair.agent);
+        } finally {
+          ctx.reservedAgents.delete(pair.agent.name);
+        }
+      },
+      taskLabel(pair.item),
+      pair.agent.name
+    );
   }
 
   while (pool.canStart("review") && pool.count("review") < capacity.review) {
     if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay)) break;
-    const item = nextItem(ctx, ctx.queue?.review);
-    if (!item) break;
-    pool.reserve(item.key, "review", () => processReviewSafe(ctx, item), kindLabel(item, "review"));
+    const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
+    if (!pair) break;
+    ctx.reservedAgents.add(pair.agent.name);
+    pool.reserve(
+      pair.item.key,
+      "review",
+      async () => {
+        try {
+          await processReviewSafe(ctx, pair.item, pair.agent);
+        } finally {
+          ctx.reservedAgents.delete(pair.agent.name);
+        }
+      },
+      kindLabel(pair.item, "review"),
+      pair.agent.name
+    );
   }
 
   while (pool.canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
-    const item = nextItem(ctx, ctx.queue?.aux);
-    if (!item) break;
+    const pair = nextDispatch(ctx, ctx.queue?.aux, { skipOwnerLevel: ctx.ownerActionInFlight > 0 });
+    if (!pair) break;
     ctx.auxThisCycle += 1;
-    pool.reserve(item.key, "aux", async () => {
-      await processAuxItem(ctx, item);
-      await save(ctx).catch(() => {});
-    }, kindLabel(item, "aux"));
+    const ownerLevel = OWNER_LEVEL_AUX.has(pair.item.kind);
+    if (ownerLevel) ctx.ownerActionInFlight += 1;
+    ctx.reservedAgents.add(pair.agent.name);
+    pool.reserve(
+      pair.item.key,
+      "aux",
+      async () => {
+        try {
+          await processAuxItem(ctx, pair.item, pair.agent);
+          await save(ctx).catch(() => {});
+        } finally {
+          ctx.reservedAgents.delete(pair.agent.name);
+          if (ownerLevel) ctx.ownerActionInFlight = Math.max(0, ctx.ownerActionInFlight - 1);
+        }
+      },
+      kindLabel(pair.item, "aux"),
+      pair.agent.name
+    );
   }
 
   if (pool.canStart("discovery") && discoveryDue(ctx) && !pool.has("discovery")) {
@@ -3403,6 +3640,14 @@ async function createContext(
   const primary = clients.workers[0] ?? clients.managers[0];
   if (!primary) throw new Error("No valid agent keys. Add them to the env file.");
   const capacity = resolveCapacity(profile, keys);
+  let zikiWorkflow: Record<string, unknown> | null = null;
+  try {
+    const data = await primary.client.project();
+    const project = data?.project ?? data;
+    zikiWorkflow = (project?.workflow ?? null) as Record<string, unknown> | null;
+  } catch (error) {
+    logger.warn(`Could not read the Ziki project workflow: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   const github = new GitHub({ profile, profileName, reposDir: loaded.profilePaths.reposDir, logger });
   let repoReady = false;
@@ -3464,7 +3709,10 @@ async function createContext(
     consecutiveNetworkErrors: 0,
     capacity,
     unsupportedKinds: new Set(),
-    profileSynced: false
+    profileSynced: false,
+    feedAgentCounts: {},
+    zikiWorkflow,
+    ownerActionInFlight: 0
   };
 }
 
@@ -3709,7 +3957,11 @@ export async function runLoop(options: {
         break;
       }
       if (ctx.rateLimitUntil > Date.now()) {
-        await sleep(ctx.rateLimitUntil - Date.now(), controller.signal);
+        while (ctx.rateLimitUntil > Date.now() && !controller.signal.aborted) {
+          await heartbeatPass(ctx);
+          const wait = Math.min(5 * 60_000, ctx.rateLimitUntil - Date.now());
+          await sleep(Math.max(1000, wait), controller.signal);
+        }
         continue;
       }
       const reason = limitReached(ctx);
@@ -3759,6 +4011,7 @@ export async function runLoop(options: {
       await ctx.pool.drain(5_000);
     }
     ctx.state.activePids = [];
+    await releaseUndeliveredClaims(ctx, `auto-work stopped (${stopReason ?? "stop"}); claim released`).catch(() => {});
     await save(ctx).catch(() => {});
     await writeStatus(ctx, { running: false }).catch(() => {});
     await writeRunSummary(ctx.profilePaths, finalSummary).catch(() => {});

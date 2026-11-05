@@ -108,3 +108,12 @@ test("formatLiveTask prefers the label and falls back to the raw key", async () 
   assert.equal(formatLiveTask({ label: "#2631 review", key: "test_fix:1", kind: "review", ageMs: 120_000 }), "#2631 review 2m");
   assert.equal(formatLiveTask({ key: "test_fix:1", kind: "review", ageMs: 120_000 }), "test_fix:1 review 2m");
 });
+
+test("TaskPool records which agent runs a task", async () => {
+  const pool = new TaskPool({ delivery: 1, followup: 1, review: 1, aux: 1, discovery: 1, owner: 1, agents: 1 });
+  const gate = gated();
+  pool.reserve("key", "delivery", gate.run, "#1 fix", "Muadib");
+  assert.equal(pool.list()[0]!.agent, "Muadib");
+  gate.release();
+  await pool.drain(1000);
+});

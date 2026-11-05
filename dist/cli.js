@@ -1084,6 +1084,16 @@ function printDetailedStatusWithFlags(flags, name, result) {
     }
     const needs = status.needsYou?.count ?? 0;
     console.log(`  Ziki needs you: ${needs}${needs ? ` → ${status.needsYou?.link}` : ""}`);
+    if (status.agents) {
+        for (const agent of status.agents) {
+            const current = agent.current
+                ? `${agent.current.label ?? agent.current.key} (${Math.round(Number(agent.current.ageMs ?? 0) / 1000)}s)`
+                : agent.claim
+                    ? `claim #${agent.claim} (${agent.claimStatus})`
+                    : "idle";
+            console.log(`  agent ${agent.name} [${agent.level}]: ${current}${agent.stale ? " · STALE HEARTBEAT" : ""}`);
+        }
+    }
     if (status.capacity) {
         console.log(`  effective limits: agents ${status.capacity.agentCeiling} · delivery ${status.capacity.delivery} · review ${status.capacity.review} · aux ${status.capacity.aux} · follow-up ${status.capacity.followup} · claims ${status.capacity.activeClaims}` +
             ` · daily deliveries ${status.profileLimits?.maxDeliveriesPerDay ?? "none"}` +
