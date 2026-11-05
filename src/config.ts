@@ -349,6 +349,12 @@ export function validateConfig(config: Config): ValidationResult {
     if (profile?.repo?.mergeMethod !== undefined && !["merge", "squash", "rebase"].includes(profile.repo.mergeMethod)) {
       errors.push(`${prefix}.repo.mergeMethod must be "merge", "squash" or "rebase"`);
     }
+    if (profile?.discovery?.contextFiles !== undefined && !Array.isArray(profile.discovery.contextFiles)) {
+      errors.push(`${prefix}.discovery.contextFiles must be an array`);
+    }
+    if (profile?.discovery?.focus !== undefined && typeof profile.discovery.focus !== "string") {
+      errors.push(`${prefix}.discovery.focus must be a string`);
+    }
     if (profile?.agentProfile?.skills !== undefined) {
       if (!Array.isArray(profile.agentProfile.skills)) {
         errors.push(`${prefix}.agentProfile.skills must be an array`);

@@ -9,6 +9,7 @@ import { TaskPool } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import { formatPrContext } from "./pr-context.js";
+import { loadDiscoveryContext } from "./discovery-context.js";
 import { actionablePrComments } from "./pr-comments.js";
 import { preparePrBody } from "./pr-body.js";
 import { prepareWorktree, prepareReviewWorktree, cleanupWorktree } from "./worktree.js";
@@ -18,6 +19,7 @@ import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memo
 import { escalate, poll, writeNeedsHuman } from "./hitl.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { scanSecrets, protectedFiles } from "./checks.js";
+import { PACKAGE_ROOT } from "./platform/paths.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
 import { isTransientNetworkError } from "./network.js";
@@ -2934,20 +2936,31 @@ async function discoveryPass(ctx) {
         `regex: ${ctx.profile.platformMatch.regex ?? "(none)"}`,
         `max ideas per run: ${ctx.profile.discovery.maxIdeasPerRun ?? 3}`
     ].join("\n");
-    const parityFile = resolveParityFile(ctx.profile);
-    const parity = parityFile && existsSync(parityFile) ? await readFile(parityFile, "utf8") : "(no parity map yet)";
-    const result = await withScratch(ctx, "discovery", (dir) => runDiscovery({
-        profile: ctx.profile,
-        profilePaths: ctx.profilePaths,
-        memoryText: ctx.memoryText,
-        repoDir: dir,
-        parity,
-        existingIssues: [existing, recentMerged ? `\n## Recently merged or delivered\n${recentMerged}` : "", inFlight ? `\n## In flight\n${inFlight}` : "", `\n## Platform policy\n${platformPolicy}`].filter(Boolean).join("\n"),
-        existingIdeas,
-        maxIdeas: ctx.profile.discovery.maxIdeasPerRun ?? 3,
-        logger: ctx.logger,
-        ...agentHooks(ctx)
-    }));
+    const result = await withScratch(ctx, "discovery", async (dir) => {
+        const context = await loadDiscoveryContext({
+            parityFile: resolveParityFile(ctx.profile),
+            contextFiles: ctx.profile.discovery.contextFiles,
+            repoDir: dir,
+            packageRoot: PACKAGE_ROOT
+        });
+        if (context.missing.length) {
+            ctx.logger.warn(`Discovery context missing: ${context.missing.join(", ")}`);
+        }
+        return runDiscovery({
+            profile: ctx.profile,
+            profilePaths: ctx.profilePaths,
+            memoryText: ctx.memoryText,
+            repoDir: dir,
+            parity: context.parity,
+            context: context.context,
+            focus: ctx.profile.discovery.focus,
+            existingIssues: [existing, recentMerged ? `\n## Recently merged or delivered\n${recentMerged}` : "", inFlight ? `\n## In flight\n${inFlight}` : "", `\n## Platform policy\n${platformPolicy}`].filter(Boolean).join("\n"),
+            existingIdeas,
+            maxIdeas: ctx.profile.discovery.maxIdeasPerRun ?? 3,
+            logger: ctx.logger,
+            ...agentHooks(ctx)
+        });
+    });
     taskUsage(ctx, null, result.tokens);
     if (await handleProviderLimit(ctx, result))
         return;

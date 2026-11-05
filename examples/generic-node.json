@@ -15,8 +15,8 @@
       "maxAuxPerCycle": null,
       "maxActiveClaims": "auto",
       "maxAttemptsPerTask": 3,
-        "maxNetworkRetries": 5,
-        "networkRetryMinutes": 1,
+      "maxNetworkRetries": 5,
+      "networkRetryMinutes": 1,
       "maxCyclesBeforeDiscovery": 6,
       "maxOpenEscalations": 5,
       "maxRuntimeMinutes": 120,
@@ -143,7 +143,13 @@
       },
       "discovery": {
         "enabled": false,
-        "maxIdeasPerRun": 3
+        "focus": "Find real backend correctness, contract-drift and missing-test gaps.",
+        "contextFiles": [
+          "docs/ARCHITECTURE.md",
+          "openapi.yaml"
+        ],
+        "maxIdeasPerRun": 3,
+        "maxCyclesBeforeRun": 60
       }
     }
   }

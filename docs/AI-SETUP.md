@@ -127,7 +127,15 @@ auto-work init --discover --keys-file keys.env --dry-run
 
 Useful overrides: `--project-slug`, `--platform`, `--github-repo`,
 `--upstream`, `--repo-url`, `--fork-owner`, `--base`, `--default-branch`,
-`--stack`, `--checks`, `--profile`, `--team-lead`, `--env-file`.
+`--stack`, `--checks`, `--profile`, `--team-lead`, `--env-file`,
+`--discovery` / `--no-discovery`, `--context-file <paths>`, and
+`--discovery-focus <text>`.
+
+Discovery is not parity. It inspects the repo, optional context files, existing
+Ziki issues/ideas and recent work, then files ideas. Use `--context-file` for
+project docs/specs (for example an OpenAPI file or architecture doc) and
+`--discovery-focus` for a plain-language brief. A `--parity` file is only an
+optional context document for web-vs-desktop parity profiles.
 
 If discovery cannot resolve the repo, ask for the upstream `owner/name` and
 whether the user wants a fork. Never invent a repository.

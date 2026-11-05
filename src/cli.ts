@@ -71,6 +71,7 @@ Usage:
   auto-work install [--keys-file <path>] [--service] [--profile <name>]
   auto-work init [--keys-file <path>] [--profile <name>] [--example <name>] [--from-file <path>] [--yes] [--advanced]
                  [--discover] [--fork] [--fork-owner <owner>] [--repo-url <url>] [--personal-fork] [--no-fork]
+                 [--discovery|--no-discovery] [--context-file <paths>] [--discovery-focus <text>]
                  [--dry-run] [--env-file <path>]
                  [--project-slug <slug>] [--platform <p>] [--github-repo <owner/name>] [--base <branch>]
   auto-work keys import <file>
@@ -379,6 +380,32 @@ async function copyPromptSet(profileName: string): Promise<string> {
   return target;
 }
 
+function discoveryConfig(
+  flags: Flags,
+  existing: Config,
+  profileName: string,
+  parity: string
+): ProfileConfig["discovery"] {
+  const previous = existing.profiles?.[profileName]?.discovery;
+  const contextFiles = (str(flags, "context-file") ?? "")
+    .split(",")
+    .map((file) => file.trim())
+    .filter(Boolean);
+  const focus = str(flags, "discovery-focus");
+  const enabled = flags["no-discovery"]
+    ? false
+    : flags.discovery === true
+      ? true
+      : previous?.enabled ?? true;
+  return {
+    enabled,
+    maxIdeasPerRun: previous?.maxIdeasPerRun ?? 3,
+    ...(parity ? { parityFile: parity } : previous?.parityFile ? { parityFile: previous.parityFile } : {}),
+    ...(contextFiles.length ? { contextFiles } : previous?.contextFiles ? { contextFiles: previous.contextFiles } : {}),
+    ...(focus ? { focus } : previous?.focus ? { focus: previous.focus } : {})
+  };
+}
+
 function baseProfile(overrides: Partial<ProfileConfig>): ProfileConfig {
   const defaults = defaultConfig().defaults ?? {};
   return deepMerge(
@@ -592,7 +619,7 @@ async function initWizard(flags: Flags): Promise<Config | null> {
     platformMatch: { keywords: [platform] },
     prompts: { dir: promptsDir },
     pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
-    discovery: { enabled: Boolean(parity), ...(parity ? { parityFile: parity } : {}) }
+    discovery: discoveryConfig(flags, existing, profileName, parity)
   });
 
   const config: Config = {
@@ -795,7 +822,7 @@ async function initDiscover(flags: Flags): Promise<void> {
     platformMatch: { keywords: [platform] },
     prompts: { dir: promptsDir },
     pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
-    discovery: { enabled: Boolean(parity), ...(parity ? { parityFile: parity } : {}) }
+    discovery: discoveryConfig(flags, existing, profileName, parity)
   });
 
   const config: Config = {
