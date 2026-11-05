@@ -14,7 +14,9 @@ export type Role =
   | "senseCheck"
   | "close"
   | "research"
-  | "jobReview";
+  | "jobReview"
+  | "bidVote"
+  | "commentVote";
 export type CapacityLimit = number | "auto" | null;
 export type MergeMode = "handoff" | "never" | "auto";
 export type MergeMethod = "merge" | "squash" | "rebase";
@@ -80,6 +82,8 @@ export interface WorkflowConfig {
   branchPrefix: string;
   commitTypes: string[];
   requireTests: boolean;
+  autoVoteBids?: "off" | "agent" | "heuristic";
+  autoUpvoteComments?: "off" | "agent" | "heuristic";
 }
 
 export interface AgentsConfig {
@@ -754,6 +758,8 @@ export interface AgentResult {
   verdict?: "confirm" | "reject" | "neutral";
   goodToMerge?: boolean;
   headSha?: string;
+  environmentHint?: string | null;
+  vote?: boolean;
   duplicateOfId?: string | number | null;
   actions?: string[];
   value?: number;

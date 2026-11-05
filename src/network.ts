@@ -34,16 +34,17 @@ export function isTransientNetworkText(text: string | null | undefined): boolean
   return NETWORK_PATTERNS.some((pattern) => pattern.test(text));
 }
 
-export function errorText(error: unknown): string {
-  if (error instanceof Error) return `${error.message}\n${error.stack ?? ""}`;
-  return String(error ?? "");
-}
-
 export function isTransientNetworkError(error: unknown): boolean {
-  const record = error as { code?: unknown; status?: unknown } | null;
+  const record = error as
+    | { code?: unknown; status?: unknown; name?: unknown; cause?: { code?: unknown; name?: unknown } }
+    | null;
   if (record?.status === 502 || record?.status === 503 || record?.status === 504) return true;
-  if (typeof record?.code === "string" && isTransientNetworkText(record.code)) return true;
-  return isTransientNetworkText(errorText(error));
+  if (record?.name === "TimeoutError") return true;
+  for (const value of [record?.code, record?.cause?.code]) {
+    if (typeof value === "string" && isTransientNetworkText(value)) return true;
+  }
+  if (record?.cause?.name === "TimeoutError") return true;
+  return false;
 }
 
 export async function retryNetwork<T>(

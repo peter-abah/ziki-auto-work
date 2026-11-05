@@ -111,6 +111,13 @@ export declare class GitHub {
         url?: string;
         createdAt?: string;
     }>>;
+    unresolvedReviewThreads(url: string): Promise<Array<{
+        id: string;
+        path?: string;
+        line?: number | null;
+        author?: string;
+        body: string;
+    }>>;
     failedCheckLogs(status: GitHubPrStatus, maxRuns?: number): Promise<Array<{
         name: string;
         log: string;

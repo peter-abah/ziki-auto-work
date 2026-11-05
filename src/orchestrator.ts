@@ -54,6 +54,7 @@ import type { ZikiClient } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import type { PrComment } from "./github.js";
 import { formatPrContext } from "./pr-context.js";
+import { actionablePrComments } from "./pr-comments.js";
 import { preparePrBody } from "./pr-body.js";
 import { prepareWorktree, prepareReviewWorktree, cleanupWorktree } from "./worktree.js";
 import {
@@ -72,6 +73,8 @@ import {
   runClose,
   runResearch,
   runJobReview,
+  runBidVote,
+  runCommentVote,
   killActiveAgents,
   activeAgentPids
 } from "./agent.js";
@@ -92,6 +95,8 @@ import { resolveCapacity } from "./capacity.js";
 import { mergeWorkItemFeeds } from "./feed.js";
 import type { AgentFeed } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
+import { deploymentEnvironment, workTargetKey } from "./work-key.js";
+import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
 import type { Capacity } from "./capacity.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
 import { formatLoopContext } from "./loop-context.js";
@@ -150,7 +155,7 @@ interface Context {
   profileSynced: boolean;
   feedAgentCounts: Record<string, number>;
   zikiWorkflow: Record<string, unknown> | null;
-  ownerActionInFlight: number;
+  reservedTargets: Set<string>;
 }
 
 function setPhase(ctx: Context, phase: string, activity: string | null = null): void {
@@ -180,6 +185,10 @@ function renderLive(ctx: Context): { line: string; key: string } {
     line: `${ctx.profileName} · ${activity} · ${elapsed}/${limit} · Ziki:${needs} · ${agentText} · ${tokenText}`,
     key: `${ctx.phase}|${first?.key ?? ""}|${first?.label ?? ""}|${first?.kind ?? ""}|${tasks.length}|${needs}`
   };
+}
+
+function trackingEnabled(profile: ProfileConfig): boolean {
+  return prTracking(profile).fixReviewComments;
 }
 
 function prTracking(profile: ProfileConfig) {
@@ -213,24 +222,6 @@ function followUpLabel(task: TaskState): string {
 function isoMax(values: Array<string | null | undefined>): string | null {
   const found = values.filter((value): value is string => Boolean(value)).sort();
   return found.at(-1) ?? null;
-}
-
-function actionablePrComment(comment: PrComment): boolean {
-  if (!comment.body.trim()) return false;
-  if (/\[bot\]$/i.test(comment.author)) return false;
-  const text = comment.body.trim().toLowerCase();
-  if (/^(lgtm|looks good|approved|ship it|nice|thanks|thank you)\b/.test(text)) return false;
-  if (comment.kind === "review" && (comment.path || comment.line)) return true;
-  return /\b(fix|please|should|could you|can you|need|change|remove|add|update|missing|broken|wrong|fail|error|conflict|rebase|test|why)\b/.test(text);
-}
-
-function actionablePrComments(task: TaskState, comments: PrComment[]): PrComment[] {
-  const cutoff = task.prLastHandledCommentAt ? Date.parse(task.prLastHandledCommentAt) : 0;
-  return comments.filter((comment) => {
-    if (!actionablePrComment(comment)) return false;
-    const at = Date.parse(comment.createdAt ?? "") || 0;
-    return at > (Number.isFinite(cutoff) ? cutoff : 0);
-  });
 }
 
 function prFollowUpDue(ctx: Context, task: TaskState, now = Date.now()): boolean {
@@ -308,10 +299,15 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
     .map((comment) => ({ ...comment, kind: "review" as const }));
   const allComments = new Map<string, PrComment>();
   for (const comment of [...status.comments, ...reviewComments]) allComments.set(comment.id, comment);
-  const comments = actionablePrComments(task, [...allComments.values()]);
+  const comments = actionablePrComments([...allComments.values()], task.prLastHandledCommentAt, {
+    mentions: ["auto-work", ...ctx.clients.workers.map((agent) => agent.name), ...ctx.clients.managers.map((agent) => agent.name)]
+  });
+  const unresolved = trackingEnabled(ctx.profile)
+    ? await ctx.github.unresolvedReviewThreads(task.prUrl).catch(() => [])
+    : [];
   const tracking = prTracking(ctx.profile);
   const failing = tracking.fixFailingChecks && status.checks === "failing";
-  const newComments = tracking.fixReviewComments && comments.length > 0;
+  const newComments = tracking.fixReviewComments && (comments.length > 0 || unresolved.length > 0);
   const changesRequested =
     tracking.fixReviewComments &&
     status.reviewDecision === "CHANGES_REQUESTED" &&
@@ -341,7 +337,10 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
   }
 
   const checkLogs = failing ? await ctx.github.failedCheckLogs(status).catch(() => []) : [];
-  const prContext = formatPrContext(status, [...allComments.values()].filter((comment) => comment.kind === "review"), checkLogs);
+  const threadText = unresolved
+    .map((thread) => `- ${thread.author ?? "someone"}${thread.path ? ` (${thread.path}${thread.line ? `:${thread.line}` : ""})` : ""}: ${thread.body}`)
+    .join("\n");
+  const prContext = `${formatPrContext(status, [...allComments.values()].filter((comment) => comment.kind === "review"), checkLogs)}${threadText ? `\n\nUnresolved review threads:\n${threadText}` : ""}`;
   const previousError = task.lastError ?? "";
   const attempt = (task.followUpAttempts ?? 0) + 1;
   task.followUpAttempts = attempt;
@@ -499,22 +498,6 @@ function agentForItem(ctx: Context, item: QueueEntry): AgentClient {
 
 const CLAIM_ADDING_WORK = new Set(["offer", "ready_issue"]);
 
-const OWNER_LEVEL_AUX = new Set([
-  "idea",
-  "convert_idea",
-  "reject_idea",
-  "confirm_issue",
-  "close_issue",
-  "sense_check",
-  "vote_importance",
-  "estimate_reward",
-  "review_comment",
-  "vote_stake",
-  "award_bid",
-  "review_bid",
-  "categorize"
-]);
-
 function isManagerAgent(ctx: Context, agent: AgentClient | null | undefined): boolean {
   return Boolean(agent && ctx.clients.managers.some((entry) => entry.name === agent.name));
 }
@@ -569,25 +552,22 @@ function resolveAgent(
     return ctx.clients.managers.find((agent) => usable(agent)) ?? null;
   }
 
-  if (OWNER_LEVEL_AUX.has(item.kind)) {
-    for (const agent of [ctx.primary, preferred, ...ctx.clients.workers, ...ctx.clients.managers]) {
-      if (usable(agent)) return agent;
-    }
-    return null;
-  }
-
   if (usable(preferred)) return preferred;
   return ctx.clients.workers.find((agent) => usable(agent)) ?? ctx.clients.managers.find((agent) => usable(agent)) ?? null;
+}
+
+function itemTargetKey(item: QueueEntry): string {
+  return workTargetKey(item.key, item.issueId, item.ideaId);
 }
 
 function nextDispatch(
   ctx: Context,
   bucket: QueueEntry[] | undefined,
-  options: { forDelivery?: boolean; forReview?: boolean; skipOwnerLevel?: boolean; skipClaimAdding?: boolean } = {}
+  options: { forDelivery?: boolean; forReview?: boolean; skipClaimAdding?: boolean } = {}
 ): { item: QueueEntry; agent: AgentClient } | null {
   for (const item of bucket ?? []) {
     if (ctx.pool.has(item.key) || item.item.canAct === false) continue;
-    if (options.skipOwnerLevel && OWNER_LEVEL_AUX.has(item.kind)) continue;
+    if (ctx.reservedTargets.has(itemTargetKey(item))) continue;
     if (options.skipClaimAdding && CLAIM_ADDING_WORK.has(item.kind)) continue;
     const agent = resolveAgent(ctx, item, options);
     if (agent) return { item, agent };
@@ -780,24 +760,6 @@ export function normalizeCommitMessage(message: string | undefined, issue: Issue
   const pattern = new RegExp(`^(${types.map((type) => type.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\([^)]+\\): \\S`);
   if (!pattern.test(text)) return fallback;
   return text.length > 72 ? text.slice(0, 72) : text;
-}
-
-const ENV_FAILURE_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  { pattern: /command not found/i, label: "a required command is not on PATH" },
-  { pattern: /\bENOENT\b/i, label: "a required file or command is missing" },
-  { pattern: /missing (env|environment|variable|token|key)/i, label: "a required environment value is missing" },
-  { pattern: /environment variable .* (not set|missing)/i, label: "a required environment variable is not set" },
-  { pattern: /(401|403|unauthorized|forbidden|not authenticated|not logged in|no credentials)/i, label: "authentication or permission is missing" },
-  { pattern: /\.env/i, label: "a project .env value is missing" },
-  { pattern: /(flutter|dart|node|npm|go|cargo|gh|git):? not found/i, label: "a toolchain executable is missing" }
-];
-
-function classifyEnvironmentFailure(text: string | undefined): string | null {
-  if (!text) return null;
-  for (const entry of ENV_FAILURE_PATTERNS) {
-    if (entry.pattern.test(text)) return entry.label;
-  }
-  return null;
 }
 
 function remainingMs(ctx: Context): number | null {
@@ -1553,7 +1515,15 @@ async function handleWorkFailure(
   ctx: Context,
   issue: Issue,
   item: QueueEntry,
-  result: { error?: string; blocked?: boolean; blocker?: string | null; summary?: string; tail?: string; providerLimit?: "quota" | "rate-limit" | "context" | null },
+  result: {
+    error?: string;
+    blocked?: boolean;
+    blocker?: string | null;
+    summary?: string;
+    tail?: string;
+    environmentHint?: string | null;
+    providerLimit?: "quota" | "rate-limit" | "context" | null;
+  },
   worker: AgentClient,
   dir: string
 ): Promise<void> {
@@ -1562,7 +1532,7 @@ async function handleWorkFailure(
   const maxAttempts = ctx.profile.limits.maxAttemptsPerTask;
   const error = result.error ?? result.blocker ?? "unknown failure";
   ctx.state.run.failures += 1;
-  const environmentHint = classifyEnvironmentFailure(`${error}\n${result.tail ?? ""}`);
+  const environmentHint = result.environmentHint ?? null;
   ctx.logger.warn(`#${issue.number} attempt ${attempts} failed: ${truncate(error, 300)}`, {
     environmentHint: environmentHint ?? undefined
   });
@@ -2068,15 +2038,9 @@ async function processDeploymentReport(ctx: Context, item: QueueEntry, preferred
     markRecent(ctx, item.key);
     return false;
   }
-  const text = `${item.title ?? ""}\n${item.detail ?? ""}`;
-  const match = text.match(/\b(dev|development|staging|stage|prod|production)\b/i);
-  const environment = match
-    ? ({ dev: "dev", development: "dev", staging: "staging", stage: "staging", prod: "prod", production: "prod" } as const)[
-        match[1]!.toLowerCase() as "dev" | "development" | "staging" | "stage" | "prod" | "production"
-      ]
-    : null;
+  const environment = deploymentEnvironment(item.key);
   if (!environment) {
-    ctx.logger.warn(`Deployment report for #${issue.number} has no environment; skipping`);
+    ctx.logger.warn(`Deployment report for #${issue.number} has no on_dev/on_staging/on_prod key suffix; skipping`);
     markRecent(ctx, item.key);
     return false;
   }
@@ -2133,13 +2097,65 @@ async function processBidVote(ctx: Context, item: QueueEntry, preferred?: AgentC
     markRecent(ctx, item.key);
     return false;
   }
-  if (item.detail.length < 40 || !/fix|implement|add|update|test|change/i.test(item.detail)) {
+  const policy = resolveVotePolicy(ctx.profile.workflow.autoVoteBids);
+  if (policy === "off") {
+    history(ctx, { type: "aux", issue: item.issueNumber, detail: "bid vote skipped: autoVoteBids is off" });
     markRecent(ctx, item.key);
     return false;
   }
-  const voter = managerFor(ctx, preferred) ?? pickWorker(ctx);
+  const voter = preferred ?? managerFor(ctx, preferred) ?? pickWorker(ctx);
   if (!voter) return false;
-  await voter.client.voteBid(bidId);
+  if (policy === "heuristic") {
+    if (!heuristicBidVote(item.detail)) {
+      markRecent(ctx, item.key);
+      return false;
+    }
+    await voter.client.voteBid(bidId);
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
+  let bid: Record<string, unknown> = { id: bidId, title: item.title, detail: item.detail, key: item.key };
+  if (issue) {
+    try {
+      const data = await ctx.primary.client.listBids(issue.id);
+      const found = (data.bids ?? data.items ?? []).find((entry: { id?: string }) => entry?.id === bidId);
+      if (found) bid = found as Record<string, unknown>;
+    } catch {
+      // keep the work-feed copy
+    }
+  }
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `bid-vote-${bidId}`, (dir) =>
+    runBidVote({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      bid,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const vote = result.vote === true;
+  if (vote) await voter.client.voteBid(bidId);
+  history(ctx, {
+    type: "decision",
+    issue: issue?.number ?? item.issueNumber,
+    detail: `${vote ? "voted for" : "declined"} bid ${bidId}: ${truncate(result.summary ?? "", 120)}`
+  });
   markRecent(ctx, item.key);
   return true;
 }
@@ -2174,13 +2190,60 @@ async function processCommentUpvote(ctx: Context, item: QueueEntry, preferred?: 
     markRecent(ctx, item.key);
     return false;
   }
-  if (!/root cause|\b[\w./-]+\.(dart|ts|tsx|js|jsx|py|go|rs):\d+/.test(item.detail)) {
+  const policy = resolveVotePolicy(ctx.profile.workflow.autoUpvoteComments);
+  if (policy === "off") {
+    history(ctx, { type: "aux", issue: item.issueNumber, detail: "comment vote skipped: autoUpvoteComments is off" });
     markRecent(ctx, item.key);
     return false;
   }
   const voter = preferred ?? pickWorker(ctx) ?? pickManager(ctx);
   if (!voter) return false;
-  await voter.client.upvoteComment(commentId);
+  if (policy === "heuristic") {
+    if (!heuristicCommentVote(item.detail)) {
+      markRecent(ctx, item.key);
+      return false;
+    }
+    await voter.client.upvoteComment(commentId);
+    markRecent(ctx, item.key);
+    return true;
+  }
+
+  const issue = item.issueId ? await loadIssueForItem(ctx, item) : null;
+  const comment = issue?.comments?.find((entry) => entry.id === commentId) ?? {
+    id: commentId,
+    body: item.detail,
+    summary: item.title
+  };
+  const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
+  const result = await withScratch(ctx, `comment-vote-${commentId}`, (dir) =>
+    runCommentVote({
+      profile: ctx.profile,
+      profilePaths: ctx.profilePaths,
+      issue,
+      comment,
+      memoryText: ctx.memoryText,
+      repoDir: dir,
+      loopContext,
+      logger: ctx.logger,
+      ...agentHooks(ctx)
+    })
+  );
+  taskUsage(ctx, issue, result.tokens);
+  if (await handleProviderLimit(ctx, result)) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  if (!result.ok) {
+    markRecent(ctx, item.key);
+    return false;
+  }
+  const vote = result.vote === true;
+  if (vote) await voter.client.upvoteComment(commentId);
+  history(ctx, {
+    type: "decision",
+    issue: issue?.number ?? item.issueNumber,
+    detail: `${vote ? "upvoted" : "declined"} comment ${commentId}: ${truncate(result.summary ?? "", 120)}`
+  });
   markRecent(ctx, item.key);
   return true;
 }
@@ -2918,12 +2981,6 @@ async function processReviewIdle(ctx: Context, item: QueueEntry, preferred?: Age
     markRecent(ctx, item.key);
     return false;
   }
-  const idle = /idle|no update|nobody holds/i.test(`${item.title} ${item.detail}`);
-  if (!idle) {
-    ctx.logger.info(`review_idle for #${issue.number} does not look idle; leaving it`);
-    markRecent(ctx, item.key);
-    return false;
-  }
   await manager.client.reclaim(issue.id);
   history(ctx, { type: "aux", issue: issue.number, detail: "reclaimed idle work" });
   markRecent(ctx, item.key);
@@ -3509,7 +3566,9 @@ function dispatch(ctx: Context): void {
   if (pool.canStart("owner")) {
     const pair = nextDispatch(ctx, ctx.queue?.owner);
     if (pair) {
+      const target = itemTargetKey(pair.item);
       ctx.reservedAgents.add(pair.agent.name);
+      ctx.reservedTargets.add(target);
       pool.reserve(
         pair.item.key,
         "owner",
@@ -3518,6 +3577,7 @@ function dispatch(ctx: Context): void {
             await processOwnerItem(ctx, pair.item);
           } finally {
             ctx.reservedAgents.delete(pair.agent.name);
+            ctx.reservedTargets.delete(target);
           }
         },
         `owner ${truncate(pair.item.title, 40)}`,
@@ -3527,11 +3587,15 @@ function dispatch(ctx: Context): void {
   }
 
   while (pool.canStart("followup")) {
-    const task = Object.values(ctx.state.tasks).find(
-      (entry) => prFollowUpDue(ctx, entry) && (!entry.agentName || !ctx.reservedAgents.has(entry.agentName))
-    );
+    const task = Object.values(ctx.state.tasks).find((entry) => {
+      if (!prFollowUpDue(ctx, entry)) return false;
+      if (entry.agentName && ctx.reservedAgents.has(entry.agentName)) return false;
+      return !ctx.reservedTargets.has(`issue:${entry.id ?? entry.number}`);
+    });
     if (!task) break;
+    const target = `issue:${task.id ?? task.number}`;
     if (task.agentName) ctx.reservedAgents.add(task.agentName);
+    ctx.reservedTargets.add(target);
     pool.reserve(
       prTaskKey(task),
       "followup",
@@ -3540,6 +3604,7 @@ function dispatch(ctx: Context): void {
           await processPrFollowUpSafe(ctx, task);
         } finally {
           if (task.agentName) ctx.reservedAgents.delete(task.agentName);
+          ctx.reservedTargets.delete(target);
         }
       },
       followUpLabel(task),
@@ -3554,7 +3619,9 @@ function dispatch(ctx: Context): void {
     const atClaimCapacity = ownClaimCount(ctx) + pool.count("delivery") >= maxClaims;
     const pair = nextDispatch(ctx, ctx.queue?.work, { forDelivery: true, skipClaimAdding: atClaimCapacity });
     if (!pair) break;
+    const target = itemTargetKey(pair.item);
     ctx.reservedAgents.add(pair.agent.name);
+    ctx.reservedTargets.add(target);
     pool.reserve(
       pair.item.key,
       "delivery",
@@ -3563,6 +3630,7 @@ function dispatch(ctx: Context): void {
           await processWorkSafe(ctx, pair.item, pair.agent);
         } finally {
           ctx.reservedAgents.delete(pair.agent.name);
+          ctx.reservedTargets.delete(target);
         }
       },
       taskLabel(pair.item),
@@ -3574,7 +3642,9 @@ function dispatch(ctx: Context): void {
     if (!underCap(counter(ctx).reviews, limits.maxReviewsPerDay)) break;
     const pair = nextDispatch(ctx, ctx.queue?.review, { forReview: true });
     if (!pair) break;
+    const target = itemTargetKey(pair.item);
     ctx.reservedAgents.add(pair.agent.name);
+    ctx.reservedTargets.add(target);
     pool.reserve(
       pair.item.key,
       "review",
@@ -3583,6 +3653,7 @@ function dispatch(ctx: Context): void {
           await processReviewSafe(ctx, pair.item, pair.agent);
         } finally {
           ctx.reservedAgents.delete(pair.agent.name);
+          ctx.reservedTargets.delete(target);
         }
       },
       kindLabel(pair.item, "review"),
@@ -3591,12 +3662,12 @@ function dispatch(ctx: Context): void {
   }
 
   while (pool.canStart("aux") && pool.count("aux") < capacity.aux && underCap(ctx.auxThisCycle, limits.maxAuxPerCycle)) {
-    const pair = nextDispatch(ctx, ctx.queue?.aux, { skipOwnerLevel: ctx.ownerActionInFlight > 0 });
+    const pair = nextDispatch(ctx, ctx.queue?.aux);
     if (!pair) break;
     ctx.auxThisCycle += 1;
-    const ownerLevel = OWNER_LEVEL_AUX.has(pair.item.kind);
-    if (ownerLevel) ctx.ownerActionInFlight += 1;
+    const target = itemTargetKey(pair.item);
     ctx.reservedAgents.add(pair.agent.name);
+    ctx.reservedTargets.add(target);
     pool.reserve(
       pair.item.key,
       "aux",
@@ -3606,7 +3677,7 @@ function dispatch(ctx: Context): void {
           await save(ctx).catch(() => {});
         } finally {
           ctx.reservedAgents.delete(pair.agent.name);
-          if (ownerLevel) ctx.ownerActionInFlight = Math.max(0, ctx.ownerActionInFlight - 1);
+          ctx.reservedTargets.delete(target);
         }
       },
       kindLabel(pair.item, "aux"),
@@ -3712,7 +3783,7 @@ async function createContext(
     profileSynced: false,
     feedAgentCounts: {},
     zikiWorkflow,
-    ownerActionInFlight: 0
+    reservedTargets: new Set()
   };
 }
 

@@ -4,11 +4,13 @@ export declare class ZikiError extends Error {
     body: unknown;
     method: string | null;
     path: string | null;
+    cause: unknown;
     constructor(message: string, options?: {
         status?: number;
         body?: unknown;
         method?: string | null;
         path?: string | null;
+        cause?: unknown;
     });
 }
 export declare class ZikiClient {

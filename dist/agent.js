@@ -9,7 +9,7 @@ import { killProcessTree } from "./platform/process.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { resolveCommand } from "./checks.js";
 import { buildAgentEnv } from "./env.js";
-import { classifyProviderLimit } from "./provider-errors.js";
+import { providerLimitForResult } from "./provider-errors.js";
 import { parseUsage } from "./usage.js";
 import { formatPrFieldMap, formatProtectedFiles, formatWorkflowRules, loadPrTemplateText } from "./rules.js";
 import { truncate } from "./log.js";
@@ -31,7 +31,9 @@ export function render(template, vars) {
 const PROMPT_FILES = {
     stakeVote: "stake-vote",
     senseCheck: "sense-check",
-    jobReview: "job-review"
+    jobReview: "job-review",
+    bidVote: "bid-vote",
+    commentVote: "comment-vote"
 };
 export async function loadPrompt(profile, role) {
     const dir = resolvePromptDir(profile);
@@ -53,7 +55,24 @@ function resultPaths(profilePaths, kind, label) {
         logPath: path.join(profilePaths.logsDir, "agents", `${base}.log`)
     };
 }
-function extractJsonResult(text) {
+export function extractJsonResult(text) {
+    const marker = "AW_RESULT_JSON:";
+    const markerAt = text.lastIndexOf(marker);
+    if (markerAt >= 0) {
+        const candidate = text.slice(markerAt + marker.length).trim();
+        const end = candidate.lastIndexOf("}");
+        if (end >= 0) {
+            try {
+                const parsed = JSON.parse(candidate.slice(0, end + 1));
+                if (parsed && typeof parsed === "object" && ("ok" in parsed || "blocked" in parsed || "summary" in parsed)) {
+                    return parsed;
+                }
+            }
+            catch {
+                // fall through to the compatibility parser
+            }
+        }
+    }
     const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1] ?? "").reverse();
     const candidates = [...fenced];
     for (let index = text.lastIndexOf("{"); index >= 0; index = text.lastIndexOf("{", index - 1)) {
@@ -83,7 +102,19 @@ export async function runAgent(options) {
     const model = resolveModel(profile, role);
     const provider = getProvider(profile.executor.provider, profile);
     const resultMode = provider.resultMode ?? "file";
-    const command = provider.build({ prompt, cwd, resultPath, model });
+    const explicitSignals = [
+        "## Explicit result signals",
+        "",
+        "Only set `providerLimit` to `\"quota\"`, `\"rate-limit\"` or `\"context\"` when the provider itself explicitly reports that failure on a failed run.",
+        "Only set `environmentHint` when a required command, environment value or authentication prerequisite is genuinely missing.",
+        "Never infer either field from source code, logs, line numbers, token counts or tool output. When unsure, leave them out.",
+        resultMode === "stdout"
+            ? "Print the final result as a single line beginning with `AW_RESULT_JSON:` followed by the JSON object."
+            : ""
+    ]
+        .filter(Boolean)
+        .join("\n");
+    const command = provider.build({ prompt: `${prompt}\n\n${explicitSignals}`, cwd, resultPath, model });
     const limit = options.timeoutMs ?? profile.executor.timeoutMs ?? 45 * 60 * 1000;
     await mkdir(path.dirname(resultPath), { recursive: true });
     await mkdir(path.dirname(logPath), { recursive: true });
@@ -139,11 +170,11 @@ export async function runAgent(options) {
             logPath,
             tail: truncate(tail, 2000),
             tokens: provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined,
-            providerLimit: classifyProviderLimit(tail)
+            providerLimit: null
         };
     }
     if (exit.error) {
-        return { ok: false, error: `agent failed to start: ${exit.error.message}`, logPath, tail: truncate(tail, 2000) };
+        return { ok: false, error: `agent failed to start: ${exit.error.message}`, logPath, tail: truncate(tail, 2000), providerLimit: null };
     }
     let parsed = null;
     if (existsSync(resultPath)) {
@@ -157,7 +188,7 @@ export async function runAgent(options) {
                 logPath,
                 tail: truncate(tail, 2000),
                 tokens: provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined,
-                providerLimit: classifyProviderLimit(`${error instanceof Error ? error.message : String(error)}\n${tail}`)
+                providerLimit: null
             };
         }
     }
@@ -171,10 +202,11 @@ export async function runAgent(options) {
             logPath,
             tail: truncate(tail, 3000),
             tokens: provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined,
-            providerLimit: classifyProviderLimit(tail)
+            providerLimit: null
         };
     }
     const tokens = parsed.tokens ?? provider.parseUsage?.(tail) ?? parseUsage(tail, profile.executor.usage) ?? undefined;
+    const failed = parsed.ok !== true || parsed.blocked === true;
     return {
         ...parsed,
         ok: parsed.ok === true && parsed.blocked !== true,
@@ -183,7 +215,7 @@ export async function runAgent(options) {
         logPath,
         tail: truncate(tail, 3000),
         tokens,
-        providerLimit: parsed.providerLimit ?? classifyProviderLimit(`${parsed.error ?? ""}\n${parsed.blocker ?? ""}\n${tail}`)
+        providerLimit: providerLimitForResult(parsed, failed)
     };
 }
 export function checksText(profile) {
@@ -622,6 +654,40 @@ export async function runJobReview(options) {
         vars: {
             job: JSON.stringify(options.job, null, 2),
             submission: JSON.stringify(options.submission, null, 2),
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runBidVote(options) {
+    return runPromptTask({
+        ...options,
+        role: "bidVote",
+        label: options.issue?.number ?? "bid",
+        vars: {
+            issueNumber: options.issue?.number ?? "",
+            issueTitle: options.issue?.title ?? "",
+            issueUrl: options.issue ? issueUrl(options.profile, options.issue) : "",
+            issueSummary: options.issue?.summary || "",
+            issueDescription: options.issue?.description || "",
+            bid: JSON.stringify(options.bid, null, 2),
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runCommentVote(options) {
+    return runPromptTask({
+        ...options,
+        role: "commentVote",
+        label: options.issue?.number ?? "comment",
+        vars: {
+            issueNumber: options.issue?.number ?? "",
+            issueTitle: options.issue?.title ?? "",
+            issueUrl: options.issue ? issueUrl(options.profile, options.issue) : "",
+            issueSummary: options.issue?.summary || "",
+            issueDescription: options.issue?.description || "",
+            comment: JSON.stringify(options.comment, null, 2),
             memory: options.memoryText,
             loopContext: options.loopContext
         }

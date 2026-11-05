@@ -47,7 +47,9 @@ export const DEFAULT_WORKFLOW = {
     maxLines: 400,
     branchPrefix: "fix",
     commitTypes: ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
-    requireTests: true
+    requireTests: true,
+    autoVoteBids: "agent",
+    autoUpvoteComments: "agent"
 };
 export const DEFAULT_ENV_FILES = [".env", ".env.local"];
 export function defaultConfig() {
@@ -350,6 +352,12 @@ export function validateConfig(config) {
             }
             if (!Array.isArray(workflow.commitTypes) || !workflow.commitTypes.length) {
                 errors.push(`${prefix}.workflow.commitTypes must be a non-empty array`);
+            }
+            for (const key of ["autoVoteBids", "autoUpvoteComments"]) {
+                const value = workflow[key];
+                if (value !== undefined && !["off", "agent", "heuristic"].includes(value)) {
+                    errors.push(`${prefix}.workflow.${key} must be "off", "agent" or "heuristic"`);
+                }
             }
         }
         if (profile?.repo?.envFiles !== undefined && !Array.isArray(profile.repo.envFiles)) {

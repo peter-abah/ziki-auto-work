@@ -33,10 +33,25 @@ test("estimates only when enabled", () => {
   assert.equal(estimated?.total, 2);
 });
 
+test("ignores source-code JSON that only has input/output fields", () => {
+  assert.equal(parseUsage(JSON.stringify({ input: 429, output: 12 })), null);
+});
+
 test("adds usage and formats percentages", () => {
   const total = addUsage({ input: 10, output: 5, total: 15 }, { input: 20, output: 7, total: 27 });
   assert.equal(total.total, 42);
   assert.equal(formatTokens(1_500), "1.5k");
   assert.equal(usagePercent(80, 100), 80);
   assert.equal(usagePercent(120, 100), 100);
+});
+
+test("parses opencode step tokens with generic keys", () => {
+  const text = JSON.stringify({
+    type: "step_finish",
+    part: { tokens: { total: 55577, input: 18086, output: 245 }, cost: 0.0019 }
+  });
+  const usage = parseUsage(text);
+  assert.equal(usage?.input, 18086);
+  assert.equal(usage?.output, 245);
+  assert.equal(usage?.total, 55577);
 });

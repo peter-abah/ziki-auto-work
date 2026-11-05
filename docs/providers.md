@@ -118,15 +118,21 @@ has no usage data, `executor.usage.regex` or `executor.usage.estimate: true` can
 supply a fallback; estimates are marked.
 
 At `limits.maxTokensPerRun`, auto-work warns at `tokenWarnPercent` and stops
-after the current task with `stopReason: "token-limit"`. A hard provider
-quota/credit error stops with `provider-limit`; a 429-backed off and retries,
-stopping after three consecutive rate limits.
+after the current task with `stopReason: "token-limit"`.
+
+Provider limits are only acted on when a **failed agent result explicitly sets**
+`providerLimit` to `"quota"`, `"rate-limit"` or `"context"`. Auto-work never
+infers them from stdout, stderr, source code, line numbers or usage metadata.
+When no explicit signal is present, failures follow normal retry/escalation
+behaviour. A failed result may also set `environmentHint` for a genuinely
+missing command, environment value or authentication prerequisite.
 
 ## Models and cost
 
 - `null` means provider default.
 - Per-role models let triage/review use a cheaper model:
-  `executor.models: { "triage": "...", "review": "..." }`.
+  `executor.models: { "triage": "...", "review": "...", "vote": "..." }`.
+  `vote` covers both bid votes and comment upvotes.
 - Model names change. Use `auto-work models` where possible and free text
   otherwise.
 - `auto-work doctor` shows the resolved model per role.

@@ -21,10 +21,11 @@ export class ZikiError extends Error {
   body: unknown;
   method: string | null;
   path: string | null;
+  cause: unknown;
 
   constructor(
     message: string,
-    options: { status?: number; body?: unknown; method?: string | null; path?: string | null } = {}
+    options: { status?: number; body?: unknown; method?: string | null; path?: string | null; cause?: unknown } = {}
   ) {
     super(message);
     this.name = "ZikiError";
@@ -32,6 +33,7 @@ export class ZikiError extends Error {
     this.body = options.body ?? null;
     this.method = options.method ?? null;
     this.path = options.path ?? null;
+    this.cause = options.cause ?? null;
   }
 }
 
@@ -168,7 +170,7 @@ export class ZikiClient {
 
     throw new ZikiError(
       `${method} ${pathname} failed: ${lastError instanceof Error ? lastError.message : "network error"}`,
-      { method, path: pathname }
+      { method, path: pathname, cause: lastError }
     );
   }
 

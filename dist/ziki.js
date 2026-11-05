@@ -4,6 +4,7 @@ export class ZikiError extends Error {
     body;
     method;
     path;
+    cause;
     constructor(message, options = {}) {
         super(message);
         this.name = "ZikiError";
@@ -11,6 +12,7 @@ export class ZikiError extends Error {
         this.body = options.body ?? null;
         this.method = options.method ?? null;
         this.path = options.path ?? null;
+        this.cause = options.cause ?? null;
     }
 }
 function sleep(ms) {
@@ -123,7 +125,7 @@ export class ZikiClient {
                 attempt += 1;
             }
         }
-        throw new ZikiError(`${method} ${pathname} failed: ${lastError instanceof Error ? lastError.message : "network error"}`, { method, path: pathname });
+        throw new ZikiError(`${method} ${pathname} failed: ${lastError instanceof Error ? lastError.message : "network error"}`, { method, path: pathname, cause: lastError });
     }
     get(pathname, options) {
         return this.request("GET", pathname, options);

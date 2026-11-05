@@ -82,7 +82,9 @@ The config is a **workspace** with one or more **profiles** (config version 3).
         "maxLines": 400,
         "branchPrefix": "fix",
         "commitTypes": ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
-        "requireTests": true
+        "requireTests": true,
+        "autoVoteBids": "agent",
+        "autoUpvoteComments": "agent"
       },
       "limits": {
         "maxDeliveriesPerDay": null,
@@ -244,6 +246,10 @@ Built-in experimental shortlist: `aider`, `goose`, `copilot`, `cursor-agent`,
 - `branchPrefix`: branch name prefix, e.g. `fix` → `fix/<issue>-<slug>`.
 - `commitTypes`: accepted conventional-commit types; others fall back.
 - `requireTests`: prompt rule (not auto-enforced, to avoid false rejects).
+- `autoVoteBids`: `"agent"` (default), `"off"` or legacy `"heuristic"` for
+  `review_bid` items.
+- `autoUpvoteComments`: `"agent"` (default), `"off"` or legacy `"heuristic"`
+  for `review_comment` items. Agent votes use `executor.models.vote` when set.
 
 The worker prompt receives these as `{{workflowRules}}`, plus
 `{{protectedFiles}}`, `{{prBase}}`, `{{forkOwner}}`, `{{teamLead}}`,
@@ -297,6 +303,27 @@ Concurrency accepts a number, `"auto"`, or `null`:
   - `auto` merges only when Ziki is ready, GitHub checks are green, the PR is
     mergeable and required approvals are present.
 - `mergeMethod`: `"squash"` (default), `"merge"` or `"rebase"`.
+
+## Your Call decisions
+
+Auto-work treats an owner comment starting `**Decision from the owner:**` as
+authoritative only when it contains labelled lines:
+
+```text
+**Decision from the owner:**
+Confirm: yes
+Merge: no
+```
+
+Values must be `yes`/`no` (or `true`/`false`). Free-form prose is ignored rather
+than guessed.
+
+## PR follow-up comments
+
+PR follow-up runs on structured signals: `CHANGES_REQUESTED`, inline review
+comments, unresolved review threads, failing checks and merge conflicts. A
+conversation comment is actionable only when it mentions `@auto-work` or one of
+the configured agent names, or starts with `/fix` / `!fix`.
 
 ## agentProfile
 

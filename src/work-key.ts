@@ -1,0 +1,15 @@
+export type DeploymentEnvironment = "dev" | "staging" | "prod";
+
+export function deploymentEnvironment(key: string): DeploymentEnvironment | null {
+  const suffix = key.split(":").pop() ?? "";
+  if (suffix === "on_dev") return "dev";
+  if (suffix === "on_staging") return "staging";
+  if (suffix === "on_prod") return "prod";
+  return null;
+}
+
+export function workTargetKey(key: string, issueId?: string | null, ideaId?: string | null): string {
+  if (issueId) return `issue:${issueId}`;
+  if (ideaId) return `idea:${ideaId}`;
+  return `key:${key}`;
+}
