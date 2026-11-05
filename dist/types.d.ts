@@ -209,6 +209,7 @@ export interface RunState {
     startedAt: string | null;
     limits: RunLimitConfig | null;
     stopReason: StopReason;
+    startedCycles?: number;
     deliveries: number;
     reviews: number;
     mergeReviews: number;

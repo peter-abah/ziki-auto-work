@@ -48,6 +48,7 @@ import {
 import { runUninstall } from "./uninstall.js";
 import { GitHub } from "./github.js";
 import { formatRunSummary } from "./run-report.js";
+import { cyclesThisRun } from "./run-limits.js";
 import { formatTokens } from "./usage.js";
 import {
   detectedStackAt,
@@ -1196,7 +1197,7 @@ function printDetailedStatusWithFlags(
   );
   if (!result.status) return;
   const status = result.status as Record<string, any>;
-  console.log(`  cycles: ${status.cycles ?? 0}  last: ${status.lastCycleAt ?? "never"}`);
+  console.log(`  cycles: ${status.cyclesThisRun ?? 0} this run · ${status.cycles ?? 0} total  last: ${status.lastCycleAt ?? "never"}`);
   if (!result.running && status.updatedAt) {
     console.log(`  last snapshot: ${status.updatedAt} (process not running)`);
   }
@@ -1344,6 +1345,7 @@ async function report(flags: Flags): Promise<void> {
     profile: profileName,
     since: since ? new Date(since).toISOString() : null,
     cycles: state.cycles,
+    cyclesThisRun: cyclesThisRun(state),
     counters: state.counters,
     history: counts,
     deliveries: state.run.deliveries,
@@ -1360,7 +1362,7 @@ async function report(flags: Flags): Promise<void> {
     return;
   }
   console.log(`Report for ${profileName}${since ? ` since ${data.since}` : ""}`);
-  console.log(`  cycles: ${data.cycles}`);
+  console.log(`  cycles: ${data.cyclesThisRun} this run · ${data.cycles} total`);
   console.log(`  deliveries this run: ${data.deliveries}`);
   console.log(`  stop reason: ${data.stopReason ?? "-"}`);
   if (data.limits) {

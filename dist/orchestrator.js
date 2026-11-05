@@ -30,6 +30,7 @@ import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 import { resolveCapacity } from "./capacity.js";
+import { cyclesThisRun, limitReached, remainingCycles } from "./run-limits.js";
 import { mergeWorkItemFeeds } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import { deploymentEnvironment, workTargetKey } from "./work-key.js";
@@ -794,6 +795,7 @@ async function buildStatus(ctx, extra = {}) {
         lastCycleAt: ctx.state.lastCycleAt,
         lastCycleMs: ctx.state.lastCycleMs,
         cycles: ctx.state.cycles,
+        cyclesThisRun: cyclesThisRun(ctx.state),
         phase: ctx.phase,
         phaseStartedAt: ctx.phaseStartedAt,
         activity: ctx.activity,
@@ -880,7 +882,7 @@ async function buildStatus(ctx, extra = {}) {
             startedAt: ctx.state.run.startedAt,
             elapsedMs: started ? Date.now() - started : null,
             remainingMs: remainingMs(ctx),
-            remainingCycles: ctx.runLimits.maxCycles === null ? null : Math.max(0, ctx.runLimits.maxCycles - ctx.state.cycles),
+            remainingCycles: remainingCycles(ctx.state, ctx.runLimits.maxCycles),
             remainingDeliveries: ctx.runLimits.maxDeliveriesTotal === null
                 ? null
                 : Math.max(0, ctx.runLimits.maxDeliveriesTotal - ctx.state.run.deliveries),
@@ -3440,7 +3442,8 @@ function discoveryDue(ctx) {
     if (!underCap(counter(ctx).discoveries, ctx.profile.limits.maxDiscoveriesPerDay))
         return false;
     const every = ctx.profile.discovery.maxCyclesBeforeRun ?? ctx.profile.limits.maxCyclesBeforeDiscovery;
-    return ctx.state.cycles > 0 && ctx.state.cycles % every === 0;
+    const runCycles = cyclesThisRun(ctx.state);
+    return runCycles > 0 && runCycles % every === 0;
 }
 async function processWorkSafe(ctx, item, worker) {
     try {
@@ -3794,23 +3797,8 @@ async function reconcileWorktreesOnStartup(ctx, blockedPids = []) {
         ctx.logger.info(`Removed stale worktree ${entry.name}`);
     }
 }
-function limitReached(ctx) {
-    const limits = ctx.runLimits;
-    if (limits.maxCycles !== null && ctx.state.cycles >= limits.maxCycles)
-        return "max-cycles";
-    if (limits.maxDeliveriesTotal !== null && ctx.state.run.deliveries >= limits.maxDeliveriesTotal)
-        return "max-deliveries";
-    if (limits.stopAt) {
-        const at = new Date(limits.stopAt).getTime();
-        if (Number.isFinite(at) && Date.now() >= at)
-            return "until";
-    }
-    if (limits.maxRuntimeMinutes !== null) {
-        const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
-        if (Date.now() - started >= limits.maxRuntimeMinutes * 60 * 1000)
-            return "max-runtime";
-    }
-    return null;
+function runLimitReached(ctx) {
+    return limitReached(ctx.state, ctx.runLimits);
 }
 async function preflightHealth(ctx) {
     const incomplete = [];
@@ -3910,6 +3898,7 @@ export async function runLoop(options = {}) {
         startedAt: new Date().toISOString(),
         limits: runLimits,
         stopReason: null,
+        startedCycles: state.cycles,
         deliveries: 0,
         reviews: 0,
         mergeReviews: 0,
@@ -4050,7 +4039,7 @@ export async function runLoop(options = {}) {
                 }
                 continue;
             }
-            const reason = limitReached(ctx);
+            const reason = runLimitReached(ctx);
             if (reason) {
                 stopReason = reason;
                 logger.info(`Run limit reached: ${reason}`, { cycles: ctx.state.cycles, deliveries: ctx.state.run.deliveries });

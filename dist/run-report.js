@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { inboxUrl } from "./urls.js";
 import { emptyUsage } from "./usage.js";
 import { summarizeHealth } from "./health.js";
+import { cyclesThisRun } from "./run-limits.js";
 export function buildRunSummary(options) {
     const { state, profileName, profile, clean, stopReason } = options;
     const startedAt = state.run.startedAt ?? state.lastRun?.startedAt ?? state.startedAt ?? new Date().toISOString();
@@ -27,7 +28,7 @@ export function buildRunSummary(options) {
         endedAt: options.endedAt ?? (clean ? new Date().toISOString() : null),
         clean,
         stopReason,
-        cycles: state.cycles,
+        cycles: cyclesThisRun(state),
         deliveries: state.run.deliveries,
         reviews: state.run.reviews,
         mergeReviews: state.run.mergeReviews,

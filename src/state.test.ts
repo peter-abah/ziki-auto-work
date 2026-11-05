@@ -70,6 +70,7 @@ test("empty state has healthy health and old state files load a default health b
     await writeFile(profilePaths.stateFile, JSON.stringify({ version: 1, cycles: 3 }), "utf8");
     const loaded = await loadState(profilePaths);
     assert.equal(loaded.cycles, 3);
+    assert.equal(loaded.run.startedCycles, 0);
     assert.equal(loaded.health.state, "healthy");
     assert.deepEqual(loaded.health.blockers, {});
   } finally {

@@ -16,6 +16,7 @@ import { assignRoles, formatKeyTable, inspectKeys, knownProjects, listPlatforms,
 import { runUninstall } from "./uninstall.js";
 import { GitHub } from "./github.js";
 import { formatRunSummary } from "./run-report.js";
+import { cyclesThisRun } from "./run-limits.js";
 import { formatTokens } from "./usage.js";
 import { detectedStackAt, ensureFork, githubLogin, inferPlatform, listBranches, parseRepoRef, rankCandidates, repoInfo, repoName, searchRepos } from "./discover.js";
 const REPO_URL = "https://github.com/peter-abah/ziki-auto-work";
@@ -1099,7 +1100,7 @@ function printDetailedStatusWithFlags(flags, name, result) {
     if (!result.status)
         return;
     const status = result.status;
-    console.log(`  cycles: ${status.cycles ?? 0}  last: ${status.lastCycleAt ?? "never"}`);
+    console.log(`  cycles: ${status.cyclesThisRun ?? 0} this run · ${status.cycles ?? 0} total  last: ${status.lastCycleAt ?? "never"}`);
     if (!result.running && status.updatedAt) {
         console.log(`  last snapshot: ${status.updatedAt} (process not running)`);
     }
@@ -1232,6 +1233,7 @@ async function report(flags) {
         profile: profileName,
         since: since ? new Date(since).toISOString() : null,
         cycles: state.cycles,
+        cyclesThisRun: cyclesThisRun(state),
         counters: state.counters,
         history: counts,
         deliveries: state.run.deliveries,
@@ -1248,7 +1250,7 @@ async function report(flags) {
         return;
     }
     console.log(`Report for ${profileName}${since ? ` since ${data.since}` : ""}`);
-    console.log(`  cycles: ${data.cycles}`);
+    console.log(`  cycles: ${data.cyclesThisRun} this run · ${data.cycles} total`);
     console.log(`  deliveries this run: ${data.deliveries}`);
     console.log(`  stop reason: ${data.stopReason ?? "-"}`);
     if (data.limits) {
