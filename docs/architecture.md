@@ -70,6 +70,24 @@ src/
 14. `cleanup` — remove old worktrees.
 15. save state, then sleep or wait for an in-flight task.
 
+## API adaptation and self-correction
+
+Ziki is a remote API, so its live schema is treated as a runtime capability, not
+a compile-time contract. Every write goes through the adaptive request layer:
+
+- known-rejected fields are cached per endpoint and stripped before sending;
+- unknown validation fields are removed from the body and retried;
+- oversized strings/arrays are repaired when the API reports a maximum;
+- full validation details are included in errors and logs;
+- if deterministic repair cannot fix a `400`/`422`, a short-lived `apiRepair`
+  agent receives the operation, attempted payload and full error body and may
+  return a corrected payload or abandon it with a reason;
+- abandoned actions are recorded instead of silently discarded.
+
+The learned contract is stored in `state.apiContracts` so the same field is not
+sent again on the next run. Discovery also sanitizes idea summaries before
+sending them.
+
 ## Roles
 
 A profile needs at least one working agent. Managers/mergers are optional; when

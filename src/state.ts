@@ -21,6 +21,7 @@ export function emptyState(): State {
     counters: {},
     memory: { lastContextLoad: null },
     feedEtags: {},
+    apiContracts: {},
     lastError: null,
     run: {
       startedAt: null,

@@ -1,5 +1,6 @@
 import type { AgentResult, Idea, Issue, ProfileConfig, ProfilePaths, Role } from "./types.js";
 import type { Logger } from "./log.js";
+import type { ApiRepairContext } from "./ziki.js";
 export declare function killActiveAgents(): void;
 export declare function activeAgentPids(): number[];
 export declare function render(template: string, vars: Record<string, unknown>): string;
@@ -33,6 +34,15 @@ export declare function runWorker(options: {
     issueContext?: string;
     loopContext?: string;
     attempt?: number;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runApiRepair(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    repoDir: string;
+    context: ApiRepairContext;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;

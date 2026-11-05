@@ -19,6 +19,7 @@ export function emptyState() {
         counters: {},
         memory: { lastContextLoad: null },
         feedEtags: {},
+        apiContracts: {},
         lastError: null,
         run: {
             startedAt: null,
