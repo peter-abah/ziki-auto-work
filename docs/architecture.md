@@ -87,7 +87,8 @@ overflow, permanent failure and shutdown. The Ziki project's `maxActiveClaims`
 
 `maxRuntimeMinutes` (default 120), `maxCycles`, `stopAt`,
 `maxDeliveriesTotal`, or an explicit stop ends the loop after the current
-cycle. Limits are chosen at `start` and recorded in `status.json` with elapsed
+cycle. `maxCycles` is counted from the start of the current run; the status and
+report show both the run cycle count and the lifetime total. Limits are chosen at `start` and recorded in `status.json` with elapsed
 and remaining time and a stop reason. Concurrency defaults to 2 deliveries,
 1 review, 2 auxiliary tasks, 1 discovery, and 4 agents total; delivery
 concurrency is also capped by `maxActiveClaims`.

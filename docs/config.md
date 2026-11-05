@@ -285,7 +285,7 @@ escalation cap.
 Run limits:
 
 - `maxRuntimeMinutes`: default 120; `null` disables the time limit.
-- `maxCycles`: stop after N cycles; `null` disables.
+- `maxCycles`: stop after N cycles **in the current run**; `null` disables. The loop keeps a separate cumulative cycle counter for status/reporting.
 - `stopAt`: ISO timestamp deadline; `null` disables.
 - `maxDeliveriesTotal`: stop after N deliveries in this run; `null` disables.
 

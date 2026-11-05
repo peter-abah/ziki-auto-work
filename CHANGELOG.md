@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Run limits: `--max-cycles` now counts cycles in the current run instead of
+  using the lifetime cycle total. `status`, `report` and `LAST-RUN` show the
+  run cycle count alongside the lifetime total, and discovery cadence resets
+  with each run.
 - Scheduling: auxiliary work now rotates by kind instead of letting a large
   investigation queue starve comments, bids and awards. Discovery reserves an
   agent slot when due, before auxiliary dispatch.

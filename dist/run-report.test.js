@@ -36,11 +36,12 @@ function profile() {
 function stateWithRun() {
     const state = emptyState();
     state.profile = "demo";
-    state.cycles = 7;
+    state.cycles = 70;
     state.run = {
         startedAt: new Date(Date.now() - 90_000).toISOString(),
         limits: null,
         stopReason: "stop",
+        startedCycles: 63,
         deliveries: 2,
         reviews: 3,
         mergeReviews: 1,

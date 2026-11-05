@@ -26,6 +26,7 @@ export function emptyState(): State {
       startedAt: null,
       limits: null,
       stopReason: null,
+      startedCycles: 0,
       deliveries: 0,
       reviews: 0,
       mergeReviews: 0,
