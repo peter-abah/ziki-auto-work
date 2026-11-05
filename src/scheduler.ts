@@ -30,8 +30,17 @@ export interface InFlightTask {
 
 export class TaskPool {
   private readonly tasks = new Map<string, InFlight>();
+  onChange: (() => void) | null = null;
 
   constructor(public limits: TaskPoolLimits) {}
+
+  private changed(): void {
+    try {
+      this.onChange?.();
+    } catch {
+      // status reporting must never break the pool
+    }
+  }
 
   has(key: string): boolean {
     return this.tasks.has(key);
@@ -57,8 +66,10 @@ export class TaskPool {
       .catch(() => undefined)
       .finally(() => {
         this.tasks.delete(key);
+        this.changed();
       });
     this.tasks.set(key, { key, kind, label, agent, startedAt: Date.now(), promise });
+    this.changed();
     return true;
   }
 

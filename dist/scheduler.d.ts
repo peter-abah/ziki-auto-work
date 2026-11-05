@@ -19,7 +19,9 @@ export interface InFlightTask {
 export declare class TaskPool {
     limits: TaskPoolLimits;
     private readonly tasks;
+    onChange: (() => void) | null;
     constructor(limits: TaskPoolLimits);
+    private changed;
     has(key: string): boolean;
     count(kind: TaskKind): number;
     total(): number;

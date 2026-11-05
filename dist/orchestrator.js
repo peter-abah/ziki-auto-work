@@ -783,6 +783,7 @@ async function buildStatus(ctx, extra = {}) {
         profile: ctx.profileName,
         pid: process.pid,
         running: extra.running ?? true,
+        updatedAt: new Date().toISOString(),
         dryRun: Boolean(ctx.dryRun),
         paused: await isPaused(ctx.profilePaths),
         stopped: await isStopped(ctx.profilePaths),
@@ -915,6 +916,52 @@ async function writeStatus(ctx, extra = {}) {
         await mkdir(ctx.profilePaths.stateDir, { recursive: true });
         await writeFile(ctx.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
     });
+}
+function scheduleStatus(ctx) {
+    if (ctx.statusTimer)
+        return;
+    ctx.statusTimer = setTimeout(() => {
+        ctx.statusTimer = null;
+        void writeStatus(ctx).catch(() => { });
+    }, 200);
+    ctx.statusTimer.unref?.();
+}
+async function writeBootStatus(loaded, state, phase, running, extra = {}) {
+    await mkdir(loaded.profilePaths.stateDir, { recursive: true });
+    const tasks = Object.values(state.tasks);
+    const status = {
+        profile: loaded.profileName,
+        pid: process.pid,
+        running,
+        phase,
+        updatedAt: new Date().toISOString(),
+        startedAt: state.startedAt,
+        lastCycleAt: state.lastCycleAt,
+        cycles: state.cycles,
+        tasks: {
+            total: tasks.length,
+            queued: tasks.filter((task) => task.status === "queued").length,
+            claimed: tasks.filter((task) => task.status === "claimed").length,
+            working: tasks.filter((task) => task.status === "working").length,
+            waitingHuman: tasks.filter((task) => task.status === "waiting_human").length,
+            delivered: tasks.filter((task) => task.status === "delivered").length,
+            done: tasks.filter((task) => task.status === "done").length,
+            failed: tasks.filter((task) => task.status === "failed").length
+        },
+        inFlight: {
+            total: 0,
+            deliveries: 0,
+            followUps: 0,
+            reviews: 0,
+            aux: 0,
+            discovery: 0,
+            owner: 0,
+            tasks: []
+        },
+        health: summarizeHealth(state.health),
+        ...extra
+    };
+    await writeFile(loaded.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
 }
 async function save(ctx) {
     if (ctx.state.lastCycleAt) {
@@ -3612,7 +3659,8 @@ async function createContext(loaded, state, logger, options) {
         profileSynced: false,
         feedAgentCounts: {},
         zikiWorkflow,
-        reservedTargets: new Set()
+        reservedTargets: new Set(),
+        statusTimer: null
     };
 }
 async function readRunLimitsFile(profilePaths) {
@@ -3802,6 +3850,7 @@ export async function runLoop(options = {}) {
     state.lastCycle = null;
     await saveState(loaded.profilePaths, state);
     await writePid(loaded.profilePaths, process.pid);
+    await writeBootStatus(loaded, state, "starting", true).catch(() => { });
     let ctx;
     try {
         ctx = await createContext(loaded, state, logger, { dryRun: Boolean(options.dryRun), runLimits });
@@ -3810,10 +3859,14 @@ export async function runLoop(options = {}) {
         const message = error instanceof Error ? error.message : String(error);
         logger.error(`Startup failed: ${message}`);
         console.error(`Startup failed: ${message}`);
+        await writeBootStatus(loaded, state, "startup-failed", false, {
+            lastError: { at: new Date().toISOString(), error: message }
+        }).catch(() => { });
         await releaseLock(loaded.profilePaths);
         await clearPid(loaded.profilePaths);
         return 1;
     }
+    ctx.pool.onChange = () => scheduleStatus(ctx);
     await reconcileWorktreesOnStartup(ctx, stalePids).catch(() => { });
     const live = new LiveStatus({
         enabled: options.foreground !== false && !options.verbose,
@@ -3969,6 +4022,9 @@ export async function runLoop(options = {}) {
             await ctx.pool.drain(5_000);
         }
         ctx.state.activePids = [];
+        if (ctx.statusTimer)
+            clearTimeout(ctx.statusTimer);
+        ctx.statusTimer = null;
         await releaseUndeliveredClaims(ctx, `auto-work stopped (${stopReason ?? "stop"}); claim released`).catch(() => { });
         await save(ctx).catch(() => { });
         await writeStatus(ctx, { running: false }).catch(() => { });

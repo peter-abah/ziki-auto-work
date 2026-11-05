@@ -170,8 +170,36 @@ export async function stopService(profileName) {
         }
     }
     await clearPid(jp);
+    await markStatusStopped(jp).catch(() => { });
     await unlink(jp.stopFile).catch(() => { });
     return { stopped: true, pid };
+}
+async function markStatusStopped(jp) {
+    if (!existsSync(jp.statusFile))
+        return;
+    let status;
+    try {
+        status = JSON.parse(await readFile(jp.statusFile, "utf8"));
+    }
+    catch {
+        return;
+    }
+    status.running = false;
+    status.stopped = true;
+    status.phase = "stopped";
+    status.activity = null;
+    status.updatedAt = new Date().toISOString();
+    status.inFlight = {
+        total: 0,
+        deliveries: 0,
+        followUps: 0,
+        reviews: 0,
+        aux: 0,
+        discovery: 0,
+        owner: 0,
+        tasks: []
+    };
+    await writeFile(jp.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
 }
 export async function statusService(profileName) {
     const jp = profilePaths(profileName);

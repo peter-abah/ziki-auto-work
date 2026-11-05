@@ -1127,15 +1127,23 @@ function statusLine(name: string, result: Awaited<ReturnType<typeof statusServic
       ? formatDuration(status.run.limits.maxRuntimeMinutes * 60 * 1000)
       : "none";
   const needs = status.needsYou?.count ?? (status.escalations as unknown[] | undefined)?.length ?? 0;
-  const inflight = status.inFlight?.total ?? 0;
+  const running = Boolean(result.running);
+  const inflight = running ? status.inFlight?.total ?? 0 : 0;
+  const statusAge = status.updatedAt ? Date.now() - Date.parse(String(status.updatedAt)) : null;
+  const statusAgeText =
+    statusAge !== null && Number.isFinite(statusAge) && (!running || statusAge > 120_000)
+      ? ` | status ${formatDuration(statusAge)} old`
+      : "";
   const queue = status.queue ? Object.values(status.queue as Record<string, number>).reduce((sum, value) => sum + Number(value || 0), 0) : 0;
   const last = status.lastCycleMs != null ? formatDuration(status.lastCycleMs) : "-";
-  const current = (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined)?.[0];
-  const phase = current
-    ? ` | ${current.label ?? `${current.key} ${current.kind}`} ${formatDuration(Number(current.ageMs ?? 0))}`
-    : status.phase
-      ? ` | ${status.phase}${status.activity ? ` ${status.activity}` : ""}`
-      : "";
+  const current = running ? (status.inFlight?.tasks as Array<Record<string, unknown>> | undefined)?.[0] : null;
+  const phase = !running
+    ? ""
+    : current
+      ? ` | ${current.label ?? `${current.key} ${current.kind}`} ${formatDuration(Number(current.ageMs ?? 0))}`
+      : status.phase
+        ? ` | ${status.phase}${status.activity ? ` ${status.activity}` : ""}`
+        : "";
   const network = status.run?.networkErrors ? ` | net err ${status.run.networkErrors}` : "";
   const tokenText = status.tokens
     ? ` | tokens ${formatTokens(status.tokens.total)}${status.tokens.limit ? `/${formatTokens(status.tokens.limit)} (${status.tokens.percent ?? 0}%)` : ""}`
@@ -1148,7 +1156,7 @@ function statusLine(name: string, result: Awaited<ReturnType<typeof statusServic
     health && health.state !== "healthy"
       ? ` | health ${health.state}:${health.blockers?.[0]?.code ?? "issue"}`
       : "";
-  return `${name} | ${state}${phase} | ${spent}/${limit}${network} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}${healthText}`;
+  return `${name} | ${state}${phase} | ${spent}/${limit}${network} | Ziki needs you: ${needs}${tokenText} | inflight ${inflight} | q ${queue} | last ${last}${lastRun}${healthText}${statusAgeText}`;
 }
 
 async function status(flags: Flags): Promise<void> {
@@ -1189,6 +1197,9 @@ function printDetailedStatusWithFlags(
   if (!result.status) return;
   const status = result.status as Record<string, any>;
   console.log(`  cycles: ${status.cycles ?? 0}  last: ${status.lastCycleAt ?? "never"}`);
+  if (!result.running && status.updatedAt) {
+    console.log(`  last snapshot: ${status.updatedAt} (process not running)`);
+  }
   if (status.run) {
     console.log(
       `  run: ${formatDuration(status.run.elapsedMs)} elapsed · ${formatDuration(status.run.remainingMs)} remaining` +
@@ -1221,7 +1232,7 @@ function printDetailedStatusWithFlags(
       console.log(`      attempts ${blocker.attempts} · next retry ${blocker.nextRetryAt ?? "none"}`);
     }
   }
-  if (status.agents) {
+  if (result.running && status.agents) {
     for (const agent of status.agents as Array<Record<string, any>>) {
       const current = agent.current
         ? `${agent.current.label ?? agent.current.key} (${Math.round(Number(agent.current.ageMs ?? 0) / 1000)}s)`
@@ -1239,7 +1250,7 @@ function printDetailedStatusWithFlags(
         ` · per-cycle aux ${status.profileLimits?.maxAuxPerCycle ?? "none"}`
     );
   }
-  if (status.inFlight) {
+  if (result.running && status.inFlight) {
     console.log(
       `  in flight: ${status.inFlight.total ?? 0} agent(s) · ${status.inFlight.deliveries} delivery · ${status.inFlight.followUps ?? 0} follow-up · ${status.inFlight.reviews} review · ${status.inFlight.aux} aux · ${status.inFlight.discovery} discovery`
     );
@@ -1263,7 +1274,7 @@ function printDetailedStatusWithFlags(
   }
   if (verbose) {
     const taskList = (status.taskList as Array<Record<string, unknown>> | undefined) ?? [];
-    console.log(`  tasks (${taskList.length}):`);
+    console.log(`  tasks${result.running ? "" : " (last snapshot)"} (${taskList.length}):`);
     for (const task of taskList) {
       console.log(
         `    - #${task.issue ?? "?"} [${task.status}] ${task.pr ? `PR ${task.pr}` : ""}${task.prState ? ` · ${task.prState}` : ""}${task.prChecks ? ` · checks ${task.prChecks}` : ""}${task.followUpAttempts ? ` · follow-ups ${task.followUpAttempts}` : ""}${task.tokens != null ? ` · ${formatTokens(Number(task.tokens))} tokens` : ""}${task.lastError ? ` · ${task.lastError}` : ""}`

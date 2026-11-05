@@ -1,8 +1,17 @@
 export class TaskPool {
     limits;
     tasks = new Map();
+    onChange = null;
     constructor(limits) {
         this.limits = limits;
+    }
+    changed() {
+        try {
+            this.onChange?.();
+        }
+        catch {
+            // status reporting must never break the pool
+        }
     }
     has(key) {
         return this.tasks.has(key);
@@ -26,8 +35,10 @@ export class TaskPool {
             .catch(() => undefined)
             .finally(() => {
             this.tasks.delete(key);
+            this.changed();
         });
         this.tasks.set(key, { key, kind, label, agent, startedAt: Date.now(), promise });
+        this.changed();
         return true;
     }
     list() {
