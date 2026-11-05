@@ -5,11 +5,11 @@ import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.
 import { PROVIDER_IDS } from "./providers/index.js";
 export const PROVIDERS = PROVIDER_IDS;
 export const DEFAULT_LIMITS = {
-    maxDeliveriesPerDay: 10,
-    maxReviewsPerDay: 20,
-    maxDiscoveriesPerDay: 5,
-    maxAuxPerCycle: 4,
-    maxActiveClaims: 2,
+    maxDeliveriesPerDay: null,
+    maxReviewsPerDay: null,
+    maxDiscoveriesPerDay: null,
+    maxAuxPerCycle: null,
+    maxActiveClaims: "auto",
     maxAttemptsPerTask: 3,
     maxNetworkRetries: 5,
     networkRetryMinutes: 1,
@@ -19,12 +19,12 @@ export const DEFAULT_LIMITS = {
     maxCycles: null,
     stopAt: null,
     maxDeliveriesTotal: null,
-    maxConcurrentDeliveries: 2,
-    maxConcurrentFollowUps: 1,
-    maxConcurrentReviews: 1,
-    maxConcurrentAux: 2,
+    maxConcurrentDeliveries: "auto",
+    maxConcurrentFollowUps: "auto",
+    maxConcurrentReviews: "auto",
+    maxConcurrentAux: "auto",
     maxConcurrentDiscovery: 1,
-    maxConcurrentAgents: 4,
+    maxConcurrentAgents: "auto",
     maxTokensPerRun: null,
     tokenWarnPercent: 80,
     providerRetryMinutes: 15
@@ -293,6 +293,47 @@ export function validateConfig(config) {
         if (!profile?.limits || typeof profile.limits !== "object") {
             errors.push(`${prefix}.limits is required`);
         }
+        else {
+            const capacityKeys = [
+                "maxDeliveriesPerDay",
+                "maxReviewsPerDay",
+                "maxDiscoveriesPerDay",
+                "maxAuxPerCycle",
+                "maxActiveClaims",
+                "maxConcurrentDeliveries",
+                "maxConcurrentFollowUps",
+                "maxConcurrentReviews",
+                "maxConcurrentAux",
+                "maxConcurrentDiscovery",
+                "maxConcurrentAgents"
+            ];
+            for (const key of capacityKeys) {
+                const value = profile.limits[key];
+                if (value === undefined || value === null || value === "auto")
+                    continue;
+                if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+                    errors.push(`${prefix}.limits.${key} must be a non-negative number, "auto" or null`);
+                }
+            }
+        }
+        if (profile?.repo?.mergeMode !== undefined && !["handoff", "never", "auto"].includes(profile.repo.mergeMode)) {
+            errors.push(`${prefix}.repo.mergeMode must be "handoff", "never" or "auto"`);
+        }
+        if (profile?.repo?.mergeMethod !== undefined && !["merge", "squash", "rebase"].includes(profile.repo.mergeMethod)) {
+            errors.push(`${prefix}.repo.mergeMethod must be "merge", "squash" or "rebase"`);
+        }
+        if (profile?.agentProfile?.skills !== undefined) {
+            if (!Array.isArray(profile.agentProfile.skills)) {
+                errors.push(`${prefix}.agentProfile.skills must be an array`);
+            }
+            else {
+                profile.agentProfile.skills.forEach((skill, index) => {
+                    requireString(skill?.tag, `${prefix}.agentProfile.skills[${index}].tag`, errors);
+                    requireString(skill?.summary, `${prefix}.agentProfile.skills[${index}].summary`, errors);
+                    requireString(skill?.description, `${prefix}.agentProfile.skills[${index}].description`, errors);
+                });
+            }
+        }
         const workflow = profile?.workflow;
         if (!workflow || typeof workflow !== "object") {
             warnings.push(`${prefix}.workflow is missing; defaults will be used`);
@@ -344,6 +385,12 @@ export function resolveModel(profile, role) {
     if (role === "followup")
         return models.followup ?? models.worker ?? profile.executor.model ?? null;
     return models[role] ?? profile.executor.model ?? null;
+}
+export function resolveMergeMode(profile) {
+    return profile.repo.mergeMode ?? "handoff";
+}
+export function resolveMergeMethod(profile) {
+    return profile.repo.mergeMethod ?? "squash";
 }
 export function resolvePromptDir(profile) {
     const dir = profile.prompts.dir;

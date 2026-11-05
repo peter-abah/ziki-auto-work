@@ -8,6 +8,13 @@ export interface TaskPoolLimits {
     owner: number;
     agents: number;
 }
+export interface InFlightTask {
+    key: string;
+    kind: TaskKind;
+    label?: string;
+    startedAt: string;
+    ageMs: number;
+}
 export declare class TaskPool {
     limits: TaskPoolLimits;
     private readonly tasks;
@@ -16,13 +23,8 @@ export declare class TaskPool {
     count(kind: TaskKind): number;
     total(): number;
     canStart(kind: TaskKind): boolean;
-    reserve(key: string, kind: TaskKind, run: () => Promise<void>): boolean;
-    list(): Array<{
-        key: string;
-        kind: TaskKind;
-        startedAt: string;
-        ageMs: number;
-    }>;
+    reserve(key: string, kind: TaskKind, run: () => Promise<void>, label?: string): boolean;
+    list(): InFlightTask[];
     waitForAny(): Promise<void>;
     drain(timeoutMs?: number): Promise<void>;
 }

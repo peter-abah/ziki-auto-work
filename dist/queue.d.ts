@@ -1,4 +1,9 @@
 import type { ProfileConfig, Queue, State, WorkFeed, WorkItem } from "./types.js";
+export declare const OWNER_KINDS: Set<string>;
+export declare const WORK_KINDS: Set<string>;
+export declare const REVIEW_KINDS: Set<string>;
+export declare const AUX_KINDS: Set<string>;
+export declare const KNOWN_KINDS: Set<string>;
 export declare function textMatchesPlatform(profile: ProfileConfig, text: string): boolean;
 export declare function matchesPlatform(profile: ProfileConfig, item: WorkItem): boolean;
 export declare function buildQueue(options: {

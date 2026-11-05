@@ -53,6 +53,10 @@ address the review comments and failing checks below, not to redo the ticket.
    `"blocked": true` with a precise blocker.
 8. If the branch has conflicts, rebase onto the current base and resolve them.
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}

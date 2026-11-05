@@ -44,6 +44,10 @@ web app (`zeduchat/zedu-fe`) and work correctly on every desktop platform.
 5. For each idea, give concrete evidence: file paths and lines, the symptom, and
    how to verify the fix.
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}

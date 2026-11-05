@@ -97,6 +97,10 @@ export class LiveStatus {
   }
 }
 
+export function formatLiveTask(task: { label?: string; key: string; kind: string; ageMs: number }): string {
+  return `${task.label ?? `${task.key} ${task.kind}`} ${formatLiveDuration(task.ageMs)}`;
+}
+
 export function formatLiveDuration(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms)) return "-";
   if (ms <= 0) return "0s";

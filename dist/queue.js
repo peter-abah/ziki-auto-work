@@ -1,39 +1,93 @@
 const PRIORITY = {
     owner_request: 1,
     offer: 2,
-    active_claim: 2,
-    ready_issue: 3,
-    test_fix: 4,
-    accept_fix: 5,
-    confirm_issue: 6,
-    idea: 7,
-    award_bid: 8,
-    review_bid: 9,
-    review_comment: 10,
-    report_pr_status: 11,
-    categorize: 12,
-    investigate_issue: 13,
-    report_deployment: 14,
-    estimate_reward: 15,
-    close_issue: 16,
-    reject_idea: 17
+    review_offer: 3,
+    job_review_offer: 3,
+    active_claim: 4,
+    reclaim_issue: 5,
+    ready_issue: 6,
+    open_issue: 7,
+    test_fix: 8,
+    deliver_stranded: 9,
+    accept_fix: 10,
+    merge_fix: 11,
+    reconcile_merged: 12,
+    await_release: 13,
+    convert_idea: 14,
+    reject_idea: 15,
+    confirm_issue: 16,
+    idea: 17,
+    vote_importance: 18,
+    sense_check: 19,
+    close_issue: 20,
+    review_idle: 21,
+    estimate_reward: 22,
+    investigate_issue: 23,
+    vote_stake: 24,
+    refresh_stake: 25,
+    review_comment: 26,
+    report_pr_status: 27,
+    report_deployment: 28,
+    repair_pull_request: 29,
+    research_job: 30,
+    award_bid: 31,
+    review_bid: 32,
+    categorize: 33
 };
-const AUX_KINDS = new Set([
-    "idea",
-    "confirm_issue",
-    "review_bid",
-    "award_bid",
-    "review_comment",
-    "report_pr_status",
-    "categorize",
-    "investigate_issue",
-    "report_deployment",
-    "estimate_reward",
-    "close_issue",
-    "reject_idea"
+export const OWNER_KINDS = new Set(["owner_request"]);
+export const WORK_KINDS = new Set([
+    "offer",
+    "review_offer",
+    "job_review_offer",
+    "active_claim",
+    "ready_issue",
+    "open_issue",
+    "reclaim_issue"
 ]);
-const REVIEW_KINDS = new Set(["test_fix", "accept_fix"]);
-const WORK_KINDS = new Set(["ready_issue", "active_claim", "offer"]);
+export const REVIEW_KINDS = new Set([
+    "test_fix",
+    "accept_fix",
+    "review_idle",
+    "deliver_stranded",
+    "merge_fix",
+    "reconcile_merged"
+]);
+export const AUX_KINDS = new Set([
+    "idea",
+    "convert_idea",
+    "reject_idea",
+    "confirm_issue",
+    "close_issue",
+    "sense_check",
+    "vote_importance",
+    "estimate_reward",
+    "investigate_issue",
+    "review_comment",
+    "refresh_stake",
+    "vote_stake",
+    "report_pr_status",
+    "report_deployment",
+    "repair_pull_request",
+    "await_release",
+    "research_job",
+    "award_bid",
+    "review_bid",
+    "categorize"
+]);
+const NO_ISSUE_KINDS = new Set([
+    "owner_request",
+    "categorize",
+    "research_job",
+    "job_review_offer",
+    "refresh_stake",
+    "vote_stake"
+]);
+export const KNOWN_KINDS = new Set([
+    ...OWNER_KINDS,
+    ...WORK_KINDS,
+    ...REVIEW_KINDS,
+    ...AUX_KINDS
+]);
 export function textMatchesPlatform(profile, text) {
     if (profile.platformMatch.regex) {
         try {
@@ -83,7 +137,10 @@ export function buildQueue(options) {
         if (recent[item.key] && now - recent[item.key] < recentMs)
             continue;
         let isPlatform = false;
-        if (kind === "owner_request" || kind === "categorize") {
+        if (NO_ISSUE_KINDS.has(kind)) {
+            isPlatform = true;
+        }
+        else if (kind === "categorize") {
             isPlatform = true;
         }
         else if (issueNumber !== null) {
@@ -112,7 +169,7 @@ export function buildQueue(options) {
             actions: item.actions ?? [],
             bucket: "other"
         };
-        if (kind === "owner_request")
+        if (OWNER_KINDS.has(kind))
             entry.bucket = "owner";
         else if (WORK_KINDS.has(kind))
             entry.bucket = "work";

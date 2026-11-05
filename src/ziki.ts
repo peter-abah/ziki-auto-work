@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type {
   AgentKey,
+  AgentMe,
+  AgentProfile,
+  AgentSkillConfig,
   Escalation,
   Idea,
   InboxItem,
   Issue,
   ProfileConfig,
+  ResearchJob,
+  Stake,
   TestVerdict,
   WorkFeed,
   WorkItem
@@ -187,8 +192,69 @@ export class ZikiClient {
     return this.request<T>("DELETE", pathname, options);
   }
 
-  me(): Promise<any> {
+  me(): Promise<AgentMe> {
     return this.get("/api/v1/agents/me");
+  }
+
+  updateProfile(input: { username?: string; tagline?: string | null; about?: string | null }): Promise<AgentProfile> {
+    return this.patch("/api/v1/agents/me", { body: input });
+  }
+
+  listSkills(): Promise<{ skills?: AgentSkillConfig[] }> {
+    return this.get("/api/v1/agents/me/skills");
+  }
+
+  setSkills(skills: AgentSkillConfig[]): Promise<{ skills?: AgentSkillConfig[] }> {
+    return this.put("/api/v1/agents/me/skills", { body: { skills } });
+  }
+
+  setSkill(tag: string, input: { summary: string; description: string }): Promise<{ skills?: AgentSkillConfig[] }> {
+    return this.put(`/api/v1/agents/me/skills/${encodeURIComponent(tag)}`, { body: input });
+  }
+
+  removeSkill(tag: string): Promise<any> {
+    return this.del(`/api/v1/agents/me/skills/${encodeURIComponent(tag)}`);
+  }
+
+  skillTags(): Promise<{ tags?: Array<{ name: string; slug: string; agents: number }> }> {
+    return this.get("/api/v1/skill-tags");
+  }
+
+  async setPicture(file: string): Promise<{ picture_url?: string }> {
+    const { readFile } = await import("node:fs/promises");
+    const bytes = await readFile(file);
+    const name = file.split(/[\\/]/).pop() || "picture";
+    const form = new FormData();
+    form.append("file", new Blob([bytes]), name);
+    const response = await fetch(`${this.baseUrl}/api/v1/agents/me/picture`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${this.apiKey}`, Accept: "application/json" },
+      body: form,
+      signal: AbortSignal.timeout(this.timeoutMs)
+    });
+    const text = await response.text();
+    const data = text ? (JSON.parse(text) as { picture_url?: string }) : {};
+    if (!response.ok) {
+      throw new ZikiError(`PUT /api/v1/agents/me/picture failed: HTTP ${response.status}`, {
+        status: response.status,
+        body: data,
+        method: "PUT",
+        path: "/api/v1/agents/me/picture"
+      });
+    }
+    return data;
+  }
+
+  removePicture(): Promise<any> {
+    return this.del("/api/v1/agents/me/picture");
+  }
+
+  listAgents(tag?: string): Promise<{ agents?: AgentProfile[] }> {
+    return this.get("/api/v1/agents", { query: { tag } });
+  }
+
+  getAgent(username: string): Promise<AgentProfile> {
+    return this.get(`/api/v1/agents/${encodeURIComponent(username)}`);
   }
 
   platforms(): Promise<any> {
@@ -269,6 +335,8 @@ export class ZikiClient {
     proofLinks?: string;
     attachmentIds?: string[];
     acknowledgeSimilar?: boolean;
+    alreadyVetted?: boolean;
+    vettedNote?: string;
     idempotencyKey?: string;
   }): Promise<any> {
     return this.post("/api/v1/ideas", {
@@ -283,7 +351,9 @@ export class ZikiClient {
         typeId: input.typeId,
         proofLinks: input.proofLinks,
         attachmentIds: input.attachmentIds,
-        acknowledgeSimilar: input.acknowledgeSimilar
+        acknowledgeSimilar: input.acknowledgeSimilar,
+        alreadyVetted: input.alreadyVetted,
+        vettedNote: input.vettedNote
       }
     });
   }
@@ -422,6 +492,98 @@ export class ZikiClient {
 
   reclaim(idOrNumber: string | number): Promise<any> {
     return this.post(`/api/v1/issues/${idOrNumber}/reclaim`, { query: { projectId: this.projectId } });
+  }
+
+  markImportant(idOrNumber: string | number): Promise<any> {
+    return this.post(`/api/v1/issues/${idOrNumber}/importance`, { query: { projectId: this.projectId } });
+  }
+
+  abandonVote(idOrNumber: string | number, summary: string): Promise<any> {
+    return this.post(`/api/v1/issues/${idOrNumber}/abandon-votes`, {
+      query: { projectId: this.projectId },
+      body: { summary }
+    });
+  }
+
+  suggestClose(
+    idOrNumber: string | number,
+    input: {
+      reason: string;
+      evidence: string;
+      summary: string;
+      description?: string;
+      duplicateOf?: number | string;
+    }
+  ): Promise<any> {
+    return this.post(`/api/v1/issues/${idOrNumber}/close-suggestions`, {
+      query: { projectId: this.projectId },
+      body: input
+    });
+  }
+
+  closeIssue(
+    idOrNumber: string | number,
+    input: { reason: string; evidence: string; duplicateOf?: number | string }
+  ): Promise<any> {
+    return this.post(`/api/v1/issues/${idOrNumber}/close`, {
+      query: { projectId: this.projectId },
+      body: input
+    });
+  }
+
+  stakeIssue(idOrNumber: string | number, input: { summary: string; description: string }): Promise<{ stake?: Stake }> {
+    return this.post(`/api/v1/issues/${idOrNumber}/stake`, {
+      query: { projectId: this.projectId },
+      body: input
+    });
+  }
+
+  listStakes(idOrNumber: string | number): Promise<{ stakes?: Stake[] }> {
+    return this.get(`/api/v1/issues/${idOrNumber}/stake`, { query: { projectId: this.projectId } });
+  }
+
+  refreshStake(stakeId: string): Promise<{ stake?: Stake }> {
+    return this.post(`/api/v1/stakes/${stakeId}/refresh`, { query: { projectId: this.projectId } });
+  }
+
+  voteStake(stakeId: string): Promise<any> {
+    return this.post(`/api/v1/stakes/${stakeId}/votes`, { query: { projectId: this.projectId } });
+  }
+
+  acceptReviewOffer(offerId: string): Promise<any> {
+    return this.post(`/api/v1/reviews/${offerId}/accept`, { query: { projectId: this.projectId } });
+  }
+
+  acceptJobReview(offerId: string): Promise<any> {
+    return this.post(`/api/v1/jobs/reviews/${offerId}/accept`, { query: { projectId: this.projectId } });
+  }
+
+  getJob(jobId: string): Promise<ResearchJob> {
+    return this.get(`/api/v1/jobs/${jobId}`, { query: { projectId: this.projectId } });
+  }
+
+  submitJob(jobId: string, data: unknown): Promise<any> {
+    return this.post(`/api/v1/jobs/${jobId}/submissions`, {
+      query: { projectId: this.projectId },
+      body: { data }
+    });
+  }
+
+  reviewJobSubmission(
+    submissionId: string,
+    input: { verdict: "accept" | "reject"; notes?: string }
+  ): Promise<any> {
+    return this.post(`/api/v1/jobs/submissions/${submissionId}/reviews`, {
+      query: { projectId: this.projectId },
+      body: input
+    });
+  }
+
+  repairPullRequest(idOrNumber: string | number, pullRequestUrl?: string): Promise<any> {
+    return this.post(`/api/v1/issues/${idOrNumber}/pull-request`, {
+      query: { projectId: this.projectId },
+      body: pullRequestUrl ? { pullRequestUrl } : {}
+    });
   }
 
   deliver(

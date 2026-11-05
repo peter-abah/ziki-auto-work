@@ -30,6 +30,7 @@ export declare function runWorker(options: {
     base: string;
     previousError?: string;
     issueContext?: string;
+    loopContext?: string;
     attempt?: number;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
@@ -58,6 +59,7 @@ export declare function runReview(options: {
     headSha: string;
     prContext?: string;
     issueContext?: string;
+    loopContext?: string;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;
@@ -75,6 +77,7 @@ export declare function runFollowUp(options: {
     attempt: number;
     maxAttempts: number;
     previousError?: string;
+    loopContext?: string;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;
@@ -85,6 +88,7 @@ export declare function runConfirm(options: {
     issue: Issue;
     memoryText: string;
     repoDir: string;
+    loopContext?: string;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;
@@ -108,6 +112,110 @@ export declare function runOwner(options: {
     };
     memoryText: string;
     repoDir: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runPromptTask(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    role: Role;
+    label: string | number;
+    cwd?: string;
+    repoDir?: string;
+    vars: Record<string, unknown>;
+    timeoutMs?: number;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runEstimate(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runInvestigate(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runImportance(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runStakeVote(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue | null;
+    stakes: unknown[];
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runSenseCheck(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runClose(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    issue: Issue;
+    actingAs: "working" | "manager";
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runResearch(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    job: unknown;
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
+    logger?: Logger;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
+export declare function runJobReview(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    job: unknown;
+    submission: unknown;
+    memoryText: string;
+    repoDir: string;
+    loopContext: string;
     logger?: Logger;
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;

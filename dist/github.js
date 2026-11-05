@@ -376,6 +376,12 @@ export class GitHub {
         if (!result.ok)
             throw new Error(result.stderr || result.stdout || "gh pr edit failed");
     }
+    async mergePr(url, method = "squash") {
+        const flag = method === "merge" ? "--merge" : method === "rebase" ? "--rebase" : "--squash";
+        const result = await this.gh(["pr", "merge", url, flag], { timeoutMs: 300_000, retry: true });
+        if (!result.ok)
+            throw new Error(result.stderr || result.stdout || "gh pr merge failed");
+    }
     async closePr(url, comment) {
         const args = ["pr", "close", url];
         if (comment)

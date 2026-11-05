@@ -38,6 +38,10 @@ not already tracked, and report them so the loop can fix them.
 5. For each idea, give concrete evidence: file paths and lines, the symptom, and
    how to verify the fix.
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}

@@ -7,7 +7,10 @@ src/
   keys.ts            key import, validation and role assignment
   types.ts           shared types
   orchestrator.ts    the loop, dispatch and state machine
-  scheduler.ts       TaskPool with per-kind and total concurrency limits
+  scheduler.ts       TaskPool with per-kind/total limits and live labels
+  capacity.ts        resolves "auto"/null concurrency from the configured agents
+  decisions.ts       parses "Your Call" owner decisions from comments
+  loop-context.ts    one renderable context object for every agent task
   mutex.ts           serialized state/history writes
   discover.ts        Ziki-first repo/fork/branch/stack discovery
   rules.ts           workflow/protected-file/PR-template prompt context
@@ -15,7 +18,7 @@ src/
   notify.ts          desktop/command notifications
   run-report.ts      clean/abrupt run summaries
   ziki.ts            typed Ziki API client
-  queue.ts           work-feed prioritisation and platform matching
+  queue.ts           all latest work kinds, prioritisation and platform matching
   memory.ts          instructions, project notes, private notes, mistakes
   hitl.ts            escalations, inbox, non-blocking resume
   github.ts          clone, worktrees, push, PRs, PR status

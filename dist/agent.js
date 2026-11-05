@@ -28,15 +28,21 @@ export function render(template, vars) {
         return value === undefined || value === null ? "" : String(value);
     });
 }
+const PROMPT_FILES = {
+    stakeVote: "stake-vote",
+    senseCheck: "sense-check",
+    jobReview: "job-review"
+};
 export async function loadPrompt(profile, role) {
     const dir = resolvePromptDir(profile);
-    const primary = path.join(dir, `${role}.md`);
+    const name = PROMPT_FILES[role] ?? role;
+    const primary = path.join(dir, `${name}.md`);
     if (existsSync(primary))
         return readFile(primary, "utf8");
-    const fallback = path.join(PACKAGE_ROOT, "prompts", "generic", `${role}.md`);
+    const fallback = path.join(PACKAGE_ROOT, "prompts", "generic", `${name}.md`);
     if (existsSync(fallback))
         return readFile(fallback, "utf8");
-    throw new Error(`Prompt "${role}.md" not found in ${dir}`);
+    throw new Error(`Prompt "${name}.md" not found in ${dir}`);
 }
 function resultPaths(profilePaths, kind, label) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -221,6 +227,7 @@ export async function runWorker(options) {
         issueStatus: issue.status,
         issueSubstatus: issue.substatus,
         issueContext: options.issueContext || "(none)",
+        loopContext: options.loopContext || "(none)",
         attempt: options.attempt ?? 1,
         previousError: options.previousError || "(none)",
         memory: memoryText,
@@ -310,6 +317,7 @@ export async function runReview(options) {
         headSha,
         prContext: options.prContext || "(not loaded)",
         issueContext: options.issueContext || "(none)",
+        loopContext: options.loopContext || "(none)",
         resultPath,
         logPath,
         resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
@@ -343,6 +351,7 @@ export async function runFollowUp(options) {
         attempt: options.attempt,
         maxAttempts: options.maxAttempts,
         previousError: options.previousError || "(none)",
+        loopContext: options.loopContext || "(none)",
         resultPath,
         logPath,
         resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
@@ -381,6 +390,7 @@ export async function runConfirm(options) {
         checks: checksText(profile),
         workflowRules: formatWorkflowRules(profile),
         protectedFiles: formatProtectedFiles(profile),
+        loopContext: options.loopContext || "(none)",
         resultPath,
         logPath,
         resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
@@ -458,6 +468,163 @@ export async function runOwner(options) {
         timeoutMs: 30 * 60 * 1000,
         onSpawn: options.onSpawn,
         onExit: options.onExit
+    });
+}
+export async function runPromptTask(options) {
+    const { profile, profilePaths, role, label, logger } = options;
+    const cwd = options.cwd ?? options.repoDir ?? process.cwd();
+    const { resultPath, logPath } = resultPaths(profilePaths, role, label);
+    const template = await loadPrompt(profile, role);
+    const prompt = render(template, {
+        projectName: projectName(profile),
+        stack: profile.stack || profile.ziki.platform,
+        repoUrl: profile.repo.githubRepo,
+        platform: profile.ziki.platform,
+        checks: checksText(profile),
+        workflowRules: formatWorkflowRules(profile),
+        protectedFiles: formatProtectedFiles(profile),
+        ...options.vars,
+        resultPath,
+        logPath,
+        resultInstruction: (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+            ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+            : `Write valid JSON to \`${resultPath}\`.`
+    });
+    return runAgent({
+        profile,
+        profilePaths,
+        role,
+        prompt,
+        cwd,
+        resultPath,
+        logPath,
+        logger,
+        timeoutMs: options.timeoutMs ?? 20 * 60 * 1000,
+        onSpawn: options.onSpawn,
+        onExit: options.onExit
+    });
+}
+export async function runEstimate(options) {
+    return runPromptTask({
+        ...options,
+        role: "estimate",
+        label: options.issue.number,
+        vars: {
+            issueNumber: options.issue.number,
+            issueTitle: options.issue.title,
+            issueUrl: issueUrl(options.profile, options.issue),
+            issueSummary: options.issue.summary || "",
+            issueDescription: options.issue.description || "",
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runInvestigate(options) {
+    return runPromptTask({
+        ...options,
+        role: "investigate",
+        label: options.issue.number,
+        vars: {
+            issueNumber: options.issue.number,
+            issueTitle: options.issue.title,
+            issueUrl: issueUrl(options.profile, options.issue),
+            issueSummary: options.issue.summary || "",
+            issueDescription: options.issue.description || "",
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runImportance(options) {
+    return runPromptTask({
+        ...options,
+        role: "importance",
+        label: options.issue.number,
+        vars: {
+            issueNumber: options.issue.number,
+            issueTitle: options.issue.title,
+            issueUrl: issueUrl(options.profile, options.issue),
+            issueSummary: options.issue.summary || "",
+            issueDescription: options.issue.description || "",
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runStakeVote(options) {
+    return runPromptTask({
+        ...options,
+        role: "stakeVote",
+        label: options.issue?.number ?? "stake",
+        vars: {
+            issueNumber: options.issue?.number ?? "",
+            issueTitle: options.issue?.title ?? "",
+            issueUrl: options.issue ? issueUrl(options.profile, options.issue) : "",
+            issueSummary: options.issue?.summary || "",
+            issueDescription: options.issue?.description || "",
+            stakes: JSON.stringify(options.stakes, null, 2),
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runSenseCheck(options) {
+    return runPromptTask({
+        ...options,
+        role: "senseCheck",
+        label: options.issue.number,
+        vars: {
+            issueNumber: options.issue.number,
+            issueTitle: options.issue.title,
+            issueUrl: issueUrl(options.profile, options.issue),
+            issueSummary: options.issue.summary || "",
+            issueDescription: options.issue.description || "",
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runClose(options) {
+    return runPromptTask({
+        ...options,
+        role: "close",
+        label: options.issue.number,
+        vars: {
+            actingAs: options.actingAs,
+            issueNumber: options.issue.number,
+            issueTitle: options.issue.title,
+            issueUrl: issueUrl(options.profile, options.issue),
+            issueSummary: options.issue.summary || "",
+            issueDescription: options.issue.description || "",
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runResearch(options) {
+    return runPromptTask({
+        ...options,
+        role: "research",
+        label: "job",
+        vars: {
+            job: JSON.stringify(options.job, null, 2),
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
+    });
+}
+export async function runJobReview(options) {
+    return runPromptTask({
+        ...options,
+        role: "jobReview",
+        label: "job",
+        vars: {
+            job: JSON.stringify(options.job, null, 2),
+            submission: JSON.stringify(options.submission, null, 2),
+            memory: options.memoryText,
+            loopContext: options.loopContext
+        }
     });
 }
 //# sourceMappingURL=agent.js.map

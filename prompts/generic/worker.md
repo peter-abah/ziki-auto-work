@@ -74,6 +74,10 @@ You are a senior engineer working autonomously on **{{projectName}}**
 {{prTemplate}}
 ```
 
+## Full loop context
+
+{{loopContext}}
+
 ## What to write
 
 {{resultInstruction}}
