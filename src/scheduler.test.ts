@@ -117,3 +117,15 @@ test("TaskPool records which agent runs a task", async () => {
   gate.release();
   await pool.drain(1000);
 });
+
+test("TaskPool notifies when tasks start and finish", async () => {
+  const pool = new TaskPool({ delivery: 1, followup: 1, review: 1, aux: 1, discovery: 1, owner: 1, agents: 1 });
+  let changes = 0;
+  pool.onChange = () => { changes += 1; };
+  const gate = gated();
+  pool.reserve("key", "delivery", gate.run);
+  assert.equal(changes, 1);
+  gate.release();
+  await pool.drain(1000);
+  assert.equal(changes, 2);
+});

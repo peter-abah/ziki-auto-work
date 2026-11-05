@@ -185,8 +185,35 @@ export async function stopService(profileName: string): Promise<{ stopped: boole
     }
   }
   await clearPid(jp);
+  await markStatusStopped(jp).catch(() => {});
   await unlink(jp.stopFile).catch(() => {});
   return { stopped: true, pid };
+}
+
+async function markStatusStopped(jp: ReturnType<typeof profilePaths>): Promise<void> {
+  if (!existsSync(jp.statusFile)) return;
+  let status: Record<string, unknown>;
+  try {
+    status = JSON.parse(await readFile(jp.statusFile, "utf8")) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  status.running = false;
+  status.stopped = true;
+  status.phase = "stopped";
+  status.activity = null;
+  status.updatedAt = new Date().toISOString();
+  status.inFlight = {
+    total: 0,
+    deliveries: 0,
+    followUps: 0,
+    reviews: 0,
+    aux: 0,
+    discovery: 0,
+    owner: 0,
+    tasks: []
+  };
+  await writeFile(jp.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
 }
 
 export async function statusService(profileName: string): Promise<{
