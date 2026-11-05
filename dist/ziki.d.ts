@@ -36,6 +36,8 @@ export declare class ZikiClient {
         idempotencyKey?: string;
         raw?: boolean;
         retries?: number;
+        timeoutMs?: number;
+        maxRetryAfterMs?: number;
     }): Promise<T>;
     get<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     post<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
@@ -170,7 +172,11 @@ export declare class ZikiClient {
         description: string;
     }): Promise<any>;
     acceptOffer(offerId: string): Promise<any>;
-    heartbeat(idOrNumber: string | number): Promise<any>;
+    heartbeat(idOrNumber: string | number, options?: {
+        timeoutMs?: number;
+        retries?: number;
+        maxRetryAfterMs?: number;
+    }): Promise<any>;
     extend(idOrNumber: string | number, reason: string): Promise<any>;
     release(idOrNumber: string | number): Promise<any>;
     reclaim(idOrNumber: string | number): Promise<any>;

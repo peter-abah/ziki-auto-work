@@ -606,6 +606,8 @@ export interface TaskState {
     headSha?: string;
     deliveredAt?: string;
     lastHeartbeatAt?: string;
+    lastHeartbeatAttemptAt?: string;
+    nextHeartbeatAt?: string;
     lastError?: string | null;
     prNumber?: number;
     prState?: string;

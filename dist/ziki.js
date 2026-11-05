@@ -18,15 +18,15 @@ export class ZikiError extends Error {
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
-function retryAfterMs(response, attempt) {
+function retryAfterMs(response, attempt, maxMs = Infinity) {
     const retry = response.headers.get("retry-after");
     if (retry) {
         const seconds = Number(retry);
         if (Number.isFinite(seconds))
-            return Math.max(0, seconds * 1000);
+            return Math.min(maxMs, Math.max(0, seconds * 1000));
         const date = Date.parse(retry);
         if (Number.isFinite(date))
-            return Math.max(0, date - Date.now());
+            return Math.min(maxMs, Math.max(0, date - Date.now()));
     }
     const reset = response.headers.get("ratelimit-reset");
     if (reset) {
@@ -34,10 +34,10 @@ function retryAfterMs(response, attempt) {
         if (Number.isFinite(value)) {
             const ms = value > 1e12 ? value - Date.now() : value * 1000 - Date.now();
             if (ms > 0)
-                return ms;
+                return Math.min(maxMs, ms);
         }
     }
-    return Math.min(60_000, 1000 * 2 ** attempt);
+    return Math.min(maxMs, 60_000, 1000 * 2 ** attempt);
 }
 export class ZikiClient {
     baseUrl;
@@ -81,13 +81,13 @@ export class ZikiClient {
                         ...(options.headers ?? {})
                     },
                     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-                    signal: AbortSignal.timeout(this.timeoutMs)
+                    signal: AbortSignal.timeout(options.timeoutMs ?? this.timeoutMs)
                 });
                 if (response.status === 304 && options.raw) {
                     return { data: null, response };
                 }
                 if ((response.status === 429 || response.status >= 500) && attempt < retries) {
-                    await sleep(retryAfterMs(response, attempt));
+                    await sleep(retryAfterMs(response, attempt, options.maxRetryAfterMs ?? Infinity));
                     attempt += 1;
                     continue;
                 }
@@ -365,8 +365,11 @@ export class ZikiClient {
     acceptOffer(offerId) {
         return this.post(`/api/v1/offers/${offerId}/accept`, { query: { projectId: this.projectId } });
     }
-    heartbeat(idOrNumber) {
-        return this.post(`/api/v1/issues/${idOrNumber}/heartbeat`, { query: { projectId: this.projectId } });
+    heartbeat(idOrNumber, options = {}) {
+        return this.post(`/api/v1/issues/${idOrNumber}/heartbeat`, {
+            query: { projectId: this.projectId },
+            ...options
+        });
     }
     extend(idOrNumber, reason) {
         return this.post(`/api/v1/issues/${idOrNumber}/extend`, {
