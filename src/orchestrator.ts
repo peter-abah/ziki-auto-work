@@ -2489,7 +2489,11 @@ async function processStakeVote(ctx: Context, item: QueueEntry): Promise<boolean
     markRecent(ctx, item.key);
     return false;
   }
-  const chosen = result.voteForStakeId ?? result.stakeId ?? actionId(item, ["vote_stake"], /stakes\/([^/]+)\/votes/);
+  const chosen =
+    result.voteForStakeId ??
+    result.stakeId ??
+    item.actions.find((action) => action.name.startsWith("vote_for_"))?.path.match(/stakes\/([^/]+)\/votes/)?.[1] ??
+    actionId(item, ["vote_stake"], /stakes\/([^/]+)\/votes/);
   if (!result.ok || !chosen) {
     markRecent(ctx, item.key);
     return false;
