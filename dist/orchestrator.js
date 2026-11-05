@@ -2316,8 +2316,8 @@ async function processClose(ctx, item) {
         return false;
     }
     const manager = pickManager(ctx);
-    const actingAs = manager ? "manager" : "working";
-    const agent = manager ?? pickWorker(ctx);
+    const actingAs = manager && item.item.minimumRole === "manager" ? "manager" : "working";
+    const agent = (actingAs === "manager" ? manager : null) ?? pickWorker(ctx) ?? manager;
     if (!agent) {
         markRecent(ctx, item.key);
         return false;
@@ -2424,7 +2424,7 @@ async function processJobReviewOffer(ctx, item) {
     }
     const agent = agentForItem(ctx, item);
     await agent.client.acceptJobReview(offerId);
-    const jobId = item.actions.map((action) => action.path.match(/\/jobs\/([^/]+)/)?.[1]).find(Boolean) ??
+    const jobId = item.actions.map((action) => action.path.match(/\/jobs\/(?!reviews\/)([^/]+)/)?.[1]).find(Boolean) ??
         `${item.detail ?? ""}`.match(/\bjob[ _-]?([A-Za-z0-9_-]+)/i)?.[1] ??
         null;
     if (!jobId) {
