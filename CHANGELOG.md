@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Scheduling: auxiliary work now rotates by kind instead of letting a large
+  investigation queue starve comments, bids and awards. Discovery reserves an
+  agent slot when due, before auxiliary dispatch.
+- Reviews now preflight the PR and existing verdicts: merged/closed PRs,
+  failing or pending checks, conflicts and already-satisfied verdict counts
+  are skipped before a review agent starts.
+- Idempotent work handling: `open_issue`, `reclaim_issue`, idle reclaims and
+  late review verdicts treat Ziki's "already done / not applicable" responses
+  as no-ops instead of failures. `convertIdea` now sends a valid JSON body.
 - Renamed **jobs** to **profiles** everywhere (config v3: `profiles` and
   `activeProfile`). There is no automatic migration from v1/v2; run
   `auto-work init` to write a v3 config.
