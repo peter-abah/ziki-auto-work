@@ -69,6 +69,13 @@ export interface PatchValidation {
  * type changes are all rejected.
  */
 export declare function validateConfigPatch(profile: ProfileConfig, ops: ConfigPatchOp[] | null | undefined, repair?: RepairConfig): PatchValidation;
+/**
+ * Fresh-install skeleton: version 4 with no profiles and no behavioural
+ * defaults. Every behavioural value comes from config/init-templates.json
+ * via stampV4/migrate (init) or the in-memory fill (loadProfile) — never
+ * from literals here. `doctor.minFreeGb` is the only knob: a local disk
+ * safety floor, not Ziki behaviour.
+ */
 export declare function defaultConfig(): Config;
 export declare function deepMerge<T>(base: T, override: unknown): T;
 export declare function parseEnvFile(text: string): Record<string, string>;

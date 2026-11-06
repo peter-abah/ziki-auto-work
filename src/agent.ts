@@ -2,7 +2,7 @@ import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentResult, Idea, Issue, ProfileConfig, ProfilePaths, Role } from "./types.js";
-import { DEFAULT_TIMING, resolveModel, resolvePromptDir } from "./config.js";
+import { resolveModel, resolvePromptDir } from "./config.js";
 import { getProvider } from "./providers/index.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { spawnCommand } from "./platform/spawn.js";

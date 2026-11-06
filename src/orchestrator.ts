@@ -27,8 +27,6 @@ import type {
   HealthComponent
 } from "./types.js";
 import {
-  DEFAULT_PR_TRACKING,
-  DEFAULT_TIMING,
   loadProfile,
   resolveMergeMethod,
   resolveMergeMode,
@@ -114,8 +112,13 @@ import {
   applyConfigPatch,
   blockerCode,
   consumeLocalApprovals,
+  diagnoseMissingKeys,
   diagnoseProjectMismatch,
+  diagnoseUnknownEndpoint,
   diagnoseUnknownFilter,
+  diagnoseUnknownKind,
+  diagnoseUnknownVocabulary,
+  parseUnknownEndpoint,
   formatRepairEscalationBody,
   isProjectNotFoundBlocker,
   latestStrategyEscalation,
@@ -138,6 +141,7 @@ import {
   healthLabel,
   nextRetryDelay,
   reportBlocker,
+  retryMsFor,
   summarizeHealth
 } from "./health.js";
 import type { HealthReport } from "./health.js";
@@ -261,36 +265,61 @@ function decisionsPolicy(profile: ProfileConfig): {
  */
 async function detectUnknownVocabulary(ctx: Context): Promise<void> {
   const known = knownVocabulary(ctx.profile);
-  const unknown = new Set<string>();
-  const consider = (value: unknown): void => {
-    if (typeof value === "string" && value && !known.has(value)) unknown.add(value);
+  const unknownKinds = new Set<string>();
+  const unknownVocab = new Set<string>();
+  const considerKind = (value: unknown): void => {
+    if (typeof value === "string" && value && !known.has(value)) unknownKinds.add(value);
+  };
+  const considerValue = (value: unknown): void => {
+    if (typeof value === "string" && value && !known.has(value)) unknownVocab.add(value);
   };
   for (const issue of ctx.platform.issues ?? []) {
-    consider(issue.status);
-    consider(issue.substatus);
+    considerValue(issue.status);
+    considerValue(issue.substatus);
   }
   for (const idea of ctx.platform.ideas ?? []) {
-    consider(idea.status);
+    considerValue(idea.status);
   }
   for (const entry of ctx.queue?.all ?? []) {
-    if (entry.kind) consider(entry.kind);
+    if (entry.kind) considerKind(entry.kind);
   }
-  if (!unknown.size) {
+  if (!unknownKinds.size && !unknownVocab.size) {
+    await clearHealth(ctx, "platform", "unknown_kind");
     await clearHealth(ctx, "platform", "unknown_vocabulary");
     return;
   }
-  await applyHealth(ctx, {
-    component: "platform",
-    code: "unknown_vocabulary",
-    severity: "warning",
-    message: `Unknown Ziki vocabulary (not in statuses.known): ${[...unknown].sort().join(", ")}`,
-    retryMs: null
-  });
-  ctx.logger.warn(`Unknown Ziki vocabulary (working around it): ${[...unknown].sort().join(", ")}`);
+  if (unknownKinds.size) {
+    const values = [...unknownKinds].sort();
+    await applyHealth(ctx, {
+      component: "platform",
+      code: "unknown_kind",
+      severity: "warning",
+      message: `Unknown Ziki work kinds (not bucketed — parked in "other"): ${values.join(", ")}`,
+      details: { values },
+      retryMs: null
+    });
+  } else {
+    await clearHealth(ctx, "platform", "unknown_kind");
+  }
+  if (unknownVocab.size) {
+    const values = [...unknownVocab].sort();
+    await applyHealth(ctx, {
+      component: "platform",
+      code: "unknown_vocabulary",
+      severity: "warning",
+      message: `Unknown Ziki vocabulary (not in statuses.known): ${values.join(", ")}`,
+      details: { values },
+      retryMs: null
+    });
+  } else {
+    await clearHealth(ctx, "platform", "unknown_vocabulary");
+  }
+  const all = [...unknownKinds, ...unknownVocab].sort();
+  ctx.logger.warn(`Unknown Ziki vocabulary (working around it): ${all.join(", ")}`);
   history(ctx, {
     type: "health",
-    detail: `unknown Ziki vocabulary: ${[...unknown].sort().join(", ")}`,
-    data: { values: [...unknown].sort() }
+    detail: `unknown Ziki vocabulary: ${all.join(", ")}`,
+    data: { values: all }
   });
 }
 
@@ -1538,6 +1567,70 @@ async function diagnoseForCode(
     } catch (error) {
       summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
     }
+  } else if (shortCode === "missing_key" && code.startsWith("config:")) {
+    try {
+      const { loadInitTemplates } = await import("./config-templates.js");
+      const templates = await loadInitTemplates();
+      const diagnosis = diagnoseMissingKeys(ctx.profile, templates);
+      evidence.push(`template comparison: ${diagnosis.summary}`);
+      ops = diagnosis.ops;
+      summary = diagnosis.summary;
+    } catch (error) {
+      summary = `Missing-key diagnosis failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  } else if (code === "config:unknown_endpoint") {
+    try {
+      const parsed = parseUnknownEndpoint(blocker.message);
+      if (!parsed) {
+        summary = "Could not parse the unknown endpoint from the failure; a human must map the route.";
+      } else {
+        const { loadInitTemplates } = await import("./config-templates.js");
+        const templates = await loadInitTemplates();
+        const diagnosis = diagnoseUnknownEndpoint(parsed.group, parsed.name, ctx.profile, templates);
+        evidence.push(`template endpoint check: ${parsed.group}.${parsed.name}`);
+        ops = diagnosis.ops;
+        summary = diagnosis.summary;
+      }
+    } catch (error) {
+      summary = `Unknown-endpoint diagnosis failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  } else if (shortCode === "unknown_kind") {
+    const values = (blocker.details as Record<string, unknown> | undefined)?.values;
+    const kinds = Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+    if (!kinds.length) {
+      summary = "Unknown-kind warning carries no values; nothing to propose.";
+    } else {
+      const allOps: ConfigPatchOp[] = [];
+      for (const kind of kinds) {
+        allOps.push(...diagnoseUnknownKind(kind, ctx.profile).ops);
+      }
+      // One bucket-array op wins (append all kinds at once, not one op per kind).
+      const priorityOps = allOps.filter((op) => op.path.startsWith("queue.priorities."));
+      const auxKinds = kinds.filter((kind) => {
+        const aux = ctx.profile.queue?.buckets?.aux;
+        return !(Array.isArray(aux) && aux.includes(kind));
+      });
+      ops = priorityOps;
+      if (auxKinds.length) {
+        const aux = Array.isArray(ctx.profile.queue?.buckets?.aux) ? [...ctx.profile.queue.buckets.aux as string[]] : [];
+        ops.push({
+          path: "queue.buckets.aux",
+          value: [...aux, ...auxKinds],
+          reason: `new Ziki kinds (${auxKinds.join(", ")}) queue as auxiliary work until triaged`
+        });
+      }
+      summary = `Ziki reports ${kinds.length} unknown work kind(s): ${kinds.join(", ")}.`;
+    }
+  } else if (shortCode === "unknown_vocabulary") {
+    const values = (blocker.details as Record<string, unknown> | undefined)?.values;
+    const words = Array.isArray(values) ? values.filter((value): value is string => typeof value === "string") : [];
+    if (!words.length) {
+      summary = "Unknown-vocabulary warning carries no values; nothing to propose.";
+    } else {
+      const diagnosis = diagnoseUnknownVocabulary(words, ctx.profile);
+      ops = diagnosis.ops;
+      summary = diagnosis.summary;
+    }
   } else if (shortCode === "unknown_filter") {
     try {
       const diagnosis = await diagnoseUnknownFilter(ctx.primary.client, ctx.profile, ctx.logger);
@@ -1666,6 +1759,29 @@ async function runRepairDoctor(
   const repair = repairConfigFor(ctx.profile);
   const loopContext = await loopContextFor(ctx, {}).catch(() => "(loop context unavailable)");
   const hooks = agentHooks(ctx);
+  const shortCode = code.includes(":") ? code.split(":").slice(1).join(":") : code;
+  // The agent only sees the sections relevant to the failure — the full
+  // config never leaves the loop. New codes add their sections here.
+  const sliceForCode: Record<string, (profile: ProfileConfig) => Record<string, unknown>> = {
+    unknown_kind: (profile) => ({ queue: profile.queue }),
+    unknown_vocabulary: (profile) => ({ statuses: profile.statuses, queue: profile.queue }),
+    missing_key: (profile) => ({
+      ziki: profile.ziki,
+      transport: profile.transport,
+      operations: profile.operations,
+      timing: profile.timing,
+      loop: profile.loop,
+      outbox: profile.outbox,
+      queue: profile.queue,
+      statuses: profile.statuses
+    }),
+    unknown_endpoint: (profile) => ({
+      ziki: profile.ziki,
+      operations: profile.operations,
+      transport: profile.transport
+    })
+  };
+  const sliceFn = sliceForCode[shortCode] ?? sliceForCode[code];
   const result = await runConfigDoctor({
     profile: ctx.profile,
     profilePaths: ctx.profilePaths,
@@ -1674,12 +1790,14 @@ async function runRepairDoctor(
     failureMessage: blocker.message,
     attempts: blocker.attempts ?? 0,
     evidence: evidence.join("\n"),
-    configSlice: {
-      ziki: ctx.profile.ziki,
-      discovery: ctx.profile.discovery,
-      pollSeconds: ctx.profile.pollSeconds,
-      memoryRefreshMinutes: ctx.profile.memoryRefreshMinutes
-    },
+    configSlice: sliceFn
+      ? sliceFn(ctx.profile)
+      : {
+          ziki: ctx.profile.ziki,
+          discovery: ctx.profile.discovery,
+          pollSeconds: ctx.profile.pollSeconds,
+          memoryRefreshMinutes: ctx.profile.memoryRefreshMinutes
+        },
     mutablePaths: repair.mutablePaths,
     allowNewKeys: repair.allowNewKeys,
     previousAnswer: previous?.answer ?? null,
@@ -1779,7 +1897,7 @@ async function handleProviderLimit(ctx: Context, result: { providerLimit?: "quot
       code: "quota",
       severity: "blocked",
       message: "The provider account has no quota/credits left.",
-      retryMs: 5 * 60_000
+      retryMs: retryMsFor(ctx.profile, "provider:quota")
     });
     if (!ctx.providerLimitNotified) {
       ctx.providerLimitNotified = true;
@@ -1800,7 +1918,7 @@ async function handleProviderLimit(ctx: Context, result: { providerLimit?: "quot
       code: "rate_limit",
       severity: "degraded",
       message: "The provider rate limit was hit; waiting before retrying.",
-      retryMs: minutes * 60_000
+      retryMs: retryMsFor(ctx.profile, "provider:rate_limit")
     });
     ctx.rateLimitUntil = Date.now() + minutes * 60 * 1000;
     ctx.logger.warn(`Provider rate limit hit; backing off ${minutes} minutes (${ctx.rateLimitCount}/3)`);
@@ -5270,7 +5388,7 @@ async function preflightHealth(ctx: Context): Promise<void> {
         perAgent: Object.fromEntries(incomplete.map((entry) => [entry.agent, entry])),
         helpUrl: incomplete.find((entry) => entry.helpUrl)?.helpUrl ?? null
       },
-      retryMs: 5 * 60_000
+      retryMs: retryMsFor(ctx.profile, "agent:profile_incomplete")
     });
   } else {
     await clearHealth(ctx, "agent", "profile_incomplete");
@@ -5283,7 +5401,7 @@ async function preflightHealth(ctx: Context): Promise<void> {
       code: "project_workflow",
       severity: "warning",
       message: "Could not read the Ziki project workflow; claim limits are unknown.",
-      retryMs: 5 * 60_000
+      retryMs: retryMsFor(ctx.profile, "config:project_workflow")
     });
   }
 }

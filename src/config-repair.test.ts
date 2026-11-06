@@ -484,3 +484,83 @@ test("loadPrompt resolves the config-doctor template", async () => {
   const text = await loadPrompt(fixtureProfile(), "configDoctor");
   assert.match(text, /configPatch/);
 });
+
+test("new repair strategies cover config-driven failure codes", async () => {
+  const { DEFAULT_REPAIR_STRATEGIES } = await import("./config.js");
+  for (const code of [
+    "config:missing_key",
+    "config:unknown_endpoint",
+    "*:unknown_kind",
+    "*:unknown_vocabulary"
+  ]) {
+    assert.ok(DEFAULT_REPAIR_STRATEGIES[code]?.enabled, code);
+  }
+});
+
+test("diagnoseMissingKeys proposes exactly the template gap", async () => {
+  const { diagnoseMissingKeys } = await import("./config-repair.js");
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = await loadInitTemplates();
+  const { DEFAULT_REPAIR_MUTABLE_PATHS } = await import("./config.js");
+  const profile = fixtureProfile();
+  delete (profile as unknown as Record<string, unknown>).transport;
+  (profile as unknown as Record<string, { mutablePaths: string[] }>).repair = {
+    ...(profile.repair as object),
+    mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS]
+  } as never;
+  const diagnosis = diagnoseMissingKeys(profile, templates);
+  const paths = diagnosis.ops.map((op) => op.path);
+  assert.ok(paths.includes("transport"), paths.join(","));
+  assert.ok(diagnosis.summary.includes("templated value"));
+  const complete = diagnoseMissingKeys(
+    (await import("./config-templates.js")).fillProfileFromTemplates(profile, templates).profile,
+    templates
+  );
+  assert.deepEqual(complete.ops, []);
+});
+
+test("diagnoseUnknownKind proposes an aux bucket slot after max priority", async () => {
+  const { diagnoseUnknownKind } = await import("./config-repair.js");
+  const profile = {
+    ...fixtureProfile(),
+    queue: {
+      priorities: { ready_issue: 6, idea: 17 },
+      buckets: { owner: [], work: ["ready_issue"], review: [], aux: ["idea"] }
+    }
+  } as unknown as ProfileConfig;
+  const diagnosis = diagnoseUnknownKind("frobnicatetime", profile);
+  const byPath = Object.fromEntries(diagnosis.ops.map((op) => [op.path, op.value]));
+  assert.equal(byPath["queue.priorities.frobnicatetime"], 18);
+  assert.deepEqual((byPath["queue.buckets.aux"] as string[]).slice(-1), ["frobnicatetime"]);
+});
+
+test("diagnoseUnknownVocabulary only appends to statuses.known", async () => {
+  const { diagnoseUnknownVocabulary } = await import("./config-repair.js");
+  const profile = {
+    ...fixtureProfile(),
+    statuses: { workable: ["open"], terminal: ["done"], known: ["open", "done"] }
+  } as unknown as ProfileConfig;
+  const diagnosis = diagnoseUnknownVocabulary(["on_prod", "open"], profile);
+  assert.equal(diagnosis.ops.length, 1);
+  assert.equal(diagnosis.ops[0]!.path, "statuses.known");
+  assert.deepEqual(diagnosis.ops[0]!.value, ["open", "done", "on_prod"]);
+  assert.deepEqual(diagnoseUnknownVocabulary(["open"], profile).ops, []);
+});
+
+test("diagnoseUnknownEndpoint backfills from templates, never invents", async () => {
+  const { diagnoseUnknownEndpoint, parseUnknownEndpoint } = await import("./config-repair.js");
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = await loadInitTemplates();
+  const profile = fixtureProfile() as unknown as Record<string, unknown>;
+  assert.deepEqual(parseUnknownEndpoint("unknown endpoint: issues.bid (not in ziki.endpoints)"), {
+    group: "issues",
+    name: "bid"
+  });
+  assert.deepEqual(parseUnknownEndpoint("unknown operation: jobs.get"), { group: "jobs", name: "get" });
+  assert.equal(parseUnknownEndpoint("something else"), null);
+  const known = diagnoseUnknownEndpoint("issues", "bid", profile as never, templates);
+  assert.ok(known.ops.some((op) => op.path === "ziki.endpoints.issues.bid"));
+  const novel = diagnoseUnknownEndpoint("issues", "teleport", profile as never, templates);
+  assert.deepEqual(novel.ops, []);
+  assert.match(novel.summary, /manually/);
+});

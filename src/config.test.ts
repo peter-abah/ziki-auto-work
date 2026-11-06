@@ -69,9 +69,9 @@ test("deepMerge merges objects and replaces arrays", () => {
   assert.deepEqual(merged, { a: { b: 1, c: 3 }, list: [9] });
 });
 
-test("defaultConfig is version 3 with profiles", () => {
+test("defaultConfig is a version 4 skeleton", () => {
   const config = defaultConfig();
-  assert.equal(config.version, 3);
+  assert.equal(config.version, 4);
   assert.equal(config.activeProfile, "");
   assert.deepEqual(config.profiles, {});
 });
@@ -345,8 +345,7 @@ test("deepMerge keeps limit defaults when a profile overrides one field", () => 
   assert.equal(merged.limits.maxRuntimeMinutes, null);
 });
 
-test("workflow defaults are present and validated", () => {
-  assert.deepEqual(defaultConfig().defaults?.workflow, DEFAULT_WORKFLOW);
+test("workflow values are validated", () => {
   const profile = fixtureProfile({ workflow: { ...DEFAULT_WORKFLOW, maxFiles: 0 } });
   const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
   assert.equal(result.ok, false);
@@ -425,13 +424,12 @@ test("validateConfig rejects malformed repair strategies", () => {
   assert.ok(result.errors.length >= 3, result.errors.join("; "));
 });
 
-test("defaultConfig ships a usable endpoint registry", () => {
+test("defaultConfig is a literal-free v4 skeleton", () => {
   const config = defaultConfig();
-  assert.ok(config.defaults);
-  const endpoints = (config.defaults as unknown as { ziki: { endpoints: Record<string, Record<string, string>> } }).ziki.endpoints;
-  assert.equal(endpoints.issues?.list, "/api/v1/issues");
-  assert.equal(endpoints.work?.feed, "/{org?}/{project}/work");
-  assert.ok(Object.keys(DEFAULT_ENDPOINTS).length > 5);
+  assert.equal(config.version, 4);
+  assert.deepEqual(config.defaults, {});
+  assert.deepEqual(config.profiles, {});
+  assert.equal(config.doctor?.minFreeGb, 3);
 });
 
 test("validateConfig rejects absolute endpoint URLs", () => {

@@ -87,8 +87,6 @@ const NESTED_FILL_SECTIONS = new Set([
   "loop",
   "pr",
   "transport",
-  "timing",
-  "health",
   "repair",
   "hitl",
   "executor"
@@ -117,9 +115,10 @@ function deepFillMissing(
  * Returns the filled profile plus the list of dot-paths that were filled
  * (for migration notes and --explain provenance). Never overwrites explicit
  * values. Sections present in templates: limits, workflow, prTracking,
- * timing, statuses, repair, transport, operations, queue, reviewGate,
+ * timing, statuses, health, repair, transport, operations, queue, reviewGate,
  * heartbeatPolicy, decisions, noop, votes, idea, apiRepair, capacity, urls,
- * discover, github, safety, checksDefaults, outbox, bootstrap, offline, loop, envFiles.
+ * discover, github, safety, checksDefaults, outbox, bootstrap, offline, loop,
+ * pr, repo, discovery, pollSeconds, memoryRefreshMinutes, hitl, executor, envFiles.
  */
 export function fillProfileFromTemplates(
   profile: ProfileConfig,
@@ -133,6 +132,7 @@ export function fillProfileFromTemplates(
     prTracking: "prTracking",
     timing: "timing",
     statuses: "statuses",
+    health: "health",
     repair: "repair",
     transport: "transport",
     operations: "operations",
@@ -235,7 +235,7 @@ export function explainProfile(
 ): ExplainEntry[] {
   const entries: ExplainEntry[] = [];
   const sections = [
-    "limits", "workflow", "prTracking", "timing", "statuses", "repair",
+    "limits", "workflow", "prTracking", "timing", "statuses", "health", "repair",
     "transport", "operations", "queue", "reviewGate", "heartbeatPolicy",
     "decisions", "noop", "votes", "idea", "apiRepair", "capacity", "urls",
     "discover", "github", "safety", "checksDefaults", "outbox", "bootstrap", "loop", "offline", "pr",

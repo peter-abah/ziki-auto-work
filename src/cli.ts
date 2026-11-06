@@ -4,8 +4,6 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { CheckSpec, Config, ProfileConfig, ProviderName, RunLimitConfig } from "./types.js";
 import {
-  DEFAULT_LIMITS,
-  DEFAULT_WORKFLOW,
   PROVIDERS,
   deepMerge,
   defaultConfig,

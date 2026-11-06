@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { Config } from "./types.js";
+import type { Config, ProfileConfig } from "./types.js";
 import {
   explainProfile,
   fillProfileFromTemplates,
@@ -8,7 +8,14 @@ import {
   migrateV3toV4,
   templateVersion
 } from "./config-templates.js";
-import { validateConfig, validateV4Sections } from "./config.js";
+import {
+  DEFAULT_REPAIR_ALLOW_NEW_KEYS,
+  DEFAULT_REPAIR_MUTABLE_PATHS,
+  DEFAULT_REPAIR_STRATEGIES,
+  validateConfig,
+  validateConfigPatch,
+  validateV4Sections
+} from "./config.js";
 import { DEFAULT_ENDPOINTS, validateEndpoints } from "./ziki-endpoints.js";
 
 function v3Profile(): Record<string, unknown> {
@@ -154,6 +161,47 @@ test("v4 validation requires every config-driven section", async () => {
   const { transport: _dropped, ...rest } = next.profiles.demo as unknown as Record<string, unknown>;
   void _dropped;
   assert.ok(validateV4Required(rest as never, "profiles.demo").some((error) => error.includes("transport")));
+});
+
+test("template repair registry matches the built-in defaults (drift guard)", async () => {
+  const templates = await loadInitTemplates();
+  const repair = templates.repair as {
+    mutablePaths: string[];
+    allowNewKeys: string[];
+    strategies: Record<string, { enabled: boolean; role: string; maxRounds: number }>;
+  };
+  assert.deepEqual(repair.mutablePaths, [...DEFAULT_REPAIR_MUTABLE_PATHS]);
+  assert.deepEqual(repair.allowNewKeys, [...DEFAULT_REPAIR_ALLOW_NEW_KEYS]);
+  assert.deepEqual(repair.strategies, JSON.parse(JSON.stringify(DEFAULT_REPAIR_STRATEGIES)));
+});
+
+test("repair patch accepts new queue priorities but rejects new endpoints", async () => {
+  const templates = await loadInitTemplates();
+  const config = {
+    version: 3 as const,
+    activeProfile: "demo",
+    defaults: {},
+    profiles: { demo: v3Profile() }
+  } as unknown as Config;
+  const { config: next } = migrateV3toV4(config, templates);
+  const profile = next.profiles.demo as ProfileConfig;
+  const repair = { enabled: true as const, mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS], allowNewKeys: [...DEFAULT_REPAIR_ALLOW_NEW_KEYS], strategies: {} };
+  assert.equal(
+    validateConfigPatch(profile, [{ path: "queue.priorities.brand_new_kind", value: 40 }], repair).ok,
+    true
+  );
+  assert.equal(
+    validateConfigPatch(profile, [{ path: "queue.priorities.brand_new_kind", value: "high" }], repair).ok,
+    false
+  );
+  assert.equal(
+    validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.newRoute", value: "/api/v1/x" }], repair).ok,
+    false
+  );
+  assert.equal(
+    validateConfigPatch(profile, [{ path: "statuses.terminal", value: ["done"] }], repair).ok,
+    false
+  );
 });
 
 test("migrated v3 config validates clean", async () => {

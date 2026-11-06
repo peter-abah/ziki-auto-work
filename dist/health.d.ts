@@ -13,6 +13,17 @@ export interface HealthUpdate {
     changed: boolean;
     created: boolean;
 }
+/**
+ * Backoff for a blocker id from profile.health.retryMs. Lookup order:
+ * exact id ("provider:quota") → wildcard code ("*:quota") → catch-all ("*").
+ * Absent map or unmapped id fails loud — unknown backoff must surface as a
+ * config gap, never a silent built-in. `null` means retry next cycle.
+ */
+export declare function retryMsFor(profile: {
+    health?: {
+        retryMs?: Record<string, number | null>;
+    } | undefined;
+} | null | undefined, blockerId: string): number | null;
 export declare function emptyHealth(): LoopHealth;
 export declare function summarizeHealth(health: LoopHealth): HealthSummary;
 export declare function blockerId(component: HealthComponent, code: string): string;

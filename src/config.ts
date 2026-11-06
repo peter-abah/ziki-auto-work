@@ -103,20 +103,69 @@ export const DEFAULT_REPAIR_MUTABLE_PATHS = [
   "ziki.platformFilter",
   "ziki.vars.*",
   "ziki.endpoints.*",
+  "operations.*",
+  "transport.*",
+  "queue.*",
+  "reviewGate.*",
+  "heartbeatPolicy.*",
+  "decisions.*",
+  "noop.patterns",
+  "votes.*",
+  "idea.*",
+  "apiRepair.*",
+  "capacity.*",
+  "urls.*",
+  "discover.*",
+  "github.*",
+  "safety.*",
+  "checksDefaults.*",
+  "outbox.*",
+  "loop.*",
+  "offline.*",
+  "discovery.*",
   // Observation cadences only: safe for agents to tune (bounded below).
   // Action-affecting timing (heartbeats, timeouts, review windows) stays
   // human-only: wrong values here lose claims or burn budget silently.
+  // Exception: heartbeatMs is NEVER agent-mutable (claim pacing).
   "timing.markRecentMs",
   "timing.offlineWatchMs",
   "timing.offlineFreshMs",
   "timing.repoHealthMs",
+  "timing.agentDefaultMs",
+  "timing.triageMs",
+  "timing.ownerMs",
+  "timing.discoveryMs",
+  "timing.repairMs",
+  "timing.doctorMs",
+  "timing.heartbeatDefaultMs",
+  "timing.reviewTransientMs",
+  "timing.reviewTerminalMs",
+  "timing.rateLimitChunkMs",
+  "limits.*",
+  "workflow.*",
+  "prTracking.*",
+  "discovery.*",
+  "pollSeconds",
+  "memoryRefreshMinutes",
   "pollSeconds",
   "memoryRefreshMinutes",
   "discovery.enabled",
-  "discovery.maxIdeasPerRun"
+  "discovery.maxIdeasPerRun",
+  // statuses.* is deliberately absent: redefining what counts as done can
+  // silently skip paid work. Only statuses.known (drift vocabulary) is
+  // agent-proposable, via deterministic diagnosis, never redefinition.
+  "statuses.known",
+  "health.retryMs.*"
 ];
 
-export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = ["ziki.platformFilter", "ziki.orgSlug"];
+export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = [
+  "ziki.platformFilter",
+  "ziki.orgSlug",
+  // New Ziki work kinds arrive as new priority keys; values must be numbers
+  // (enforced in validateConfigPatch). Endpoint names stay closed: unknown
+  // API routes are never invented, only remapped.
+  "queue.priorities.*"
+];
 
 export const DEFAULT_ZIKI_STATUSES = {
   workable: ["requires_confirmation", "open", "in_progress"],
@@ -160,7 +209,11 @@ export const DEFAULT_TIMING = {
 export const DEFAULT_REPAIR_STRATEGIES: Record<string, RepairStrategyConfig> = {
   "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
   "feed:unexpected_response_shape": { enabled: true, role: "configDoctor", maxRounds: 3 },
-  "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 }
+  "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 },
+  "config:missing_key": { enabled: true, role: "configDoctor", maxRounds: 2 },
+  "config:unknown_endpoint": { enabled: true, role: "configDoctor", maxRounds: 2 },
+  "*:unknown_kind": { enabled: true, role: "configDoctor", maxRounds: 2 },
+  "*:unknown_vocabulary": { enabled: true, role: "configDoctor", maxRounds: 2 }
 };
 
 const NEVER_MUTABLE_PATTERNS = [
@@ -186,6 +239,17 @@ function pathMatchesAllowlist(path: string, allowlist: readonly string[]): boole
     if (entry.endsWith(".*")) return path === entry.slice(0, -2) || path.startsWith(`${entry.slice(0, -2)}.`);
     return path === entry;
   });
+}
+
+/**
+ * allowNewKeys supports trailing-wildcard entries (`queue.priorities.*`):
+ * exact match wins, otherwise a `prefix.*` entry covers `prefix.<anything>`.
+ */
+function allowNewKey(opPath: string, allowNewKeys: readonly string[]): boolean {
+  if (allowNewKeys.includes(opPath)) return true;
+  return allowNewKeys.some(
+    (entry) => entry.endsWith(".*") && opPath.startsWith(`${entry.slice(0, -2)}.`)
+  );
 }
 
 /** Read a dot-path (`ziki.projectId`) from a profile object. */
@@ -269,9 +333,17 @@ export function validateConfigPatch(
     // against them need no new-key permission either.
     const timingKey = opPath === "timing" ? "" : opPath.startsWith("timing.") ? opPath.slice("timing.".length) : null;
     const isKnownTiming = timingKey !== null && (timingKey === "" || timingKey in TIMING_MIN_MS || timingKey === "heartbeatMs");
-    if (existing === undefined && !allowNewKeys.includes(opPath) && !isNewVarsKey && !isKnownEndpoint && !isKnownTiming) {
+    if (existing === undefined && !allowNewKey(opPath, allowNewKeys) && !isNewVarsKey && !isKnownEndpoint && !isKnownTiming) {
       errors.push(`${label} creates a new key not in repair.allowNewKeys: ${opPath}`);
       continue;
+    }
+    // New queue priorities must be numbers: a string priority would silently
+    // mis-sort the new kind instead of failing loud.
+    if (existing === undefined && opPath.startsWith("queue.priorities.")) {
+      if (typeof op.value !== "number" || !Number.isFinite(op.value)) {
+        errors.push(`${label} queue priority values must be numbers: ${opPath}`);
+        continue;
+      }
     }
     if (existing !== undefined && existing !== null && op.value !== undefined && op.value !== null) {
       const expected = Array.isArray(existing) ? "array" : typeof existing;
@@ -333,45 +405,18 @@ function nestEndpointPath(opPath: string, value: unknown): unknown {
   return root;
 }
 
+/**
+ * Fresh-install skeleton: version 4 with no profiles and no behavioural
+ * defaults. Every behavioural value comes from config/init-templates.json
+ * via stampV4/migrate (init) or the in-memory fill (loadProfile) — never
+ * from literals here. `doctor.minFreeGb` is the only knob: a local disk
+ * safety floor, not Ziki behaviour.
+ */
 export function defaultConfig(): Config {
   return {
-    version: 3,
+    version: 4,
     activeProfile: "",
-    defaults: {
-      executor: {
-        provider: "opencode",
-        model: null,
-        timeoutMs: 2_700_000,
-        permissionMode: "auto"
-      },
-      limits: { ...DEFAULT_LIMITS },
-      workflow: { ...DEFAULT_WORKFLOW },
-      pollSeconds: 120,
-      memoryRefreshMinutes: 30,
-      hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null },
-      platformMatch: {},
-      discovery: { enabled: false, maxIdeasPerRun: 3 },
-      checks: [],
-      prompts: { dir: "prompts/generic" },
-      pr: { templateFile: "prompts/generic/pr.md" },
-      prTracking: { ...DEFAULT_PR_TRACKING },
-      ziki: {
-        endpoints: JSON.parse(JSON.stringify(templateEndpoints())) as Record<string, Record<string, string>>,
-        vars: {},
-        statuses: JSON.parse(JSON.stringify(DEFAULT_ZIKI_STATUSES))
-      } as unknown as ZikiConfig,
-      timing: { ...DEFAULT_TIMING },
-      health: {},
-      repair: {
-        enabled: true,
-        mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS],
-        allowNewKeys: [...DEFAULT_REPAIR_ALLOW_NEW_KEYS],
-        strategies: JSON.parse(JSON.stringify(DEFAULT_REPAIR_STRATEGIES)) as Record<
-          string,
-          RepairStrategyConfig
-        >
-      }
-    },
+    defaults: {},
     profiles: {},
     doctor: { minFreeGb: 3 }
   };

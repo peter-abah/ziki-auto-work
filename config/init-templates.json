@@ -2,8 +2,16 @@
   "defaultBaseUrl": "https://ziki.dev",
   "pollSeconds": 120,
   "memoryRefreshMinutes": 30,
-  "hitl": { "enabled": true, "defaultType": "question", "notify": "auto", "notifyCommand": null },
-  "executor": { "timeoutMs": 2700000, "permissionMode": "auto" },
+  "hitl": {
+    "enabled": true,
+    "defaultType": "question",
+    "notify": "auto",
+    "notifyCommand": null
+  },
+  "executor": {
+    "timeoutMs": 2700000,
+    "permissionMode": "auto"
+  },
   "endpoints": {
     "work": {
       "feed": "/{org?}/{project}/work"
@@ -174,8 +182,6 @@
     "repoHealthMs": 21600000,
     "heartbeatMs": null,
     "heartbeatDefaultMs": 600000,
-    "reviewTransientMs": 300000,
-    "reviewTerminalMs": 1800000,
     "rateLimitChunkMs": 300000
   },
   "statuses": {
@@ -253,18 +259,57 @@
       "ziki.platformFilter",
       "ziki.vars.*",
       "ziki.endpoints.*",
+      "operations.*",
+      "transport.*",
+      "queue.*",
+      "reviewGate.*",
+      "heartbeatPolicy.*",
+      "decisions.*",
+      "noop.patterns",
+      "votes.*",
+      "idea.*",
+      "apiRepair.*",
+      "capacity.*",
+      "urls.*",
+      "discover.*",
+      "github.*",
+      "safety.*",
+      "checksDefaults.*",
+      "outbox.*",
+      "loop.*",
+      "offline.*",
+      "discovery.*",
       "timing.markRecentMs",
       "timing.offlineWatchMs",
       "timing.offlineFreshMs",
       "timing.repoHealthMs",
+      "timing.agentDefaultMs",
+      "timing.triageMs",
+      "timing.ownerMs",
+      "timing.discoveryMs",
+      "timing.repairMs",
+      "timing.doctorMs",
+      "timing.heartbeatDefaultMs",
+      "timing.reviewTransientMs",
+      "timing.reviewTerminalMs",
+      "timing.rateLimitChunkMs",
+      "limits.*",
+      "workflow.*",
+      "prTracking.*",
+      "discovery.*",
+      "pollSeconds",
+      "memoryRefreshMinutes",
       "pollSeconds",
       "memoryRefreshMinutes",
       "discovery.enabled",
-      "discovery.maxIdeasPerRun"
+      "discovery.maxIdeasPerRun",
+      "statuses.known",
+      "health.retryMs.*"
     ],
     "allowNewKeys": [
       "ziki.platformFilter",
-      "ziki.orgSlug"
+      "ziki.orgSlug",
+      "queue.priorities.*"
     ],
     "strategies": {
       "platform:not_found": {
@@ -278,6 +323,26 @@
         "maxRounds": 3
       },
       "*:unknown_filter": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 2
+      },
+      "config:missing_key": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 2
+      },
+      "config:unknown_endpoint": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 2
+      },
+      "*:unknown_kind": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 2
+      },
+      "*:unknown_vocabulary": {
         "enabled": true,
         "role": "configDoctor",
         "maxRounds": 2
@@ -1223,7 +1288,7 @@
   },
   "idea": {
     "summaryMin": 20,
-    "suffix": " — desktop parity gap.",
+    "suffix": " \u2014 desktop parity gap.",
     "summaryMax": 300,
     "titleMax": 200,
     "descriptionMax": 5000,
@@ -1253,9 +1318,23 @@
     "inboxPath": "/inbox"
   },
   "discover": {
-    "existingStatuses": ["open", "in_progress", "done", "merge", "resolved", "closed"],
-    "recentMergedStatuses": ["resolved", "closed"],
-    "recentMergedSubstatuses": ["on_dev", "on_staging", "on_prod"],
+    "existingStatuses": [
+      "open",
+      "in_progress",
+      "done",
+      "merge",
+      "resolved",
+      "closed"
+    ],
+    "recentMergedStatuses": [
+      "resolved",
+      "closed"
+    ],
+    "recentMergedSubstatuses": [
+      "on_dev",
+      "on_staging",
+      "on_prod"
+    ],
     "contextIssueLimit": 300,
     "contextMergedLimit": 60,
     "contextTaskLimit": 40,
@@ -1330,28 +1409,144 @@
   },
   "checkPresets": {
     "flutter": [
-      { "name": "deps", "command": "flutter", "args": ["pub", "get"], "timeoutMs": 600000 },
-      { "name": "format", "command": "dart", "args": ["format", "--output=none", "--set-exit-if-changed"], "filesOnly": true, "include": [".dart"] },
-      { "name": "analyze", "command": "flutter", "args": ["analyze", "--fatal-infos", "--fatal-warnings"] },
-      { "name": "test", "command": "flutter", "args": ["test", "--reporter", "json"], "reporter": "json", "timeoutMs": 1800000 }
+      {
+        "name": "deps",
+        "command": "flutter",
+        "args": [
+          "pub",
+          "get"
+        ],
+        "timeoutMs": 600000
+      },
+      {
+        "name": "format",
+        "command": "dart",
+        "args": [
+          "format",
+          "--output=none",
+          "--set-exit-if-changed"
+        ],
+        "filesOnly": true,
+        "include": [
+          ".dart"
+        ]
+      },
+      {
+        "name": "analyze",
+        "command": "flutter",
+        "args": [
+          "analyze",
+          "--fatal-infos",
+          "--fatal-warnings"
+        ]
+      },
+      {
+        "name": "test",
+        "command": "flutter",
+        "args": [
+          "test",
+          "--reporter",
+          "json"
+        ],
+        "reporter": "json",
+        "timeoutMs": 1800000
+      }
     ],
     "node": [
-      { "name": "deps", "command": "npm", "args": ["ci"], "timeoutMs": 600000 },
-      { "name": "lint", "command": "npm", "args": ["run", "lint"], "required": false },
-      { "name": "test", "command": "npm", "args": ["test"], "timeoutMs": 1800000 }
+      {
+        "name": "deps",
+        "command": "npm",
+        "args": [
+          "ci"
+        ],
+        "timeoutMs": 600000
+      },
+      {
+        "name": "lint",
+        "command": "npm",
+        "args": [
+          "run",
+          "lint"
+        ],
+        "required": false
+      },
+      {
+        "name": "test",
+        "command": "npm",
+        "args": [
+          "test"
+        ],
+        "timeoutMs": 1800000
+      }
     ],
     "python": [
-      { "name": "deps", "command": "python", "args": ["-m", "pip", "install", "-e", "."], "timeoutMs": 600000 },
-      { "name": "lint", "command": "ruff", "args": ["check", "."], "required": false },
-      { "name": "test", "command": "pytest", "args": ["-q"], "timeoutMs": 1800000 }
+      {
+        "name": "deps",
+        "command": "python",
+        "args": [
+          "-m",
+          "pip",
+          "install",
+          "-e",
+          "."
+        ],
+        "timeoutMs": 600000
+      },
+      {
+        "name": "lint",
+        "command": "ruff",
+        "args": [
+          "check",
+          "."
+        ],
+        "required": false
+      },
+      {
+        "name": "test",
+        "command": "pytest",
+        "args": [
+          "-q"
+        ],
+        "timeoutMs": 1800000
+      }
     ],
     "go": [
-      { "name": "build", "command": "go", "args": ["build", "./..."], "timeoutMs": 900000 },
-      { "name": "test", "command": "go", "args": ["test", "./..."], "timeoutMs": 1800000 }
+      {
+        "name": "build",
+        "command": "go",
+        "args": [
+          "build",
+          "./..."
+        ],
+        "timeoutMs": 900000
+      },
+      {
+        "name": "test",
+        "command": "go",
+        "args": [
+          "test",
+          "./..."
+        ],
+        "timeoutMs": 1800000
+      }
     ],
     "rust": [
-      { "name": "build", "command": "cargo", "args": ["build"], "timeoutMs": 1800000 },
-      { "name": "test", "command": "cargo", "args": ["test"], "timeoutMs": 1800000 }
+      {
+        "name": "build",
+        "command": "cargo",
+        "args": [
+          "build"
+        ],
+        "timeoutMs": 1800000
+      },
+      {
+        "name": "test",
+        "command": "cargo",
+        "args": [
+          "test"
+        ],
+        "timeoutMs": 1800000
+      }
     ]
   },
   "pr": {
@@ -1433,7 +1628,27 @@
     "maxPrs": 5,
     "checkTimeoutMs": 600000,
     "mutatingPattern": "format",
-    "excludedStatuses": ["done", "failed", "skipped"]
+    "excludedStatuses": [
+      "done",
+      "failed",
+      "skipped"
+    ]
+  },
+  "health": {
+    "retryMs": {
+      "*:auth": 300000,
+      "*:permission": 300000,
+      "*:rate_limit": 900000,
+      "*:network": 60000,
+      "*:not_found": 300000,
+      "*:unknown_filter": 300000,
+      "agent:profile_incomplete": 300000,
+      "config:missing_key": 300000,
+      "config:unknown_endpoint": 300000,
+      "config:project_workflow": 300000,
+      "provider:quota": 300000,
+      "*": 300000
+    }
   },
   "bootstrap": {
     "stateFile": "BOOTSTRAP.json",
