@@ -9,6 +9,8 @@ export interface ReviewGateInput {
     status: ReviewGateStatus | null;
     goodVerdicts?: number;
     verdictsNeeded?: number | null;
+    transientMs?: number;
+    terminalMs?: number;
 }
 export interface ReviewGateResult {
     ok: boolean;

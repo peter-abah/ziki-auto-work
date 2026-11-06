@@ -32,7 +32,19 @@ export function blockerId(component, code) {
 function bodyRecord(error) {
     return error.body && typeof error.body === "object" ? error.body : {};
 }
-export function classifyError(error, component) {
+export function classifyError(error, component, profile) {
+    const report = classifyErrorInner(error, component);
+    const overrides = profile?.health?.retryMs;
+    if (overrides) {
+        const key = overrides[report.code] !== undefined ? report.code : `*:${report.code}`;
+        const override = overrides[key];
+        if (typeof override === "number" && override >= 0) {
+            report.retryMs = override;
+        }
+    }
+    return report;
+}
+function classifyErrorInner(error, component) {
     if (error instanceof ZikiError) {
         const body = bodyRecord(error);
         const code = String(body.error ?? "");

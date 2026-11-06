@@ -10,6 +10,8 @@ export interface ReviewGateInput {
   status: ReviewGateStatus | null;
   goodVerdicts?: number;
   verdictsNeeded?: number | null;
+  transientMs?: number;
+  terminalMs?: number;
 }
 
 export interface ReviewGateResult {
@@ -51,32 +53,34 @@ export function countGoodVerdicts(verdicts: ReadonlyArray<VerdictLike>): number 
 
 export function reviewGate(input: ReviewGateInput): ReviewGateResult {
   const { status, goodVerdicts = 0, verdictsNeeded: needed = null } = input;
+  const transientMs = input.transientMs ?? TRANSIENT_RECENT_MS;
+  const terminalMs = input.terminalMs ?? TERMINAL_RECENT_MS;
   if (!status) {
-    return { ok: false, reason: "PR status unavailable", recentMs: TRANSIENT_RECENT_MS };
+    return { ok: false, reason: "PR status unavailable", recentMs: transientMs };
   }
   if (status.merged) {
-    return { ok: false, reason: "PR is already merged", recentMs: TERMINAL_RECENT_MS };
+    return { ok: false, reason: "PR is already merged", recentMs: terminalMs };
   }
   if (status.state !== "OPEN") {
-    return { ok: false, reason: `PR is ${status.state.toLowerCase()}`, recentMs: TERMINAL_RECENT_MS };
+    return { ok: false, reason: `PR is ${status.state.toLowerCase()}`, recentMs: terminalMs };
   }
   if (status.isDraft) {
-    return { ok: false, reason: "PR is still a draft", recentMs: TRANSIENT_RECENT_MS };
+    return { ok: false, reason: "PR is still a draft", recentMs: transientMs };
   }
   if (status.checks === "failing") {
-    return { ok: false, reason: "PR checks are failing", recentMs: TRANSIENT_RECENT_MS };
+    return { ok: false, reason: "PR checks are failing", recentMs: transientMs };
   }
   if (status.checks === "pending") {
-    return { ok: false, reason: "PR checks are still pending", recentMs: TRANSIENT_RECENT_MS };
+    return { ok: false, reason: "PR checks are still pending", recentMs: transientMs };
   }
   if (status.mergeable === false) {
-    return { ok: false, reason: "PR has merge conflicts", recentMs: TRANSIENT_RECENT_MS };
+    return { ok: false, reason: "PR has merge conflicts", recentMs: transientMs };
   }
   if (needed !== null && goodVerdicts >= needed) {
     return {
       ok: false,
       reason: `issue already has ${goodVerdicts} good-to-merge verdict(s); ${needed} needed`,
-      recentMs: TERMINAL_RECENT_MS
+      recentMs: terminalMs
     };
   }
   return { ok: true };

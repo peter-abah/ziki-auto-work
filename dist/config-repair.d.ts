@@ -42,6 +42,11 @@ export interface ProjectDiagnosis {
     ops: ConfigPatchOp[];
     /** Human-readable diagnosis summary. */
     detail: string;
+    /**
+     * The project's workUrl when it did not parse as /{org}/{project}/work.
+     * Signals a URL-shape change: never guess from it, ask the owner instead.
+     */
+    unparsedWorkUrl: string | null;
 }
 /**
  * Live diagnosis: list the tenant's projects, match a replacement, read it

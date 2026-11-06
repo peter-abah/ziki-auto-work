@@ -4,6 +4,7 @@ import type { ApiRepairContext } from "./ziki.js";
 export declare function killActiveAgents(): void;
 export declare function activeAgentPids(): number[];
 export declare function render(template: string, vars: Record<string, unknown>): string;
+export declare function agentTimeoutMs(profile: ProfileConfig, role: Role): number;
 export declare function loadPrompt(profile: ProfileConfig, role: Role | "pr"): Promise<string>;
 export declare function extractJsonResult(text: string): AgentResult | null;
 export declare function runAgent(options: {

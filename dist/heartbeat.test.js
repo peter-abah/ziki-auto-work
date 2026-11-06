@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { HEARTBEAT_INTERVAL_MS, applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue } from "./heartbeat.js";
+import { HEARTBEAT_INTERVAL_MS, applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue, resolveHeartbeatIntervalMs } from "./heartbeat.js";
 function task(overrides = {}) {
     return {
         id: "issue_1",
@@ -53,5 +53,16 @@ test("rate-limit and server failures back off", () => {
     const server = task();
     assert.equal(applyHeartbeatFailure(server, Object.assign(new Error("boom"), { status: 500 }), now).retryMs, 5 * 60_000);
     assert.ok(server.nextHeartbeatAt);
+});
+test("resolveHeartbeatIntervalMs prefers explicit config, then live workflow, then default", () => {
+    // explicit config wins even over a tighter live value
+    assert.equal(resolveHeartbeatIntervalMs({ timing: { heartbeatMs: 60_000 }, zikiWorkflow: { heartbeatMinutes: 1 } }), 60_000);
+    // live workflow capped at the default (never slower than default)
+    assert.equal(resolveHeartbeatIntervalMs({ timing: {}, zikiWorkflow: { heartbeatMinutes: 240 } }), 10 * 60_000);
+    // live workflow tighter than default wins
+    assert.equal(resolveHeartbeatIntervalMs({ timing: {}, zikiWorkflow: { heartbeatMinutes: 1 } }), 60_000);
+    // missing/invalid values fall back to the default
+    assert.equal(resolveHeartbeatIntervalMs({ timing: {}, zikiWorkflow: {} }), 10 * 60_000);
+    assert.equal(resolveHeartbeatIntervalMs({ timing: { heartbeatDefaultMs: 30_000 }, zikiWorkflow: null }), 30_000);
 });
 //# sourceMappingURL=heartbeat.test.js.map

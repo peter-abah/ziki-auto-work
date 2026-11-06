@@ -61,7 +61,24 @@ function bodyRecord(error: ZikiError): Record<string, unknown> {
   return error.body && typeof error.body === "object" ? (error.body as Record<string, unknown>) : {};
 }
 
-export function classifyError(error: unknown, component: HealthComponent): HealthReport {
+export function classifyError(
+  error: unknown,
+  component: HealthComponent,
+  profile?: { health?: { retryMs?: Record<string, number | null> } | undefined } | null
+): HealthReport {
+  const report = classifyErrorInner(error, component);
+  const overrides = profile?.health?.retryMs;
+  if (overrides) {
+    const key = overrides[report.code] !== undefined ? report.code : `*:${report.code}`;
+    const override = overrides[key];
+    if (typeof override === "number" && override >= 0) {
+      report.retryMs = override;
+    }
+  }
+  return report;
+}
+
+function classifyErrorInner(error: unknown, component: HealthComponent): HealthReport {
   if (error instanceof ZikiError) {
     const body = bodyRecord(error);
     const code = String(body.error ?? "");

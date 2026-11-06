@@ -454,3 +454,33 @@ test("validateConfigPatch rejects unknown template vars and protected paths", ()
   const secret = validateConfigPatch(profile, [{ path: "ziki.apiKey", value: "x" }], repair);
   assert.equal(secret.ok, false);
 });
+
+test("validateConfig accepts timing, statuses and retry overrides", () => {
+  const profile = fixtureProfile({
+    timing: { offlineWatchMs: 120_000 },
+    health: { retryMs: { "platform:not_found": 60_000 } },
+    statuses: { workable: ["open"], terminal: ["closed"] }
+  });
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, true, result.errors.join("; "));
+});
+
+test("validateConfig rejects bad timing, statuses and retry overrides", () => {
+  const badTiming = fixtureProfile({ timing: { offlineWatchMs: 1 } as never });
+  assert.equal(validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: badTiming } }).ok, false);
+  const badStatus = fixtureProfile({ statuses: { workable: "open" } as never });
+  assert.equal(validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: badStatus } }).ok, false);
+  const badRetry = fixtureProfile({ health: { retryMs: { x: -5 } } });
+  assert.equal(validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: badRetry } }).ok, false);
+});
+
+test("validateConfigPatch enforces timing floors for agent proposals", () => {
+  const profile = fixtureProfile();
+  const repair = repairConfigFor(profile);
+  const tooFast = validateConfigPatch(profile, [{ path: "timing.offlineWatchMs", value: 1000 }], repair);
+  assert.equal(tooFast.ok, false);
+  const ok = validateConfigPatch(profile, [{ path: "timing.offlineWatchMs", value: 300_000 }], repair);
+  assert.equal(ok.ok, true, ok.errors.join("; "));
+  const forbidden = validateConfigPatch(profile, [{ path: "ziki.heartbeatMs", value: 1000 }], repair);
+  assert.equal(forbidden.ok, false);
+});

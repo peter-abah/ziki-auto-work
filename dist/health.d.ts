@@ -16,7 +16,11 @@ export interface HealthUpdate {
 export declare function emptyHealth(): LoopHealth;
 export declare function summarizeHealth(health: LoopHealth): HealthSummary;
 export declare function blockerId(component: HealthComponent, code: string): string;
-export declare function classifyError(error: unknown, component: HealthComponent): HealthReport;
+export declare function classifyError(error: unknown, component: HealthComponent, profile?: {
+    health?: {
+        retryMs?: Record<string, number | null>;
+    } | undefined;
+} | null): HealthReport;
 export declare function reportBlocker(health: LoopHealth, report: HealthReport, now?: number): HealthUpdate;
 export declare function clearBlocker(health: LoopHealth, component: HealthComponent, code?: string): HealthBlocker[];
 export declare function nextRetryDelay(health: LoopHealth, now?: number): number | null;

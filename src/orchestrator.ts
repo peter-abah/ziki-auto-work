@@ -28,6 +28,7 @@ import type {
 } from "./types.js";
 import {
   DEFAULT_PR_TRACKING,
+  DEFAULT_TIMING,
   loadProfile,
   resolveMergeMethod,
   resolveMergeMode,
@@ -128,7 +129,7 @@ import { mergeWorkItemFeeds } from "./feed.js";
 import type { AgentFeed } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import { deploymentEnvironment, workTargetKey } from "./work-key.js";
-import { applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue } from "./heartbeat.js";
+import { applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue, resolveHeartbeatIntervalMs } from "./heartbeat.js";
 import {
   blockerId,
   classifyError,
@@ -148,8 +149,84 @@ import type { LoopContextInput } from "./loop-context.js";
 import type { GitHubPrStatus, PrComment as PrReviewComment } from "./github.js";
 import type { OwnerDecision } from "./types.js";
 
-const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
-const TERMINAL = new Set(["resolved", "closed"]);
+function workableStatuses(profile: ProfileConfig): Set<string> {
+  const custom = profile.statuses?.workable;
+  return new Set(custom && custom.length ? custom : ["requires_confirmation", "open", "in_progress"]);
+}
+
+function terminalStatuses(profile: ProfileConfig): Set<string> {
+  const custom = profile.statuses?.terminal;
+  return new Set(custom && custom.length ? custom : ["resolved", "closed", "done", "merge", "accepted"]);
+}
+
+function terminalSubstatuses(profile: ProfileConfig): Set<string> {
+  const custom = profile.statuses?.terminalSubstatus;
+  return new Set(custom && custom.length ? custom : ["done", "merge"]);
+}
+
+function confirmationStatuses(profile: ProfileConfig): Set<string> {
+  const custom = profile.statuses?.confirmation;
+  return new Set(custom && custom.length ? custom : ["requires_confirmation"]);
+}
+
+function knownVocabulary(profile: ProfileConfig): Set<string> {
+  const custom = profile.statuses?.known;
+  if (custom && custom.length) return new Set(custom);
+  return new Set([
+    ...workableStatuses(profile),
+    ...terminalStatuses(profile),
+    ...terminalSubstatuses(profile),
+    "on_dev", "on_staging", "on_prod", "archived", "converted", "rejected",
+    // feed kinds the loop knows how to handle (see dispatch in processAux)
+    "ready_issue", "test_fix", "award_bid", "review_bid", "review_comment",
+    "reclaim_issue", "investigate_issue", "report_deployment", "report_pr_status",
+    "categorize", "sense_check", "active_claim", "offer", "review_offer",
+    "job_review_offer", "open_issue", "confirm_issue", "vote_importance",
+    "estimate_reward", "refresh_stake", "vote_stake", "merge_review",
+    "close_issue", "research_job", "review_idle", "join_request", "idea"
+  ]);
+}
+
+/**
+ * Surface any Ziki vocabulary we have never seen: statues, substatuses or
+ * feed kinds outside the known set. The loop keeps working on what it knows;
+ * unknown values are reported (NEEDS-HUMAN via a warning blocker) instead of
+ * being silently dropped or blindly acted on.
+ */
+async function detectUnknownVocabulary(ctx: Context): Promise<void> {
+  const known = knownVocabulary(ctx.profile);
+  const unknown = new Set<string>();
+  const consider = (value: unknown): void => {
+    if (typeof value === "string" && value && !known.has(value)) unknown.add(value);
+  };
+  for (const issue of ctx.platform.issues ?? []) {
+    consider(issue.status);
+    consider(issue.substatus);
+  }
+  for (const idea of ctx.platform.ideas ?? []) {
+    consider(idea.status);
+  }
+  for (const entry of ctx.queue?.all ?? []) {
+    if (entry.kind) consider(entry.kind);
+  }
+  if (!unknown.size) {
+    await clearHealth(ctx, "platform", "unknown_vocabulary");
+    return;
+  }
+  await applyHealth(ctx, {
+    component: "platform",
+    code: "unknown_vocabulary",
+    severity: "warning",
+    message: `Unknown Ziki vocabulary (not in statuses.known): ${[...unknown].sort().join(", ")}`,
+    retryMs: null
+  });
+  ctx.logger.warn(`Unknown Ziki vocabulary (working around it): ${[...unknown].sort().join(", ")}`);
+  history(ctx, {
+    type: "health",
+    detail: `unknown Ziki vocabulary: ${[...unknown].sort().join(", ")}`,
+    data: { values: [...unknown].sort() }
+  });
+}
 
 interface AgentClient {
   name: string;
@@ -416,7 +493,7 @@ async function processPrFollowUp(ctx: Context, task: TaskState): Promise<void> {
 
   const heartbeat = setInterval(() => {
     agent.client.heartbeat(issue.id).catch(() => {});
-  }, 10 * 60 * 1000);
+  }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, zikiWorkflow: ctx.zikiWorkflow }));
   let result;
   try {
     result = await runFollowUp({
@@ -728,8 +805,9 @@ function counter(ctx: Context) {
   return counterFor(ctx.state);
 }
 
-function markRecent(ctx: Context, key: string, ms = 30 * 60_000): void {
-  ctx.state.recentFeedKeys[key] = Date.now() - (30 * 60_000 - ms);
+function markRecent(ctx: Context, key: string, ms?: number): void {
+  const window = ms ?? ctx.profile.timing?.markRecentMs ?? 30 * 60_000;
+  ctx.state.recentFeedKeys[key] = Date.now() - (30 * 60_000 - window);
 }
 
 function history(ctx: Context, entry: Omit<HistoryEntry, "at">): void {
@@ -900,21 +978,21 @@ async function flushOutboxPass(ctx: Context): Promise<void> {
 }
 
 /** PR watch while the loop is blocked: GitHub reads only, local bookkeeping, no Ziki or Git writes. */
-const OFFLINE_WATCH_INTERVAL_MS = 15 * 60_000;
 const OFFLINE_WATCH_MAX_PRS = 5;
-const OFFLINE_WATCH_FRESH_MS = 30 * 60_000;
 
 async function offlineWatchPass(ctx: Context): Promise<void> {
   const now = Date.now();
+  const intervalMs = ctx.profile.timing?.offlineWatchMs ?? DEFAULT_TIMING.offlineWatchMs;
   const last = ctx.state.lastOfflineWatchAt ? new Date(ctx.state.lastOfflineWatchAt).getTime() : 0;
-  if (now - last < OFFLINE_WATCH_INTERVAL_MS) return;
+  if (now - last < intervalMs) return;
   ctx.state.lastOfflineWatchAt = new Date().toISOString();
+  const freshMs = ctx.profile.timing?.offlineFreshMs ?? DEFAULT_TIMING.offlineFreshMs;
   const candidates = Object.values(ctx.state.tasks)
     .filter((task) => task.prUrl && !["done", "failed", "skipped"].includes(task.status))
     .slice(0, OFFLINE_WATCH_MAX_PRS);
   for (const task of candidates) {
     try {
-      if (task.prLastCheckedAt && now - new Date(task.prLastCheckedAt).getTime() < OFFLINE_WATCH_FRESH_MS) continue;
+      if (task.prLastCheckedAt && now - new Date(task.prLastCheckedAt).getTime() < freshMs) continue;
       const status = await ctx.github.prStatus(task.prUrl!);
       const changed =
         task.prState !== status.state ||
@@ -949,13 +1027,12 @@ async function offlineWatchPass(ctx: Context): Promise<void> {
  * Failures surface as a *warning* health item (visible in NEEDS-HUMAN), never
  * a blocker.
  */
-const REPO_HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-
 async function repoHealthPass(ctx: Context): Promise<void> {
   if (!ctx.repoReady) return;
   const now = Date.now();
+  const intervalMs = ctx.profile.timing?.repoHealthMs ?? DEFAULT_TIMING.repoHealthMs;
   const last = ctx.state.lastRepoHealthAt ? new Date(ctx.state.lastRepoHealthAt).getTime() : 0;
-  if (now - last < REPO_HEALTH_INTERVAL_MS) return;
+  if (now - last < intervalMs) return;
   ctx.state.lastRepoHealthAt = new Date().toISOString();
   const repoDir = path.join(ctx.profilePaths.reposDir, "repo");
   const results: Array<{ name: string; ok?: boolean; skipped?: string }> = [];
@@ -997,7 +1074,7 @@ async function repoHealthPass(ctx: Context): Promise<void> {
       code: "checks_failing",
       severity: "warning",
       message: `Repo checks failing while blocked: ${failing.join(", ")}`,
-      retryMs: REPO_HEALTH_INTERVAL_MS
+      retryMs: ctx.profile.timing?.repoHealthMs ?? DEFAULT_TIMING.repoHealthMs
     });
   } else {
     await clearHealth(ctx, "repo");
@@ -1019,6 +1096,13 @@ async function parkBlocked(ctx: Context): Promise<{ blocked: true }> {
   } catch (error) {
     ctx.logger.warn(
       `Repo health check failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  try {
+    await detectUnknownVocabulary(ctx);
+  } catch (error) {
+    ctx.logger.warn(
+      `Vocabulary drift check failed: ${error instanceof Error ? error.message : String(error)}`
     );
   }
   await save(ctx).catch(() => {});
@@ -1517,7 +1601,7 @@ interface FeedFailure {
 async function recordFeedHealth(ctx: Context, failures: FeedFailure[]): Promise<void> {
   const groups = new Map<string, { report: HealthReport; agents: string[]; perAgent: Record<string, unknown> }>();
   for (const failure of failures) {
-    const report = classifyError(failure.error, "feed");
+    const report = classifyError(failure.error, "feed", ctx.profile);
     const key = blockerId(report.component, report.code);
     const group = groups.get(key);
     if (!group) {
@@ -2064,14 +2148,15 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
     return data;
   } catch (error) {
     ctx.logger.warn(`Platform set refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-    await applyHealth(ctx, classifyError(error, "platform"));
+    await applyHealth(ctx, classifyError(error, "platform", ctx.profile));
     return cached ?? { fetchedAt: null, issues: [], ideas: [] };
   }
 }
 
 async function heartbeatPass(ctx: Context): Promise<void> {
   const now = Date.now();
-  const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now));
+  const intervalMs = resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, zikiWorkflow: ctx.zikiWorkflow });
+  const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now, intervalMs));
   if (!live.length) return;
 
   const results = await Promise.allSettled(
@@ -2087,7 +2172,7 @@ async function heartbeatPass(ctx: Context): Promise<void> {
     const task = live[index]!;
     const result = results[index]!;
     if (result.status === "fulfilled") {
-      applyHeartbeatSuccess(task, now);
+      applyHeartbeatSuccess(task, now, intervalMs);
       ctx.logger.info(`Heartbeat #${task.number}`, { agent: result.value.agent.name });
       continue;
     }
@@ -2188,8 +2273,12 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
   if (!issue) return;
 
   const existingTask = ctx.state.tasks[taskKey(issue)] ?? null;
+  const terminal = terminalStatuses(ctx.profile);
+  const terminalSub = terminalSubstatuses(ctx.profile);
   const terminalStatus =
-    TERMINAL.has(issue.status) || ["done", "merge", "accepted"].includes(issue.status) || ["done", "merge"].includes(issue.substatus);
+    terminal.has(issue.status) ||
+    terminal.has(issue.substatus) ||
+    (typeof issue.substatus === "string" && terminalSub.has(issue.substatus));
 
   if (issue.pullRequestUrl) {
     if (issue.holder && issue.holder.status === "active" && !isOurAgent(ctx, issue.holder.agentName)) {
@@ -2240,7 +2329,8 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
     markRecent(ctx, item.key);
     return;
   }
-  if (!WORKABLE.has(issue.substatus) && !WORKABLE.has(issue.status)) {
+  const workable = workableStatuses(ctx.profile);
+  if (!workable.has(issue.substatus) && !workable.has(issue.status)) {
     markRecent(ctx, item.key);
     return;
   }
@@ -2279,7 +2369,7 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
 
   const heartbeat = setInterval(() => {
     worker.client.heartbeat(issue.id).catch(() => {});
-  }, 10 * 60 * 1000);
+  }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, zikiWorkflow: ctx.zikiWorkflow }));
 
   let result;
   try {
@@ -2558,7 +2648,7 @@ async function handleWorkFailure(
 }
 
 async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
-  if (issue.substatus === "requires_confirmation") {
+  if (issue.substatus && confirmationStatuses(ctx.profile).has(issue.substatus)) {
     const confirmer = pickManagerOrWorker(ctx);
     if (!confirmer) return false;
     const loopContext = await loopContextFor(ctx, { issue, includeGit: false });
@@ -2615,8 +2705,9 @@ async function ensureReady(ctx: Context, issue: Issue): Promise<boolean> {
     return false;
   }
 
-  if (issue.status === "open" || issue.substatus === "open") return true;
-  return issue.status === "in_progress" || issue.substatus === "in_progress";
+  if (issue.status && workableStatuses(ctx.profile).has(issue.status)) return true;
+  if (issue.substatus && workableStatuses(ctx.profile).has(issue.substatus)) return true;
+  return false;
 }
 
 async function ensureBidAndAward(
@@ -2753,7 +2844,9 @@ async function processTestFix(ctx: Context, item: QueueEntry, preferred?: AgentC
   const gate = reviewGate({
     status,
     goodVerdicts,
-    verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow)
+    verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow),
+    transientMs: ctx.profile.timing?.reviewTransientMs,
+    terminalMs: ctx.profile.timing?.reviewTerminalMs
   });
   if (!gate.ok || !status) {
     ctx.logger.info(`Skipping review of #${issue.number}: ${gate.reason}`);
@@ -3344,7 +3437,7 @@ async function processIdeaVerdict(ctx: Context, item: QueueEntry, preferred?: Ag
 async function processConfirm(ctx: Context, item: QueueEntry, preferred?: AgentClient): Promise<boolean> {
   const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
   const issue = normalizeIssue(data);
-  if (!issue || issue.substatus !== "requires_confirmation") {
+  if (!issue || !issue.substatus || !confirmationStatuses(ctx.profile).has(issue.substatus)) {
     markRecent(ctx, item.key);
     return false;
   }
@@ -4488,7 +4581,7 @@ async function runCycle(ctx: Context): Promise<{
     clientForName: (name) => clientByName(ctx, name)?.client ?? null
   });
   if (polled.errors.length) {
-    const report = classifyError(polled.errors[0], "inbox");
+    const report = classifyError(polled.errors[0], "inbox", ctx.profile);
     if (report.code !== "profile_incomplete") await applyHealth(ctx, report);
   } else {
     await clearHealth(ctx, "inbox");
@@ -4504,7 +4597,7 @@ async function runCycle(ctx: Context): Promise<{
       ctx.logger.info("Memory refreshed", { notes: ctx.memory.ownNotes.length });
       await clearHealth(ctx, "memory");
     } catch (error) {
-      await applyHealth(ctx, classifyError(error, "memory"));
+      await applyHealth(ctx, classifyError(error, "memory", ctx.profile));
     }
   }
 
@@ -4546,6 +4639,9 @@ async function runCycle(ctx: Context): Promise<{
     platformNumbers,
     platformIdeaNumbers,
     state: ctx.state
+  });
+  await detectUnknownVocabulary(ctx).catch((error) => {
+    ctx.logger.warn(`Vocabulary drift check failed: ${error instanceof Error ? error.message : String(error)}`);
   });
 
   if (ctx.dryRun) {
@@ -5028,7 +5124,7 @@ async function preflightHealth(ctx: Context): Promise<void> {
         });
       }
     } catch (error) {
-      await applyHealth(ctx, { ...classifyError(error, "agent"), agents: [agent.name] });
+      await applyHealth(ctx, { ...classifyError(error, "agent", ctx.profile), agents: [agent.name] });
     }
   }
   if (incomplete.length) {
@@ -5261,7 +5357,8 @@ export async function runLoop(options: {
       if (ctx.rateLimitUntil > Date.now()) {
         while (ctx.rateLimitUntil > Date.now() && !controller.signal.aborted) {
           await heartbeatPass(ctx);
-          const wait = Math.min(5 * 60_000, ctx.rateLimitUntil - Date.now());
+          const chunkMs = ctx.profile.timing?.rateLimitChunkMs ?? DEFAULT_TIMING.rateLimitChunkMs;
+          const wait = Math.min(chunkMs, ctx.rateLimitUntil - Date.now());
           await sleep(Math.max(1000, wait), controller.signal);
         }
         continue;

@@ -70,6 +70,58 @@ export interface ZikiConfig {
   projectName?: string;
 }
 
+/**
+ * Status vocabulary. Ziki renames things; these lists decide what the loop
+ * does with each value instead of hardcoding it. Anything observed that is
+ * not in `known` raises a visible `unknown_vocabulary` warning.
+ * Agent-readable, human-written: redefining finished states can silently
+ * skip paid work, so agents may not propose these paths.
+ */
+export interface ZikiStatusesConfig {
+  /** Issues/ideas the loop may work on. */
+  workable?: string[];
+  /** Done states (checked against status and substatus). */
+  terminal?: string[];
+  /** Done-like substatuses only. */
+  terminalSubstatus?: string[];
+  /** Substatuses that must pass confirmation before work starts. */
+  confirmation?: string[];
+  /** Full known vocabulary (statuses, substatuses, feed kinds) for drift detection. */
+  known?: string[];
+}
+
+/**
+ * Human-tunable backoff overrides (ms), keyed by blocker code
+ * (e.g. `"platform:not_found"`, `"*:unknown_kind"` also matches).
+ * `null` restores the built-in default for that code.
+ */
+export interface HealthTuningConfig {
+  retryMs?: Record<string, number | null>;
+}
+
+/**
+ * Timing policy (all ms). Every interval/timeout the loop uses lives here so
+ * pacing is tunable without a release. `heartbeatMs: null` (default) derives
+ * the interval from Ziki's live workflow, capped at `heartbeatDefaultMs`.
+ */
+export interface TimingConfig {
+  agentDefaultMs?: number;
+  triageMs?: number;
+  ownerMs?: number;
+  discoveryMs?: number;
+  repairMs?: number;
+  doctorMs?: number;
+  markRecentMs?: number;
+  offlineWatchMs?: number;
+  offlineFreshMs?: number;
+  repoHealthMs?: number;
+  heartbeatMs?: number | null;
+  heartbeatDefaultMs?: number;
+  reviewTransientMs?: number;
+  reviewTerminalMs?: number;
+  rateLimitChunkMs?: number;
+}
+
 /** One op in an agent-proposed config patch. Applied only after approval. */
 export interface ConfigPatchOp {
   /** Dot path into the merged profile, e.g. `ziki.projectId`. */
@@ -406,8 +458,13 @@ export interface ProfileConfig {
   pollSeconds: number;
   memoryRefreshMinutes: number;
   hitl: HitlConfig;
-  /** Agent-driven config repair (approval-gated). Absent = defaults apply. */
   repair?: RepairConfig;
+  /** Status vocabulary (see ZikiStatusesConfig). Merged from defaults; human-written. */
+  statuses?: ZikiStatusesConfig;
+  /** Backoff overrides per blocker code (see HealthTuningConfig). */
+  health?: HealthTuningConfig;
+  /** Timing policy for every interval/timeout (see TimingConfig). */
+  timing?: TimingConfig;
 }
 
 export interface DoctorConfig {

@@ -1,4 +1,22 @@
 export const HEARTBEAT_INTERVAL_MS = 10 * 60_000;
+/**
+ * Heartbeat cadence, derived from Ziki's own workflow when available.
+ * Explicit config always wins; otherwise take the tighter of the live
+ * workflow value and the built-in default (never slower than the default,
+ * so a generous server value can't silently stretch our claims).
+ */
+export function resolveHeartbeatIntervalMs(ctx) {
+    const fallback = typeof ctx.timing?.heartbeatDefaultMs === "number" && ctx.timing.heartbeatDefaultMs > 0
+        ? ctx.timing.heartbeatDefaultMs
+        : HEARTBEAT_INTERVAL_MS;
+    if (typeof ctx.timing?.heartbeatMs === "number" && ctx.timing.heartbeatMs > 0) {
+        return ctx.timing.heartbeatMs;
+    }
+    const live = Number(ctx.zikiWorkflow?.heartbeatMinutes);
+    if (Number.isFinite(live) && live > 0)
+        return Math.min(live * 60_000, fallback);
+    return fallback;
+}
 export function heartbeatDue(task, now = Date.now(), intervalMs = HEARTBEAT_INTERVAL_MS) {
     if (!task.claimId || !task.id || !task.agentName)
         return false;

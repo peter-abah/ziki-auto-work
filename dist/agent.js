@@ -1,7 +1,7 @@
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import { resolveModel, resolvePromptDir } from "./config.js";
+import { DEFAULT_TIMING, resolveModel, resolvePromptDir } from "./config.js";
 import { getProvider } from "./providers/index.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { spawnCommand } from "./platform/spawn.js";
@@ -27,6 +27,27 @@ export function render(template, vars) {
         const value = vars[key];
         return value === undefined || value === null ? "" : String(value);
     });
+}
+/**
+ * Timeout for an agent spawn, fully config-driven (see `timing` in config).
+ * Falls back to built-in defaults so ad-hoc profiles keep working.
+ */
+const ROLE_TIMEOUT_KEY = {
+    apiRepair: "repairMs",
+    configDoctor: "doctorMs",
+    triage: "triageMs",
+    owner: "ownerMs",
+    discovery: "discoveryMs"
+};
+export function agentTimeoutMs(profile, role) {
+    const key = ROLE_TIMEOUT_KEY[role];
+    const specific = key ? profile.timing?.[key] : undefined;
+    if (typeof specific === "number" && specific > 0)
+        return specific;
+    const fallback = profile.timing?.agentDefaultMs;
+    if (typeof fallback === "number" && fallback > 0)
+        return fallback;
+    return DEFAULT_TIMING[key ?? "agentDefaultMs"] ?? 45 * 60_000;
 }
 const PROMPT_FILES = {
     stakeVote: "stake-vote",
@@ -339,7 +360,7 @@ export async function runApiRepair(options) {
         resultPath,
         logPath,
         logger: options.logger,
-        timeoutMs: 5 * 60_000,
+        timeoutMs: agentTimeoutMs(profile, "apiRepair"),
         onSpawn: options.onSpawn,
         onExit: options.onExit
     });
@@ -376,7 +397,7 @@ export async function runConfigDoctor(options) {
         resultPath,
         logPath,
         logger: options.logger,
-        timeoutMs: options.timeoutMs ?? 5 * 60_000,
+        timeoutMs: options.timeoutMs ?? agentTimeoutMs(profile, "configDoctor"),
         onSpawn: options.onSpawn,
         onExit: options.onExit
     });
@@ -414,7 +435,7 @@ export async function runDiscovery(options) {
         resultPath,
         logPath,
         logger,
-        timeoutMs: 45 * 60 * 1000,
+        timeoutMs: agentTimeoutMs(profile, "discovery"),
         onSpawn: options.onSpawn,
         onExit: options.onExit
     });
@@ -558,7 +579,7 @@ export async function runTriage(options) {
         resultPath,
         logPath,
         logger,
-        timeoutMs: 20 * 60 * 1000,
+        timeoutMs: agentTimeoutMs(profile, "triage"),
         onSpawn: options.onSpawn,
         onExit: options.onExit
     });
@@ -590,7 +611,7 @@ export async function runOwner(options) {
         resultPath,
         logPath,
         logger,
-        timeoutMs: 30 * 60 * 1000,
+        timeoutMs: agentTimeoutMs(profile, "owner"),
         onSpawn: options.onSpawn,
         onExit: options.onExit
     });
@@ -624,7 +645,7 @@ export async function runPromptTask(options) {
         resultPath,
         logPath,
         logger,
-        timeoutMs: options.timeoutMs ?? 20 * 60 * 1000,
+        timeoutMs: options.timeoutMs ?? agentTimeoutMs(profile, role),
         onSpawn: options.onSpawn,
         onExit: options.onExit
     });

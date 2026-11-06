@@ -1,6 +1,30 @@
-import type { TaskState } from "./types.js";
+import type { TaskState, TimingConfig } from "./types.js";
 
 export const HEARTBEAT_INTERVAL_MS = 10 * 60_000;
+
+export interface HeartbeatTimingInput {
+  timing?: Pick<TimingConfig, "heartbeatMs" | "heartbeatDefaultMs"> | null | undefined;
+  zikiWorkflow?: Record<string, unknown> | null | undefined;
+}
+
+/**
+ * Heartbeat cadence, derived from Ziki's own workflow when available.
+ * Explicit config always wins; otherwise take the tighter of the live
+ * workflow value and the built-in default (never slower than the default,
+ * so a generous server value can't silently stretch our claims).
+ */
+export function resolveHeartbeatIntervalMs(ctx: HeartbeatTimingInput): number {
+  const fallback =
+    typeof ctx.timing?.heartbeatDefaultMs === "number" && ctx.timing.heartbeatDefaultMs > 0
+      ? ctx.timing.heartbeatDefaultMs
+      : HEARTBEAT_INTERVAL_MS;
+  if (typeof ctx.timing?.heartbeatMs === "number" && ctx.timing.heartbeatMs > 0) {
+    return ctx.timing.heartbeatMs;
+  }
+  const live = Number(ctx.zikiWorkflow?.heartbeatMinutes);
+  if (Number.isFinite(live) && live > 0) return Math.min(live * 60_000, fallback);
+  return fallback;
+}
 
 export interface HeartbeatFailure {
   claimLost: boolean;

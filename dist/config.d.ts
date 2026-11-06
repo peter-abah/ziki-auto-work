@@ -29,6 +29,30 @@ export declare const DEFAULT_ENV_FILES: string[];
  */
 export declare const DEFAULT_REPAIR_MUTABLE_PATHS: string[];
 export declare const DEFAULT_REPAIR_ALLOW_NEW_KEYS: string[];
+export declare const DEFAULT_ZIKI_STATUSES: {
+    workable: string[];
+    terminal: string[];
+    terminalSubstatus: string[];
+    confirmation: string[];
+    known: string[];
+};
+export declare const DEFAULT_TIMING: {
+    agentDefaultMs: number;
+    triageMs: number;
+    ownerMs: number;
+    discoveryMs: number;
+    repairMs: number;
+    doctorMs: number;
+    markRecentMs: number;
+    offlineWatchMs: number;
+    offlineFreshMs: number;
+    repoHealthMs: number;
+    heartbeatMs: number | null;
+    heartbeatDefaultMs: number;
+    reviewTransientMs: number;
+    reviewTerminalMs: number;
+    rateLimitChunkMs: number;
+};
 export declare const DEFAULT_REPAIR_STRATEGIES: Record<string, RepairStrategyConfig>;
 export declare function isNeverMutablePath(path: string): boolean;
 /** Read a dot-path (`ziki.projectId`) from a profile object. */
@@ -60,6 +84,9 @@ export interface ValidationResult {
 }
 export declare function inferPushMode(forkOwner: string, upstreamOwner: string, user?: string | null): PushMode;
 export declare function validateConfig(config: Config): ValidationResult;
+export declare function validateZikiStatuses(value: unknown, label: string): string[];
+export declare function validateTiming(value: unknown, label: string): string[];
+export declare function validateHealthRetry(value: unknown, label: string): string[];
 export declare function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig;
 export declare function resolveModel(profile: ProfileConfig, role: Role): string | null;
 export declare function resolveMergeMode(profile: ProfileConfig): "handoff" | "never" | "auto";

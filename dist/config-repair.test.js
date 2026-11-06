@@ -185,6 +185,19 @@ test("diagnoseProjectMismatch proposes only differing identity fields", async ()
     const quiet = await diagnoseProjectMismatch(client, aligned);
     assert.deepEqual(quiet.ops, []);
     assert.match(quiet.detail, /already matches/);
+    assert.equal(quiet.unparsedWorkUrl, null);
+});
+test("diagnoseProjectMismatch flags unparseable work URLs for human confirmation", async () => {
+    const { diagnoseProjectMismatch: diagnose } = await import("./config-repair.js");
+    const profile = fixtureProfile();
+    const client = {
+        listProjects: async () => ({ items: fixtureProjects() }),
+        readProject: async () => ({ id: "c17fc461d8ec6105f842b1c84", workUrl: "https://ziki.dev/something-else" })
+    };
+    const diagnosis = await diagnose(client, profile);
+    assert.equal(diagnosis.unparsedWorkUrl, "https://ziki.dev/something-else");
+    assert.match(diagnosis.detail, /human/);
+    assert.ok(diagnosis.ops.every((op) => op.path === "ziki.projectId" || op.path === "ziki.projectSlug"));
 });
 test("validateConfigPatch accepts an allowlisted change", () => {
     const profile = fixtureProfile();

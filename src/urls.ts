@@ -4,12 +4,19 @@ export function baseUrl(profile: ProfileConfig): string {
   return profile.ziki.baseUrl.replace(/\/+$/, "");
 }
 
+/** Project path segment: `org/project` when the org is known, else the legacy bare slug. */
+export function projectPath(profile: ProfileConfig): string {
+  const project = profile.ziki.projectSlug;
+  const org = profile.ziki.orgSlug?.trim();
+  return org ? `${org}/${project}` : project;
+}
+
 export function issueUrl(profile: ProfileConfig, issue: { number: number | string }): string {
-  return `${baseUrl(profile)}/${profile.ziki.projectSlug}/${issue.number}`;
+  return `${baseUrl(profile)}/${projectPath(profile)}/${issue.number}`;
 }
 
 export function ideaUrl(profile: ProfileConfig, idea: { number: number | string }): string {
-  return `${baseUrl(profile)}/${profile.ziki.projectSlug}/ideas/${idea.number}`;
+  return `${baseUrl(profile)}/${projectPath(profile)}/ideas/${idea.number}`;
 }
 
 export function inboxUrl(profile: ProfileConfig): string {

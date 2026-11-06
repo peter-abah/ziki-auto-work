@@ -142,6 +142,7 @@ export async function diagnoseProjectMismatch(client, profile, logger) {
             match: null,
             ambiguous: matched && "ambiguous" in matched ? matched.ambiguous : null,
             ops: [],
+            unparsedWorkUrl: null,
             detail: matched && "ambiguous" in matched
                 ? `multiple tenant projects match; need a human pick: ${matched.ambiguous.map((project) => project.slug).join(", ")}`
                 : `no tenant project matches platform "${profile.ziki.platform}" or repo "${profile.repo.githubRepo}"`
@@ -149,9 +150,13 @@ export async function diagnoseProjectMismatch(client, profile, logger) {
     }
     const project = matched.project;
     let work = null;
+    let rawWorkUrl = null;
     try {
         const full = await client.readProject(project.id);
-        work = parseWorkUrl(typeof full?.workUrl === "string" ? full.workUrl : null);
+        if (typeof full?.workUrl === "string" && full.workUrl) {
+            rawWorkUrl = full.workUrl;
+            work = parseWorkUrl(full.workUrl);
+        }
     }
     catch (error) {
         logger?.warn(`Project read failed for ${project.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -169,13 +174,24 @@ export async function diagnoseProjectMismatch(client, profile, logger) {
     if (work && work.project !== project.slug) {
         logger?.warn(`Project slug mismatch: list says "${project.slug}" but workUrl points at "${work.project}"`);
     }
+    // Unrecognized address shape: do NOT guess org/project from it. The match
+    // above still lets the agent propose identity fields it can see, but a
+    // human must confirm the addressing before anything applies.
+    const unparsedWorkUrl = !work && rawWorkUrl ? rawWorkUrl : null;
+    if (unparsedWorkUrl) {
+        logger?.warn(`Unrecognized project URL shape (needs human confirmation): ${unparsedWorkUrl}`);
+    }
     return {
         projects,
         match: { project, reason: matched.reason },
         ambiguous: null,
         ops,
+        unparsedWorkUrl,
         detail: ops.length
-            ? `Project ${profile.ziki.projectId} is gone on Ziki; matched replacement ${project.slug} (${matched.reason}).`
+            ? `Project ${profile.ziki.projectId} is gone on Ziki; matched replacement ${project.slug} (${matched.reason}).` +
+                (unparsedWorkUrl
+                    ? ` NOTE: the project's address format is unrecognized (${unparsedWorkUrl}) — confirm the project URL shape with a human before approving.`
+                    : "")
             : `Project identity already matches tenant project ${project.slug}; no rotation needed.`
     };
 }

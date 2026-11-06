@@ -68,12 +68,56 @@ export const DEFAULT_REPAIR_MUTABLE_PATHS = [
     "ziki.platformFilter",
     "ziki.vars.*",
     "ziki.endpoints.*",
+    // Observation cadences only: safe for agents to tune (bounded below).
+    // Action-affecting timing (heartbeats, timeouts, review windows) stays
+    // human-only: wrong values here lose claims or burn budget silently.
+    "timing.markRecentMs",
+    "timing.offlineWatchMs",
+    "timing.offlineFreshMs",
+    "timing.repoHealthMs",
     "pollSeconds",
     "memoryRefreshMinutes",
     "discovery.enabled",
     "discovery.maxIdeasPerRun"
 ];
 export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = ["ziki.platformFilter", "ziki.orgSlug"];
+export const DEFAULT_ZIKI_STATUSES = {
+    workable: ["requires_confirmation", "open", "in_progress"],
+    terminal: ["resolved", "closed", "done", "merge", "accepted"],
+    terminalSubstatus: ["done", "merge"],
+    confirmation: ["requires_confirmation"],
+    known: [
+        // statuses
+        "open", "requires_confirmation", "in_progress", "resolved", "closed",
+        "done", "merge", "accepted", "archived", "converted", "rejected",
+        // substatuses
+        "on_dev", "on_staging", "on_prod",
+        // feed kinds the loop knows how to handle
+        "ready_issue", "test_fix", "award_bid", "review_bid", "review_comment",
+        "reclaim_issue", "investigate_issue", "report_deployment", "report_pr_status",
+        "categorize", "sense_check", "active_claim", "offer", "review_offer",
+        "job_review_offer", "open_issue", "confirm_issue", "vote_importance",
+        "estimate_reward", "refresh_stake", "vote_stake", "merge_review",
+        "close_issue", "research_job", "review_idle", "join_request", "idea"
+    ]
+};
+export const DEFAULT_TIMING = {
+    agentDefaultMs: 45 * 60_000,
+    triageMs: 20 * 60_000,
+    ownerMs: 30 * 60_000,
+    discoveryMs: 45 * 60_000,
+    repairMs: 5 * 60_000,
+    doctorMs: 5 * 60_000,
+    markRecentMs: 30 * 60_000,
+    offlineWatchMs: 15 * 60_000,
+    offlineFreshMs: 30 * 60_000,
+    repoHealthMs: 6 * 60 * 60_000,
+    heartbeatMs: null,
+    heartbeatDefaultMs: 10 * 60_000,
+    reviewTransientMs: 5 * 60_000,
+    reviewTerminalMs: 30 * 60_000,
+    rateLimitChunkMs: 5 * 60_000
+};
 export const DEFAULT_REPAIR_STRATEGIES = {
     "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
     "feed:unexpected_response_shape": { enabled: true, role: "configDoctor", maxRounds: 3 },
@@ -170,7 +214,11 @@ export function validateConfigPatch(profile, ops, repair) {
             isKnownEndpoint = parts.length === 0 || (!!group && (parts.length === 1 || parts.slice(1).join(".") in group));
         }
         const isNewVarsKey = opPath.startsWith("ziki.vars.") && existing === undefined;
-        if (existing === undefined && !allowNewKeys.includes(opPath) && !isNewVarsKey && !isKnownEndpoint) {
+        // Known timing knobs always exist after defaults merge, so proposals
+        // against them need no new-key permission either.
+        const timingKey = opPath === "timing" ? "" : opPath.startsWith("timing.") ? opPath.slice("timing.".length) : null;
+        const isKnownTiming = timingKey !== null && (timingKey === "" || timingKey in TIMING_MIN_MS || timingKey === "heartbeatMs");
+        if (existing === undefined && !allowNewKeys.includes(opPath) && !isNewVarsKey && !isKnownEndpoint && !isKnownTiming) {
             errors.push(`${label} creates a new key not in repair.allowNewKeys: ${opPath}`);
             continue;
         }
@@ -188,6 +236,25 @@ export function validateConfigPatch(profile, ops, repair) {
         if (opPath === "ziki.endpoints" || opPath.startsWith("ziki.endpoints.")) {
             const single = opPath === "ziki.endpoints" ? op.value : nestEndpointPath(opPath, op.value);
             errors.push(...validateEndpoints(single, knownVars, label));
+            continue;
+        }
+        if (opPath === "timing" || opPath.startsWith("timing.")) {
+            const entries = opPath === "timing" && isPlainObject(op.value)
+                ? Object.entries(op.value)
+                : [[opPath.slice("timing.".length), op.value]];
+            for (const [key, value] of entries) {
+                if (key === "heartbeatMs" && value === null)
+                    continue;
+                const floor = TIMING_MIN_MS[key];
+                if (floor === undefined) {
+                    errors.push(`${label} targets unknown timing knob: ${key}`);
+                }
+                else {
+                    const problem = checkTimingValue(key, value, floor);
+                    if (problem)
+                        errors.push(`${label}.${problem}`);
+                }
+            }
             continue;
         }
         try {
@@ -236,8 +303,11 @@ export function defaultConfig() {
             prTracking: { ...DEFAULT_PR_TRACKING },
             ziki: {
                 endpoints: JSON.parse(JSON.stringify(DEFAULT_ENDPOINTS)),
-                vars: {}
+                vars: {},
+                statuses: JSON.parse(JSON.stringify(DEFAULT_ZIKI_STATUSES))
             },
+            timing: { ...DEFAULT_TIMING },
+            health: {},
             repair: {
                 enabled: true,
                 mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS],
@@ -389,6 +459,7 @@ export function validateConfig(config) {
         if (profile?.ziki?.orgSlug !== undefined && (typeof profile.ziki.orgSlug !== "string" || !profile.ziki.orgSlug.trim())) {
             errors.push(`${prefix}.ziki.orgSlug must be a non-empty string when set`);
         }
+        errors.push(...validateZikiStatuses(profile?.statuses, `${prefix}.statuses`));
         errors.push(...validateEndpointVars(profile?.ziki?.vars, `${prefix}.ziki.vars`), ...validateEndpoints(profile?.ziki?.endpoints, [
             ...BUILTIN_IDENTITY_VARS,
             "project",
@@ -550,9 +621,93 @@ export function validateConfig(config) {
         if (typeof profile?.pollSeconds !== "number" || profile.pollSeconds < 10) {
             errors.push(`${prefix}.pollSeconds must be at least 10`);
         }
+        errors.push(...validateTiming(profile?.timing, `${prefix}.timing`));
+        errors.push(...validateHealthRetry(profile?.health?.retryMs, `${prefix}.health.retryMs`));
         validateRepairConfig(prefix, profile?.repair, errors);
     }
     return { ok: errors.length === 0, errors, warnings };
+}
+function stringList(value) {
+    return Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.length > 0);
+}
+export function validateZikiStatuses(value, label) {
+    if (value === undefined)
+        return [];
+    const errors = [];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return [`${label} must be an object with workable/terminal lists`];
+    }
+    const record = value;
+    for (const key of ["workable", "terminal", "terminalSubstatus", "confirmation", "known"]) {
+        if (record[key] === undefined)
+            continue;
+        if (!stringList(record[key]))
+            errors.push(`${label}.${key} must be an array of non-empty strings`);
+    }
+    return errors;
+}
+const TIMING_MIN_MS = {
+    agentDefaultMs: 60_000,
+    triageMs: 60_000,
+    ownerMs: 60_000,
+    discoveryMs: 60_000,
+    repairMs: 30_000,
+    doctorMs: 30_000,
+    markRecentMs: 60_000,
+    offlineWatchMs: 60_000,
+    offlineFreshMs: 60_000,
+    repoHealthMs: 3_600_000,
+    heartbeatDefaultMs: 60_000,
+    reviewTransientMs: 60_000,
+    reviewTerminalMs: 60_000,
+    rateLimitChunkMs: 1000
+};
+export function validateTiming(value, label) {
+    if (value === undefined)
+        return [];
+    const errors = [];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return [`${label} must be an object of millisecond durations`];
+    }
+    const record = value;
+    if (record.heartbeatMs !== undefined && record.heartbeatMs !== null &&
+        (typeof record.heartbeatMs !== "number" || !Number.isFinite(record.heartbeatMs) || record.heartbeatMs <= 0)) {
+        errors.push(`${label}.heartbeatMs must be a positive number of ms, or null to derive from Ziki`);
+    }
+    for (const [key, min] of Object.entries(TIMING_MIN_MS)) {
+        const entry = record[key];
+        if (entry === undefined)
+            continue;
+        const problem = checkTimingValue(key, entry, min);
+        if (problem)
+            errors.push(`${label}.${problem}`);
+    }
+    for (const key of Object.keys(record)) {
+        if (!(key in TIMING_MIN_MS) && key !== "heartbeatMs") {
+            errors.push(`${label}.${key} is not a known timing knob`);
+        }
+    }
+    return errors;
+}
+function checkTimingValue(key, value, min) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min) {
+        return `${key} must be a number >= ${min}ms`;
+    }
+    return null;
+}
+export function validateHealthRetry(value, label) {
+    if (value === undefined)
+        return [];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return [`${label} must be an object of blocker code -> ms (or null for built-in)`];
+    }
+    const errors = [];
+    for (const [code, ms] of Object.entries(value)) {
+        if (ms !== null && (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0)) {
+            errors.push(`${label}[${JSON.stringify(code)}] must be a non-negative number of ms or null`);
+        }
+    }
+    return errors;
 }
 function validateRepairConfig(prefix, repair, errors) {
     if (repair === undefined)
