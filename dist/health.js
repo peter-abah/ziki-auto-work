@@ -111,6 +111,19 @@ function classifyErrorInner(error, component) {
         if (error.status >= 500) {
             return { component, code: "network", severity: "degraded", message, retryMs: undefined };
         }
+        if (code === "unexpected_response_shape") {
+            return {
+                component,
+                code,
+                severity: "warning",
+                message,
+                details: {
+                    expected: typeof body.expected === "string" ? body.expected : null,
+                    preview: typeof body.preview === "string" ? body.preview : String(body.preview ?? "").slice(0, 500)
+                },
+                retryMs: undefined
+            };
+        }
         if (error.status === 404) {
             return { component, code: "not_found", severity: "blocked", message, retryMs: undefined };
         }

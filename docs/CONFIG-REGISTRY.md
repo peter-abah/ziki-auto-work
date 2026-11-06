@@ -62,7 +62,17 @@
 | C9 | `prompts/generic/*.md` (19), `prompts/zedu-desktop/*.md` (18) | embedded status names, `/api/v1` paths, `project_zedu`, verdict language | Ziki renames → agent acts on stale instructions | prompt lint: raw literals banned, must use `{{var}}`; vars supplied from config in `loop-context.ts`/`agent.ts` |
 | C10 | `src/cli.ts:303-332,427-432` | check presets (flutter `pub get`/`analyze --fatal-infos`, npm `ci`, pip `install -e .`, `600s`), `commitTypes`, `branchPrefix fix`, `maxFiles 5/maxLines 400`, `pollSeconds 120`, `memoryRefresh 30`, `prTracking{on,10,10}`, `discovery{off,3}` | — (init-time only after P1; must move to `init-templates.json`) | `config/init-templates.json` (init reads, runtime never does) |
 
-## D. Health/timing/backoff (P3 ✅)
+## D. Health/timing/backoff (P3 ✅ + agent-bypass removal, `dev` unpushed)
+
+P3 follow-up (user directive: nothing deterministic may overrule the agent):
+`repairBlockedLoop` no longer parks on unrecognized 404 bodies and
+`diagnoseForCode` no longer returns early-`wait` on feed-shape-with-matching-
+identity — every non-hard failure reaches the config-doctor agent with full
+evidence. The config-doctor prompt authorizes unauthenticated read-only
+public GETs for investigation (never writes/credentials); the orchestrator
+live-verifies proposed endpoint ops (GET probe: only 404 + "no such API
+route" drops the op, everything else goes to the human's APPROVE gate).
+Hard stops unchanged: provider/model errors, missing keys.
 
 | # | Source | Literal | Config home |
 |---|---|---|---|
