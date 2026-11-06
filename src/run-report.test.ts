@@ -26,7 +26,7 @@ function profile(): ProfileConfig {
     checks: [],
     platformMatch: { keywords: ["desktop"] },
     prompts: { dir: "prompts/generic" },
-    pr: { templateFile: "prompts/generic/pr.md" },
+    pr: { templateFile: "prompts/generic/pr.md", maxBodyChars: 60000 },
     urls: {
       envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
       issuePath: "/{org?}/{project}/{issue}",

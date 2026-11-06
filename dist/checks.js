@@ -13,9 +13,9 @@ export function resolveCommand(profile, command) {
     }
     return command;
 }
-function tail(output) {
-    const lines = output.split("\n").filter(Boolean);
-    return lines.slice(-40).join("\n");
+function tail(output, lines) {
+    const parts = output.split("\n").filter(Boolean);
+    return parts.slice(-lines).join("\n");
 }
 function normalizeTestPath(url) {
     const raw = String(url ?? "").replace(/^file:\/\//, "");
@@ -57,8 +57,9 @@ function filesFor(spec, changedFiles) {
 }
 export async function runChecks(profile, worktree, options) {
     const results = [];
+    const defaults = requireChecksDefaults(profile);
     for (const spec of profile.checks) {
-        const required = spec.required !== false;
+        const required = spec.required ?? defaults.requiredDefault;
         const command = resolveCommand(profile, spec.command);
         const files = filesFor(spec, options.changedFiles);
         if (spec.filesOnly && !files.length) {
@@ -68,7 +69,7 @@ export async function runChecks(profile, worktree, options) {
         const args = [...spec.args, ...files];
         const result = await runCommand(command, args, {
             cwd: worktree,
-            timeoutMs: spec.timeoutMs ?? 20 * 60 * 1000,
+            timeoutMs: spec.timeoutMs ?? defaults.timeoutMs,
             env: buildCheckEnv(profile, spec.env)
         });
         let failures;
@@ -82,7 +83,7 @@ export async function runChecks(profile, worktree, options) {
             name: spec.name,
             ok,
             required,
-            output: tail(`${result.stdout}\n${result.stderr}`),
+            output: tail(`${result.stdout}\n${result.stderr}`, defaults.tailLines),
             ...(failures ? { failures } : {})
         });
         options.logger?.info(`Check ${spec.name}: ${ok ? "pass" : "fail"}`, {
@@ -93,19 +94,39 @@ export async function runChecks(profile, worktree, options) {
     const ok = results.every((result) => result.ok || !result.required);
     return { ok, results };
 }
-export const DEFAULT_PROTECTED = [
-    ".github/**",
-    "AGENTS.md",
-    "CONTRIBUTING.md",
-    ".env",
-    ".env.*",
-    "*.p12",
-    "*.pfx",
-    "*.pem",
-    "*.p8",
-    "*.jks",
-    "*.keystore"
-];
+function requireChecksDefaults(profile) {
+    const defaults = profile.checksDefaults;
+    if (!defaults || typeof defaults !== "object") {
+        throw new Error("profile.checksDefaults is required (run `auto-work migrate`)");
+    }
+    const { timeoutMs, tailLines, requiredDefault } = defaults;
+    if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new Error("profile.checksDefaults.timeoutMs must be a positive number (run `auto-work migrate`)");
+    }
+    if (typeof tailLines !== "number" || !Number.isInteger(tailLines) || tailLines <= 0) {
+        throw new Error("profile.checksDefaults.tailLines must be a positive integer (run `auto-work migrate`)");
+    }
+    if (typeof requiredDefault !== "boolean") {
+        throw new Error("profile.checksDefaults.requiredDefault must be a boolean (run `auto-work migrate`)");
+    }
+    return { timeoutMs, tailLines, requiredDefault };
+}
+function requireSafety(profile) {
+    const safety = profile.safety;
+    if (!safety || typeof safety !== "object") {
+        throw new Error("profile.safety is required (run `auto-work migrate`)");
+    }
+    const { protectedFiles, secretPatterns } = safety;
+    if (!Array.isArray(protectedFiles) ||
+        !protectedFiles.length ||
+        !protectedFiles.every((entry) => typeof entry === "string")) {
+        throw new Error("profile.safety.protectedFiles must be a non-empty string array (run `auto-work migrate`)");
+    }
+    if (!Array.isArray(secretPatterns) || !secretPatterns.every((entry) => typeof entry === "string")) {
+        throw new Error("profile.safety.secretPatterns must be an array of regex strings (run `auto-work migrate`)");
+    }
+    return { protectedFiles, secretPatterns };
+}
 function globToRegExp(pattern) {
     const escaped = pattern
         .replace(/[.+^${}()|[\]\\]/g, "\\$&")
@@ -115,7 +136,10 @@ function globToRegExp(pattern) {
         .replace(/\?/g, ".");
     return new RegExp(`^${escaped}$`);
 }
-export function protectedFiles(files, patterns = DEFAULT_PROTECTED) {
+export function protectedFiles(files, patterns) {
+    if (!Array.isArray(patterns)) {
+        throw new Error("protected file patterns are required (safety.protectedFiles, run `auto-work migrate`)");
+    }
     const regexes = patterns.map((pattern) => pattern.startsWith("re:") ? new RegExp(pattern.slice(3)) : globToRegExp(pattern));
     return files.filter((file) => {
         const normalized = file.replace(/\\/g, "/");
@@ -123,29 +147,24 @@ export function protectedFiles(files, patterns = DEFAULT_PROTECTED) {
         return regexes.some((regex) => regex.test(normalized) || regex.test(base));
     });
 }
-const SECRET_PATTERNS = [
-    /ZIKI_KEY[A-Z0-9_]*\s*=\s*\S+/i,
-    /\bghp_[A-Za-z0-9]{20,}\b/,
-    /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
-    /\bsk-[A-Za-z0-9]{20,}\b/,
-    /\bAKIA[0-9A-Z]{16}\b/,
-    /BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY/,
-    /\bpassword\s*[:=]\s*["'][^"']{4,}["']/i
-];
-export function scanSecretsText(text) {
+export function scanSecretsText(text, patterns) {
+    if (!Array.isArray(patterns)) {
+        throw new Error("secret patterns are required (safety.secretPatterns, run `auto-work migrate`)");
+    }
     const hits = [];
-    for (const pattern of SECRET_PATTERNS) {
+    for (const source of patterns) {
+        const pattern = new RegExp(source, "i");
         const match = text.match(pattern);
         if (match?.[0])
             hits.push(match[0].slice(0, 80));
     }
     return hits;
 }
-export function scanSecrets(diff) {
+export function scanSecrets(diff, patterns) {
     const added = diff
         .split("\n")
         .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
         .join("\n");
-    return scanSecretsText(added);
+    return scanSecretsText(added, patterns);
 }
 //# sourceMappingURL=checks.js.map

@@ -1,6 +1,17 @@
 import { randomUUID } from "node:crypto";
-const MAX_ATTEMPTS = 25;
-const DEFAULT_MAX_PER_FLUSH = 5;
+function requireOutboxPolicy(policy) {
+    if (!policy || typeof policy !== "object") {
+        throw new Error("outbox policy is required (run `auto-work migrate`)");
+    }
+    const { maxAttempts, maxPerFlush, fifo } = policy;
+    if (typeof maxAttempts !== "number" || !Number.isInteger(maxAttempts) || maxAttempts < 1) {
+        throw new Error("outbox.maxAttempts must be a positive integer (run `auto-work migrate`)");
+    }
+    if (typeof maxPerFlush !== "number" || !Number.isInteger(maxPerFlush) || maxPerFlush < 1) {
+        throw new Error("outbox.maxPerFlush must be a positive integer (run `auto-work migrate`)");
+    }
+    return { maxAttempts, maxPerFlush, fifo: fifo !== false };
+}
 function queue(state) {
     if (!state.outbox)
         state.outbox = { items: [], failed: [] };
@@ -55,17 +66,31 @@ async function dispatch(client, entry, knownIdeaTitles) {
  */
 export async function flushOutbox(state, client, options = {}) {
     const q = queue(state);
-    const max = options.maxPerFlush ?? DEFAULT_MAX_PER_FLUSH;
+    const resolved = requireOutboxPolicy(options.policy ??
+        (options.maxPerFlush !== undefined || options.maxAttempts !== undefined || options.fifo !== undefined
+            ? { maxAttempts: options.maxAttempts, maxPerFlush: options.maxPerFlush, fifo: options.fifo }
+            : undefined));
+    const max = options.maxPerFlush ?? resolved.maxPerFlush;
+    const maxAttempts = options.maxAttempts ?? resolved.maxAttempts;
+    const fifo = options.fifo ?? resolved.fifo;
+    const takeIndex = fifo ? 0 : -1;
+    const takeEntry = () => takeIndex === 0 ? q.items[0] : q.items[q.items.length - 1];
+    const dropEntry = () => {
+        if (takeIndex === 0)
+            q.items.shift();
+        else
+            q.items.pop();
+    };
     const known = options.knownIdeaTitles instanceof Set ? options.knownIdeaTitles : new Set(options.knownIdeaTitles ?? []);
     let flushed = 0;
     let skipped = 0;
     let processed = 0;
     let deferred = null;
     while (q.items.length && processed < max) {
-        const entry = q.items[0];
+        const entry = takeEntry();
         try {
             const outcome = await dispatch(client, entry, known);
-            q.items.shift();
+            dropEntry();
             processed += 1;
             if (outcome.status === "flushed") {
                 flushed += 1;
@@ -79,8 +104,8 @@ export async function flushOutbox(state, client, options = {}) {
         catch (error) {
             entry.attempts += 1;
             entry.lastError = error instanceof Error ? error.message : String(error);
-            if (entry.attempts >= MAX_ATTEMPTS) {
-                q.items.shift();
+            if (entry.attempts >= maxAttempts) {
+                dropEntry();
                 q.failed.push(entry);
                 options.logger?.warn(`Outbox entry exhausted, moved to failed: ${entry.kind} ${entry.title ?? entry.id}`);
                 options.onEvent?.({ type: "dropped", entry, error: entry.lastError });

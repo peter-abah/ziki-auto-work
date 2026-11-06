@@ -87,13 +87,7 @@ export declare function validateConfig(config: Config): ValidationResult;
 export declare function validateZikiStatuses(value: unknown, label: string): string[];
 export declare function validateTiming(value: unknown, label: string): string[];
 export declare function validateHealthRetry(value: unknown, label: string): string[];
-/**
- * v4 section validation (light in P1 — presence + shape; per-section
- * strictness lands with the P2 phase that consumes each section).
- * v3 configs skip this entirely. v4 configs must carry transport +
- * operations; all other new sections warn when absent until their P2
- * phase flips them to required.
- */
+export declare function validateV4Required(profile: ProfileConfig, prefix: string): string[];
 export declare function validateV4Sections(profile: ProfileConfig, prefix: string): string[];
 export declare function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig;
 export declare function resolveModel(profile: ProfileConfig, role: Role): string | null;

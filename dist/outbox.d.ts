@@ -1,4 +1,4 @@
-import type { OutboxEntry, State } from "./types.js";
+import type { OutboxEntry, OutboxPolicyConfig, State } from "./types.js";
 import type { ZikiClient } from "./ziki.js";
 import type { Logger } from "./log.js";
 export interface OutboxEvent {
@@ -11,10 +11,13 @@ export declare function queueOutbox(state: State, entry: Omit<OutboxEntry, "id" 
 export declare function outboxDepth(state: State): number;
 export interface FlushOptions {
     maxPerFlush?: number;
+    maxAttempts?: number;
+    fifo?: boolean;
     /** Current tenant idea titles for createIdea dedupe (skip, don't re-file). */
     knownIdeaTitles?: Set<string> | string[];
     logger?: Logger;
     onEvent?: (event: OutboxEvent) => void;
+    policy?: OutboxPolicyConfig | null | undefined;
 }
 /**
  * Flush queued writes FIFO. Stops at the first failure to preserve order;

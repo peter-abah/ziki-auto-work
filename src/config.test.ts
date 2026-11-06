@@ -241,15 +241,18 @@ test("protectedFiles matches patterns", () => {
 });
 
 test("scanSecrets finds keys in added lines", () => {
-  assert.equal(scanSecrets("+ZIKI_KEY1=secret\n+const ok = 1;").length, 1);
-  assert.equal(scanSecrets("+const ok = 1;").length, 0);
+  const patterns = ["ZIKI_KEY[A-Z0-9_]*\\s*=\\s*\\S+"];
+  assert.equal(scanSecrets("+ZIKI_KEY1=secret\n+const ok = 1;", patterns).length, 1);
+  assert.equal(scanSecrets("+const ok = 1;", patterns).length, 0);
 });
 
 test("branchName and summarizeChecks", () => {
-  assert.equal(branchName({ number: 12 }, "Fix the thing"), "fix/12-fix-the-thing");
-  assert.equal(summarizeChecks([]), "none");
-  assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "SUCCESS" }]), "passing");
-  assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "FAILURE" }]), "failing");
+  assert.equal(branchName({ number: 12 }, "Fix the thing", "fix"), "fix/12-fix-the-thing");
+  const states = { passing: "passing", failing: "failing", pending: "pending", none: "none" };
+  assert.equal(summarizeChecks([], states), "none");
+  assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "SUCCESS" }], states), "passing");
+  assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "FAILURE" }], states), "failing");
+  assert.throws(() => summarizeChecks([], null as never), /check states/);
 });
 
 test("buildPrBody renders the profile template", async () => {

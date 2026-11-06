@@ -24,7 +24,8 @@ import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { rotatedKinds } from "./fair-queue.js";
 import { countGoodVerdicts, reviewGate, verdictsNeeded } from "./review-gate.js";
 import { errorMessage, isNoopZikiError, noopPatterns } from "./noop.js";
-import { scanSecrets, protectedFiles } from "./checks.js";
+import { scanSecrets } from "./checks.js";
+import { effectiveProtectedFiles } from "./rules.js";
 import { PACKAGE_ROOT, paths, safeName } from "./platform/paths.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
@@ -80,6 +81,12 @@ function requirePositiveInt(value, path) {
     }
     return value;
 }
+function requireString(value, path) {
+    if (typeof value !== "string" || !value) {
+        throw new Error(`${path} must be a non-empty string (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
 function loopMs(profile, key) {
     const value = profile.loop?.[key];
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -110,6 +117,8 @@ function decisionsPolicy(profile) {
         candidateSubstatuses: requireStringList(decisions.candidateSubstatuses, "profile.decisions.candidateSubstatuses"),
         mergeStatuses: requireStringList(decisions.mergeStatuses, "profile.decisions.mergeStatuses"),
         mergeSubstatuses: requireStringList(decisions.mergeSubstatuses, "profile.decisions.mergeSubstatuses"),
+        mergeReadyStatuses: requireStringList(decisions.mergeReadyStatuses, "profile.decisions.mergeReadyStatuses"),
+        mergeReadySubstatuses: requireStringList(decisions.mergeReadySubstatuses, "profile.decisions.mergeReadySubstatuses"),
         keyChars: requirePositiveInt(decisions.keyChars, "profile.decisions.keyChars")
     };
 }
@@ -433,7 +442,7 @@ async function processPrFollowUp(ctx, task) {
         await save(ctx);
         return;
     }
-    const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
+    const protectedHits = effectiveProtectedFiles(ctx.profile);
     if (protectedHits.length) {
         await escalatePrFollowUp(ctx, issue, task, `protected files changed: ${protectedHits.join(", ")}`);
         await save(ctx);
@@ -442,7 +451,7 @@ async function processPrFollowUp(ctx, task) {
     const diff = await ctx.github.git(["diff", "--cached", "HEAD"], { cwd: task.worktree })
         .then((output) => output.stdout)
         .catch(() => "");
-    const secretHits = scanSecrets(diff);
+    const secretHits = scanSecrets(diff, ctx.profile.safety?.secretPatterns);
     if (secretHits.length) {
         await escalatePrFollowUp(ctx, issue, task, `possible secret in follow-up: ${secretHits[0]}`);
         await save(ctx);
@@ -766,7 +775,6 @@ async function maybeReloadConfig(ctx, force = false) {
  * human approval — via Ziki escalation reply or `auto-work approve`.
  */
 /** One wedged retry of the whole outbox is enough per cycle; the rest waits. */
-const OUTBOX_FLUSH_PER_CYCLE = 5;
 /**
  * Flush queued Ziki writes FIFO once the loop is healthy again. Runs on the
  * normal cycle path only (never while blocked). Never throws: failures stay
@@ -783,7 +791,7 @@ async function flushOutboxPass(ctx) {
     }
     const knownIdeaTitles = new Set((ctx.platform.ideas ?? []).map((idea) => idea.title));
     const result = await flushOutbox(ctx.state, ctx.primary.client, {
-        maxPerFlush: OUTBOX_FLUSH_PER_CYCLE,
+        policy: ctx.profile.outbox,
         knownIdeaTitles,
         logger: ctx.logger,
         onEvent: (event) => {
@@ -1881,13 +1889,13 @@ async function loadPlatformSets(ctx) {
             cached = null;
         }
     }
-    if (cached?.fetchedAt && Date.now() - new Date(cached.fetchedAt).getTime() < 10 * 60 * 1000) {
+    if (cached?.fetchedAt && Date.now() - new Date(cached.fetchedAt).getTime() < loopMs(ctx.profile, "platformCacheMs")) {
         return cached;
     }
     try {
         const [issues, ideas] = await Promise.all([
-            ctx.primary.client.listAllIssues({ platform: apiPlatformFilter(ctx.profile), max: 2000 }),
-            ctx.primary.client.listAllIdeas({ platform: apiPlatformFilter(ctx.profile), max: 1000 })
+            ctx.primary.client.listAllIssues({ platform: apiPlatformFilter(ctx.profile), max: loopMs(ctx.profile, "platformMaxIssues") }),
+            ctx.primary.client.listAllIdeas({ platform: apiPlatformFilter(ctx.profile), max: loopMs(ctx.profile, "platformMaxIdeas") })
         ]);
         const data = {
             fetchedAt: new Date().toISOString(),
@@ -2168,7 +2176,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
     if (diffStats.total > ctx.profile.workflow.maxLines) {
         return handleWorkFailure(ctx, issue, item, { error: `change is ${diffStats.total} lines (max ${ctx.profile.workflow.maxLines})` }, worker, dir);
     }
-    const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
+    const protectedHits = effectiveProtectedFiles(ctx.profile);
     if (protectedHits.length) {
         return handleWorkFailure(ctx, issue, item, { error: `protected files changed: ${protectedHits.join(", ")}` }, worker, dir);
     }
@@ -2176,7 +2184,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
         .git(["diff", "--cached", `upstream/${ctx.profile.repo.base}`], { cwd: dir })
         .then((output) => output.stdout)
         .catch(() => "");
-    const secretHits = scanSecrets(diff);
+    const secretHits = scanSecrets(diff, ctx.profile.safety?.secretPatterns);
     if (secretHits.length) {
         return handleWorkFailure(ctx, issue, item, { error: `possible secret in diff: ${secretHits[0]}` }, worker, dir);
     }
@@ -3846,7 +3854,13 @@ async function processMergeFix(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return true;
     }
-    const zikiReady = issue.status === "merge" || issue.status === "accepted" || issue.substatus === "ready_to_merge" || issue.substatus === "accepted";
+    const mergePolicy = decisionsPolicy(ctx.profile);
+    const mergeReady = (list, value) => new Set(list).has(value);
+    const zikiReady = mergeReady(mergePolicy.mergeReadyStatuses, issue.status) ||
+        mergeReady(mergePolicy.mergeReadySubstatuses, issue.substatus);
+    const reviewGate = ctx.profile.reviewGate;
+    const reviewDecisions = ctx.profile.github?.reviewDecisions;
+    const approvedDecision = requireString(reviewDecisions?.approved, "profile.github.reviewDecisions.approved");
     const gate = mergeGateReason({
         zikiReady,
         checks: status.checks,
@@ -3854,8 +3868,15 @@ async function processMergeFix(ctx, item, preferred) {
         merged: status.merged,
         state: status.state,
         reviewDecision: status.reviewDecision,
-        approvedReviews: status.reviews.filter((review) => review.state === "APPROVED").length,
-        requiredReviewers: ctx.profile.repo.requiredReviewers?.length ?? 0
+        approvedReviews: status.reviews.filter((review) => review.state === approvedDecision).length,
+        requiredReviewers: ctx.profile.repo.requiredReviewers?.length ?? 0,
+        policy: {
+            openState: requireString(reviewGate?.openState, "profile.reviewGate.openState"),
+            passingChecks: requireString(reviewGate?.checkStates?.passing, "profile.reviewGate.checkStates.passing"),
+            noneChecks: requireString(reviewGate?.checkStates?.none, "profile.reviewGate.checkStates.none"),
+            changesRequested: requireString(reviewDecisions?.changesRequested, "profile.github.reviewDecisions.changesRequested"),
+            approved: approvedDecision
+        }
     });
     if (gate) {
         ctx.logger.info(`merge_fix for #${issue.number} held: ${gate} (checks=${status.checks}, mergeable=${String(status.mergeable)}, review=${String(status.reviewDecision)})`);

@@ -687,6 +687,9 @@ export function validateConfig(config: Config): ValidationResult {
     errors.push(...validateHealthRetry(profile?.health?.retryMs, `${prefix}.health.retryMs`));
     validateRepairConfig(prefix, profile?.repair, errors);
     errors.push(...validateV4Sections(profile, `${prefix}`));
+    if (Number(config.version) === 4) {
+      errors.push(...validateV4Required(profile, `${prefix}`));
+    }
   }
 
   return { ok: errors.length === 0, errors, warnings };
@@ -858,6 +861,57 @@ const V4_REQUIRED_IN_V4 = ["transport", "operations"] as const;
  * operations; all other new sections warn when absent until their P2
  * phase flips them to required.
  */
+const V4_REQUIRED_SECTIONS = [
+  "transport",
+  "queue",
+  "reviewGate",
+  "heartbeatPolicy",
+  "decisions",
+  "noop",
+  "votes",
+  "idea",
+  "apiRepair",
+  "capacity",
+  "urls",
+  "discover",
+  "github",
+  "safety",
+  "checksDefaults",
+  "outbox",
+  "bootstrap",
+  "offline",
+  "loop",
+  "pr",
+  "repo",
+  "discovery"
+] as const;
+
+export function validateV4Required(profile: ProfileConfig, prefix: string): string[] {
+  const errors: string[] = [];
+  const record = profile as unknown as Record<string, unknown>;
+  for (const section of V4_REQUIRED_SECTIONS) {
+    const value = record[section];
+    if (value === undefined) {
+      errors.push(`${prefix}.${section} is required in v4 (run \`auto-work migrate\`)`);
+    } else if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      errors.push(`${prefix}.${section} must be an object (run \`auto-work migrate\`)`);
+    }
+  }
+  if ((profile.ziki as unknown as Record<string, unknown> | undefined)?.endpoints === undefined) {
+    errors.push(`${prefix}.ziki.endpoints is required in v4 (run \`auto-work migrate\`)`);
+  }
+  if (typeof profile.pr?.maxBodyChars !== "number") {
+    errors.push(`${prefix}.pr.maxBodyChars must be a number (run \`auto-work migrate\`)`);
+  }
+  if (profile.repo?.mergeMode !== undefined && !["handoff", "never", "auto"].includes(profile.repo.mergeMode)) {
+    errors.push(`${prefix}.repo.mergeMode must be "handoff", "never" or "auto"`);
+  }
+  if (profile.repo?.mergeMethod !== undefined && !["merge", "squash", "rebase"].includes(profile.repo.mergeMethod)) {
+    errors.push(`${prefix}.repo.mergeMethod must be "merge", "squash" or "rebase"`);
+  }
+  return errors;
+}
+
 export function validateV4Sections(profile: ProfileConfig, prefix: string): string[] {
   if (!profile) return [];
   const errors: string[] = [];
@@ -930,11 +984,19 @@ export function resolveModel(profile: ProfileConfig, role: Role): string | null 
 }
 
 export function resolveMergeMode(profile: ProfileConfig): "handoff" | "never" | "auto" {
-  return profile.repo.mergeMode ?? "handoff";
+  const mode = profile.repo.mergeMode;
+  if (mode !== "handoff" && mode !== "never" && mode !== "auto") {
+    throw new Error('profile.repo.mergeMode must be "handoff", "never" or "auto" (run `auto-work migrate`)');
+  }
+  return mode;
 }
 
 export function resolveMergeMethod(profile: ProfileConfig): "merge" | "squash" | "rebase" {
-  return profile.repo.mergeMethod ?? "squash";
+  const method = profile.repo.mergeMethod;
+  if (method !== "merge" && method !== "squash" && method !== "rebase") {
+    throw new Error('profile.repo.mergeMethod must be "merge", "squash" or "rebase" (run `auto-work migrate`)');
+  }
+  return method;
 }
 
 export function resolvePromptDir(profile: ProfileConfig): string {

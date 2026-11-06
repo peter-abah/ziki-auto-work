@@ -1,9 +1,33 @@
 import type { Issue, ProfileConfig } from "./types.js";
+export interface GithubCheckStates {
+    passing: string;
+    failing: string;
+    pending: string;
+    none: string;
+}
+export interface ResolvedGithubPolicy {
+    stateMap: {
+        merged: string[];
+        closed: string[];
+    };
+    mergeableMap: {
+        mergeable: string;
+        conflicting: string;
+    };
+    mergeFlags: Record<string, string>;
+    defaultMergeMethod: string;
+    timeouts: {
+        fetch: number;
+        view: number;
+        create: number;
+        merge: number;
+    };
+}
 export declare function slugify(text: string, max?: number): string;
 export declare function branchName(issue: {
     number: number | string;
-}, title: string, prefix?: string): string;
-export declare function summarizeChecks(rollup: Array<Record<string, unknown>>): "passing" | "failing" | "pending" | "none";
+}, title: string, prefix: string): string;
+export declare function summarizeChecks(rollup: Array<Record<string, unknown>>, states: GithubCheckStates): string;
 export interface PrComment {
     id: string;
     author: string;
@@ -36,7 +60,7 @@ export interface GitHubPrStatus {
     headSha: string | null;
     headRefName: string | null;
     baseRefName: string | null;
-    checks: "passing" | "failing" | "pending" | "none";
+    checks: string;
     mergeable: boolean | null;
     reviewDecision: string | null;
     comments: PrComment[];
@@ -123,7 +147,7 @@ export declare class GitHub {
         log: string;
     }>>;
     updatePrBody(url: string, body: string): Promise<void>;
-    mergePr(url: string, method?: "merge" | "squash" | "rebase"): Promise<void>;
+    mergePr(url: string, method?: "merge" | "squash" | "rebase" | string): Promise<void>;
     closePr(url: string, comment?: string): Promise<void>;
     authStatus(): Promise<import("./platform/spawn.js").RunResult>;
     remoteAccess(url: string): Promise<import("./platform/spawn.js").RunResult>;

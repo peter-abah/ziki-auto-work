@@ -1167,6 +1167,14 @@
     "mergeSubstatuses": [
       "requires_review"
     ],
+    "mergeReadyStatuses": [
+      "merge",
+      "accepted"
+    ],
+    "mergeReadySubstatuses": [
+      "ready_to_merge",
+      "accepted"
+    ],
     "keyChars": 80
   },
   "noop": {
@@ -1271,6 +1279,32 @@
         "client"
       ]
     },
+    "platformPatterns": {
+      "desktop": [
+        "(^|-)desktop($|-)",
+        "-desktop-app$"
+      ],
+      "mobile": [
+        "(^|-)mobile($|-)",
+        "-android$",
+        "-ios$"
+      ],
+      "web": [
+        "(^|-)fe$",
+        "-web$",
+        "-frontend$",
+        "-client$"
+      ]
+    },
+    "searchLimit": 30,
+    "timeouts": {
+      "searchMs": 60000,
+      "apiMs": 60000,
+      "protocolMs": 20000,
+      "forkMs": 180000,
+      "forkAttempts": 5,
+      "forkRetryMs": 1500
+    },
     "scores": {
       "exact": 60,
       "prefix": 40,
@@ -1294,6 +1328,43 @@
     },
     "stackPlatformDefault": "web"
   },
+  "checkPresets": {
+    "flutter": [
+      { "name": "deps", "command": "flutter", "args": ["pub", "get"], "timeoutMs": 600000 },
+      { "name": "format", "command": "dart", "args": ["format", "--output=none", "--set-exit-if-changed"], "filesOnly": true, "include": [".dart"] },
+      { "name": "analyze", "command": "flutter", "args": ["analyze", "--fatal-infos", "--fatal-warnings"] },
+      { "name": "test", "command": "flutter", "args": ["test", "--reporter", "json"], "reporter": "json", "timeoutMs": 1800000 }
+    ],
+    "node": [
+      { "name": "deps", "command": "npm", "args": ["ci"], "timeoutMs": 600000 },
+      { "name": "lint", "command": "npm", "args": ["run", "lint"], "required": false },
+      { "name": "test", "command": "npm", "args": ["test"], "timeoutMs": 1800000 }
+    ],
+    "python": [
+      { "name": "deps", "command": "python", "args": ["-m", "pip", "install", "-e", "."], "timeoutMs": 600000 },
+      { "name": "lint", "command": "ruff", "args": ["check", "."], "required": false },
+      { "name": "test", "command": "pytest", "args": ["-q"], "timeoutMs": 1800000 }
+    ],
+    "go": [
+      { "name": "build", "command": "go", "args": ["build", "./..."], "timeoutMs": 900000 },
+      { "name": "test", "command": "go", "args": ["test", "./..."], "timeoutMs": 1800000 }
+    ],
+    "rust": [
+      { "name": "build", "command": "cargo", "args": ["build"], "timeoutMs": 1800000 },
+      { "name": "test", "command": "cargo", "args": ["test"], "timeoutMs": 1800000 }
+    ]
+  },
+  "pr": {
+    "maxBodyChars": 60000
+  },
+  "discovery": {
+    "enabled": true,
+    "maxIdeasPerRun": 3
+  },
+  "repo": {
+    "mergeMode": "handoff",
+    "mergeMethod": "squash"
+  },
   "github": {
     "stateMap": {
       "merged": [
@@ -1313,10 +1384,14 @@
       "rebase": "--rebase"
     },
     "defaultMergeMethod": "squash",
+    "reviewDecisions": {
+      "approved": "APPROVED",
+      "changesRequested": "CHANGES_REQUESTED"
+    },
     "timeouts": {
       "fetch": 300000,
       "view": 60000,
-      "create": 120000,
+      "create": 180000,
       "merge": 300000
     }
   },
@@ -1376,7 +1451,10 @@
     "truncLen": 120,
     "cacheMs": 600000,
     "statusAgeMs": 120000,
-    "pollFloorMs": 1000
+    "pollFloorMs": 1000,
+    "platformCacheMs": 600000,
+    "platformMaxIssues": 2000,
+    "platformMaxIdeas": 1000
   },
   "envFiles": [
     ".env",

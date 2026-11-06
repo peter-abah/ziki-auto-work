@@ -53,8 +53,9 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * Sections where nested keys fill from templates when absent (additive
- * policy lists). Excluded: operations/endpoints/ziki/limits/workflow —
- * maps where a missing key may be an intentional removal.
+ * policy lists). Only template-known keys ever fill, so identity sections
+ * stay untouched. Excluded: operations/endpoints/ziki — maps where a
+ * missing key may be an intentional removal.
  */
 const NESTED_FILL_SECTIONS = new Set([
   "limits",
@@ -63,6 +64,8 @@ const NESTED_FILL_SECTIONS = new Set([
   "timing",
   "statuses",
   "health",
+  "repo",
+  "pr",
   "discovery",
   "decisions",
   "queue",
@@ -82,6 +85,7 @@ const NESTED_FILL_SECTIONS = new Set([
   "bootstrap",
   "offline",
   "loop",
+  "pr",
   "transport",
   "timing",
   "health",
@@ -150,6 +154,9 @@ export function fillProfileFromTemplates(
     bootstrap: "bootstrap",
     offline: "offline",
     loop: "loop",
+    pr: "pr",
+    repo: "repo",
+    discovery: "discovery",
     pollSeconds: "pollSeconds",
     memoryRefreshMinutes: "memoryRefreshMinutes",
     hitl: "hitl",
@@ -231,7 +238,8 @@ export function explainProfile(
     "limits", "workflow", "prTracking", "timing", "statuses", "repair",
     "transport", "operations", "queue", "reviewGate", "heartbeatPolicy",
     "decisions", "noop", "votes", "idea", "apiRepair", "capacity", "urls",
-    "discover", "github", "safety", "checksDefaults", "outbox",   "bootstrap", "loop", "offline",
+    "discover", "github", "safety", "checksDefaults", "outbox", "bootstrap", "loop", "offline", "pr",
+    "repo", "discovery",
     "pollSeconds", "memoryRefreshMinutes", "hitl", "executor", "endpoints"
   ];
   // "endpoints" above is display-only: the real fill targets ziki.endpoints

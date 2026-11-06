@@ -266,6 +266,7 @@ export interface PromptsConfig {
 export interface PrConfig {
   templateFile: string;
   teamLead?: string;
+  maxBodyChars?: number;
 }
 
 export interface PrTrackingConfig {
@@ -536,6 +537,9 @@ export interface DecisionsPolicyConfig {
   /** Issue states where a merge decision may be acted on. */
   mergeStatuses?: string[];
   mergeSubstatuses?: string[];
+  /** Ziki states that count as merge-ready for merge_fix. */
+  mergeReadyStatuses?: string[];
+  mergeReadySubstatuses?: string[];
   /** Chars of decision text kept in the dedupe key. */
   keyChars?: number;
 }
@@ -582,12 +586,23 @@ export interface UrlsPolicyConfig {
 
 export interface DiscoverPolicyConfig {
   platformSuffixes?: Record<string, string[]>;
+  platformPatterns?: Record<string, string[]>;
   scores?: Record<string, number>;
   starDivisor?: number;
   starCap?: number;
   skipArchived?: boolean;
   stackMap?: Record<string, string>;
   stackPlatform?: Record<string, string>;
+  stackPlatformDefault?: string;
+  searchLimit?: number;
+  timeouts?: {
+    searchMs?: number;
+    apiMs?: number;
+    protocolMs?: number;
+    forkMs?: number;
+    forkAttempts?: number;
+    forkRetryMs?: number;
+  };
 }
 
 export interface GithubPolicyConfig {
@@ -596,6 +611,7 @@ export interface GithubPolicyConfig {
   mergeFlags?: Record<string, string>;
   defaultMergeMethod?: string;
   timeouts?: { fetch?: number; view?: number; create?: number; merge?: number };
+  reviewDecisions?: { approved?: string; changesRequested?: string };
 }
 
 export interface SafetyPolicyConfig {
@@ -627,6 +643,9 @@ export interface LoopPolicyConfig {
   cacheMs?: number;
   statusAgeMs?: number;
   pollFloorMs?: number;
+  platformCacheMs?: number;
+  platformMaxIssues?: number;
+  platformMaxIdeas?: number;
 }
 
 export interface OfflinePolicyConfig {
@@ -1039,7 +1058,7 @@ export interface TaskState {
   lastError?: string | null;
   prNumber?: number;
   prState?: string;
-  prChecks?: "passing" | "failing" | "pending" | "none";
+  prChecks?: string;
   prMergeable?: boolean | null;
   prReviewDecision?: string | null;
   prLastCheckedAt?: string;

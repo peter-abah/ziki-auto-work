@@ -246,57 +246,52 @@ async function install(flags) {
     console.log("  auto-work run --once --dry-run");
     console.log("  auto-work start");
 }
-function checkPreset(name) {
-    if (name === "flutter") {
-        return [
-            { name: "deps", command: "flutter", args: ["pub", "get"], timeoutMs: 600_000 },
-            {
-                name: "format",
-                command: "dart",
-                args: ["format", "--output=none", "--set-exit-if-changed"],
-                filesOnly: true,
-                include: [".dart"]
-            },
-            { name: "analyze", command: "flutter", args: ["analyze", "--fatal-infos", "--fatal-warnings"] },
-            {
-                name: "test",
-                command: "flutter",
-                args: ["test", "--reporter", "json"],
-                reporter: "json",
-                timeoutMs: 1_800_000
-            }
-        ];
+/**
+ * Stack check presets come from init templates (init-time data, never code).
+ * Unknown stacks yield no checks rather than a guessed command.
+ */
+async function checkPreset(name) {
+    const presets = await loadCheckPresets();
+    const preset = presets[name];
+    if (preset === undefined)
+        return [];
+    if (!Array.isArray(preset)) {
+        throw new Error(`check preset "${name}" must be an array (run \`auto-work migrate\`)`);
     }
-    if (name === "node") {
-        return [
-            { name: "deps", command: "npm", args: ["ci"], timeoutMs: 600_000 },
-            { name: "lint", command: "npm", args: ["run", "lint"], required: false },
-            { name: "test", command: "npm", args: ["test"], timeoutMs: 1_800_000 }
-        ];
-    }
-    if (name === "python") {
-        return [
-            { name: "deps", command: "python", args: ["-m", "pip", "install", "-e", "."], timeoutMs: 600_000 },
-            { name: "lint", command: "ruff", args: ["check", "."], required: false },
-            { name: "test", command: "pytest", args: ["-q"], timeoutMs: 1_800_000 }
-        ];
-    }
-    if (name === "go") {
-        return [
-            { name: "build", command: "go", args: ["build", "./..."], timeoutMs: 900_000 },
-            { name: "test", command: "go", args: ["test", "./..."], timeoutMs: 1_800_000 }
-        ];
-    }
-    if (name === "rust") {
-        return [
-            { name: "build", command: "cargo", args: ["build"], timeoutMs: 1_800_000 },
-            { name: "test", command: "cargo", args: ["test"], timeoutMs: 1_800_000 }
-        ];
-    }
-    return [];
+    return JSON.parse(JSON.stringify(preset));
 }
-function detectedStack() {
-    return detectedStackAt(process.cwd());
+async function loadCheckPresets() {
+    const { loadInitTemplates } = await import("./config-templates.js");
+    const templates = (await loadInitTemplates());
+    const presets = templates.checkPresets;
+    if (!presets || typeof presets !== "object" || Array.isArray(presets)) {
+        throw new Error("init templates missing checkPresets");
+    }
+    return presets;
+}
+async function loadExecutorDefaults() {
+    const { loadInitTemplates } = await import("./config-templates.js");
+    const templates = (await loadInitTemplates());
+    const executor = templates.executor;
+    if (typeof executor?.timeoutMs !== "number" || (executor?.permissionMode !== "auto" && executor?.permissionMode !== "safe")) {
+        throw new Error("init templates missing executor.timeoutMs/permissionMode");
+    }
+    return { timeoutMs: executor.timeoutMs, permissionMode: executor.permissionMode };
+}
+async function loadDiscoverPolicy() {
+    const { loadInitTemplates } = await import("./config-templates.js");
+    const templates = (await loadInitTemplates());
+    const policy = templates.discover;
+    if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+        throw new Error("init templates missing discover policy");
+    }
+    return policy;
+}
+async function detectedStack() {
+    const policy = await loadDiscoverPolicy();
+    const { resolveDiscoverPolicy } = await import("./discover.js");
+    const resolved = resolveDiscoverPolicy(policy);
+    return detectedStackAt(process.cwd(), resolved.stackMap);
 }
 async function detectedProviders() {
     const found = [];
@@ -329,21 +324,22 @@ async function copyPromptSet(profileName) {
     }
     return target;
 }
-function discoveryConfig(flags, existing, profileName, parity) {
+async function discoveryConfig(flags, existing, profileName, parity) {
     const previous = existing.profiles?.[profileName]?.discovery;
     const contextFiles = (str(flags, "context-file") ?? "")
         .split(",")
         .map((file) => file.trim())
         .filter(Boolean);
     const focus = str(flags, "discovery-focus");
-    const enabled = flags["no-discovery"]
-        ? false
-        : flags.discovery === true
-            ? true
-            : previous?.enabled ?? true;
+    const { loadInitTemplates } = await import("./config-templates.js");
+    const templateDiscovery = (await loadInitTemplates()).discovery;
+    if (typeof templateDiscovery?.enabled !== "boolean" || typeof templateDiscovery?.maxIdeasPerRun !== "number") {
+        throw new Error("init templates missing discovery.enabled/maxIdeasPerRun");
+    }
+    const enabled = flags["no-discovery"] ? false : flags.discovery === true ? true : (previous?.enabled ?? templateDiscovery.enabled);
     return {
         enabled,
-        maxIdeasPerRun: previous?.maxIdeasPerRun ?? 3,
+        maxIdeasPerRun: previous?.maxIdeasPerRun ?? templateDiscovery.maxIdeasPerRun,
         ...(parity ? { parityFile: parity } : previous?.parityFile ? { parityFile: previous.parityFile } : {}),
         ...(contextFiles.length ? { contextFiles } : previous?.contextFiles ? { contextFiles: previous.contextFiles } : {}),
         ...(focus ? { focus } : previous?.focus ? { focus: previous.focus } : {})
@@ -511,8 +507,10 @@ async function initWizard(flags) {
         for (const platform of platforms)
             console.log(`  ${platform.slug}  ${platform.name}`);
     }
-    const stack = detectedStack();
-    const stackPlatform = stack === "flutter" ? "desktop" : "web";
+    const stack = await detectedStack();
+    const discoverPolicy = await loadDiscoverPolicy();
+    const { stackPlatform: stackPlatformFromPolicy } = await import("./discover.js");
+    const stackPlatform = stackPlatformFromPolicy(stack, discoverPolicy);
     const platformDefault = platforms.find((platform) => platform.slug === stackPlatform)?.slug ?? platforms[0]?.slug ?? stackPlatform;
     let platform = str(flags, "platform") || (yes ? platformDefault : "");
     if (!platform) {
@@ -565,12 +563,12 @@ async function initWizard(flags) {
             ...(teamLead ? { teamLead } : {})
         },
         agents: { workers, managers },
-        executor: { provider, model: model || null, timeoutMs: 2_700_000, permissionMode: "auto" },
-        checks: checkPreset(checksName),
+        executor: { provider, model: model || null, ...(await loadExecutorDefaults()) },
+        checks: await checkPreset(checksName),
         platformMatch: { keywords: [platform] },
         prompts: { dir: promptsDir },
         pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
-        discovery: discoveryConfig(flags, existing, profileName, parity)
+        discovery: await discoveryConfig(flags, existing, profileName, parity)
     });
     let config = {
         version: 3,
@@ -590,6 +588,9 @@ async function initDiscover(flags) {
     const dryRun = Boolean(flags["dry-run"]);
     const baseUrl = await flagBaseUrl(flags);
     const gh = str(flags, "gh") || "gh";
+    const discoverPolicy = await loadDiscoverPolicy();
+    const { resolveDiscoverPolicy } = await import("./discover.js");
+    const discoverTimeouts = resolveDiscoverPolicy(discoverPolicy).timeouts;
     let existing;
     try {
         existing = await loadConfig();
@@ -659,10 +660,10 @@ async function initDiscover(flags) {
     const forkOwnerFlag = str(flags, "fork-owner");
     if (!repoRef) {
         if (!githubRepo) {
-            const login = await githubLogin(gh);
-            let candidates = await searchRepos(projectSlug, { gh, limit: 30 });
+            const login = await githubLogin(gh, runCommand, discoverTimeouts.apiMs);
+            let candidates = await searchRepos(projectSlug, { gh, policy: discoverPolicy });
             const requestedPlatform = str(flags, "platform") || null;
-            candidates = rankCandidates(candidates, projectSlug, requestedPlatform);
+            candidates = rankCandidates(candidates, projectSlug, requestedPlatform, discoverPolicy);
             if (!candidates.length) {
                 if (yes)
                     throw new Error(`No GitHub repository found for "${projectSlug}". Pass --github-repo owner/name.`);
@@ -696,13 +697,13 @@ async function initDiscover(flags) {
     if (!repoRef)
         throw new Error("A repository is required.");
     const upstream = `${repoRef.owner}/${repoRef.name}`;
-    const info = await repoInfo(upstream, gh);
+    const info = await repoInfo(upstream, gh, runCommand, discoverTimeouts.apiMs);
     if (!info)
         throw new Error(`Cannot read ${upstream}. Check gh auth and the repository name.`);
     const defaultBranch = info.defaultBranch;
-    const branches = await listBranches(upstream, gh);
+    const branches = await listBranches(upstream, gh, runCommand, discoverTimeouts.apiMs);
     const base = str(flags, "base") || (branches.includes("staging") ? "staging" : defaultBranch);
-    const user = await githubLogin(gh);
+    const user = await githubLogin(gh, runCommand, discoverTimeouts.apiMs);
     const repoUrlOwner = repoUrlOverride ? parseRepoRef(repoUrlOverride)?.owner : null;
     const noFork = Boolean(flags["no-fork"]);
     const personalFork = Boolean(flags["personal-fork"]);
@@ -723,20 +724,20 @@ async function initDiscover(flags) {
         forkOwner = repoRef.owner;
     const org = forkOwner !== user && pushMode !== "upstream" ? forkOwner : undefined;
     const createFork = Boolean(flags.fork) && !dryRun && pushMode !== "upstream";
-    let fork = await ensureFork({ upstream, user: forkOwner, org, createFork, gh });
+    let fork = await ensureFork({ upstream, user: forkOwner, org, createFork, gh, policy: discoverPolicy });
     if (fork.needsFork && !dryRun) {
         if (yes)
             throw new Error(`Fork ${fork.forkRepo} does not exist. Pass --fork to create it.`);
         const answer = await ask(`Create fork ${fork.forkRepo} from ${upstream}? (y/N)`, "n");
         if (/^y/i.test(answer))
-            fork = await ensureFork({ upstream, user: forkOwner, org, createFork: true, gh });
+            fork = await ensureFork({ upstream, user: forkOwner, org, createFork: true, gh, policy: discoverPolicy });
         else
             throw new Error(`A fork is required. Create ${fork.forkRepo} or pass --repo-url with an existing fork.`);
     }
     if (repoUrlOverride) {
         fork = { ...fork, forkGitUrl: repoUrlOverride, exists: true, needsFork: false };
     }
-    let platform = str(flags, "platform") || inferPlatform(repoName(upstream)) || "";
+    let platform = str(flags, "platform") || inferPlatform(repoName(upstream), discoverPolicy) || "";
     const platformDefault = platforms.find((entry) => entry.slug === platform)?.slug ?? platforms[0]?.slug ?? platform ?? "desktop";
     if (!platform) {
         if (yes)
@@ -757,7 +758,7 @@ async function initDiscover(flags) {
     const teamLead = str(flags, "team-lead") || "";
     const profileName = str(flags, "profile") || `${projectSlug}-${platform}`;
     const promptsDir = path.join(paths().configDir, "prompts", safeName(profileName));
-    const checks = checkPreset(checksFlag || stack);
+    const checks = await checkPreset(checksFlag || stack);
     const parity = str(flags, "parity") || "";
     const envFile = str(flags, "env-file");
     const profile = baseProfile({
@@ -771,16 +772,15 @@ async function initDiscover(flags) {
             forkOwner: fork.forkOwner,
             pushMode,
             defaultBranch,
-            envFiles: [".env", ".env.local"],
             ...(teamLead ? { teamLead } : {})
         },
         agents: { workers: roles.workers, managers: roles.managers },
-        executor: { provider, model: model || null, timeoutMs: 2_700_000, permissionMode: "auto" },
+        executor: { provider, model: model || null, ...(await loadExecutorDefaults()) },
         checks,
         platformMatch: { keywords: [platform] },
         prompts: { dir: promptsDir },
         pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
-        discovery: discoveryConfig(flags, existing, profileName, parity)
+        discovery: await discoveryConfig(flags, existing, profileName, parity)
     });
     let config = {
         version: 3,
@@ -822,11 +822,12 @@ async function initDiscover(flags) {
         console.warn("The config is written; fix access and run `auto-work doctor` to clone.");
     }
     if (repoDir && !stackFlag) {
-        const detected = detectedStackAt(repoDir);
+        const { resolveDiscoverPolicy: resolveStackPolicy } = await import("./discover.js");
+        const detected = detectedStackAt(repoDir, resolveStackPolicy(await loadDiscoverPolicy()).stackMap);
         if (detected !== "generic") {
             profile.stack = detected;
             if (!checksFlag)
-                profile.checks = checkPreset(detected);
+                profile.checks = await checkPreset(detected);
             await saveConfig(config);
             console.log(`Detected stack: ${detected}`);
         }
@@ -900,7 +901,7 @@ async function init(flags) {
     nextCommands();
 }
 async function detect(flags) {
-    const stack = detectedStack();
+    const stack = await detectedStack();
     const providers = await detectedProviders();
     const config = await loadConfig();
     const profileName = config.activeProfile || Object.keys(config.profiles)[0] || null;
@@ -911,7 +912,7 @@ async function detect(flags) {
         node: process.versions.node,
         cwd: process.cwd(),
         stack,
-        stackFiles: ["pubspec.yaml", "package.json", "pyproject.toml", "go.mod", "Cargo.toml"].filter((file) => existsSync(path.join(process.cwd(), file))),
+        stackFiles: Object.keys((await loadDiscoverPolicy()).stackMap ?? {}).filter((file) => existsSync(path.join(process.cwd(), file))),
         providers,
         configFile: paths().configFile,
         activeProfile: profileName,

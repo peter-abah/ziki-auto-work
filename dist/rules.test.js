@@ -1,10 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_PROTECTED } from "./checks.js";
 import { DEFAULT_WORKFLOW, DEFAULT_LIMITS } from "./config.js";
 import { branchName } from "./github.js";
 import { normalizeCommitMessage } from "./orchestrator.js";
 import { effectiveProtectedFiles, formatWorkflowRules } from "./rules.js";
+import { loadInitTemplates } from "./config-templates.js";
+const templates = await loadInitTemplates();
+const safetyProtected = templates.safety.protectedFiles;
 function profile(overrides = {}) {
     return {
         ziki: { baseUrl: "https://ziki.dev", projectId: "project_demo", projectSlug: "demo", platform: "desktop" },
@@ -26,6 +28,7 @@ function profile(overrides = {}) {
         platformMatch: { keywords: ["desktop"] },
         prompts: { dir: "prompts/generic" },
         pr: { templateFile: "prompts/generic/pr.md", teamLead: "@lead" },
+        safety: JSON.parse(JSON.stringify(templates.safety)),
         discovery: { enabled: false },
         workflow: { ...DEFAULT_WORKFLOW },
         limits: { ...DEFAULT_LIMITS },
@@ -44,9 +47,10 @@ test("formatWorkflowRules surfaces limits, target, team lead and protected files
     assert.match(text, /@lead/);
     assert.match(text, /AGENTS\.md/);
 });
-test("effectiveProtectedFiles uses config or the generic defaults", () => {
+test("effectiveProtectedFiles uses repo config or the safety policy", () => {
     assert.deepEqual(effectiveProtectedFiles(profile()), ["AGENTS.md"]);
-    assert.deepEqual(effectiveProtectedFiles(profile({ repo: { ...profile().repo, protectedFiles: [] } })), DEFAULT_PROTECTED);
+    assert.deepEqual(effectiveProtectedFiles(profile({ repo: { ...profile().repo, protectedFiles: [] } })), safetyProtected);
+    assert.throws(() => effectiveProtectedFiles({}), /safety\.protectedFiles/);
 });
 test("branchName honors a configured prefix", () => {
     assert.equal(branchName({ number: 12 }, "Fix the widget", "fix"), "fix/12-fix-the-widget");

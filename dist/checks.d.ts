@@ -6,7 +6,6 @@ export declare function runChecks(profile: ProfileConfig, worktree: string, opti
     changedFiles: string[];
     logger?: Logger;
 }): Promise<CheckRunResult>;
-export declare const DEFAULT_PROTECTED: string[];
-export declare function protectedFiles(files: string[], patterns?: string[]): string[];
-export declare function scanSecretsText(text: string): string[];
-export declare function scanSecrets(diff: string): string[];
+export declare function protectedFiles(files: string[], patterns: string[] | null | undefined): string[];
+export declare function scanSecretsText(text: string, patterns: string[] | null | undefined): string[];
+export declare function scanSecrets(diff: string, patterns: string[] | null | undefined): string[];

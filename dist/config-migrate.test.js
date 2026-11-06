@@ -114,6 +114,21 @@ test("template operations reference real endpoints", async () => {
         }
     }
 });
+test("v4 validation requires every config-driven section", async () => {
+    const templates = await loadInitTemplates();
+    const config = {
+        version: 3,
+        activeProfile: "demo",
+        defaults: {},
+        profiles: { demo: v3Profile() }
+    };
+    const { config: next } = migrateV3toV4(config, templates);
+    const { validateV4Required } = await import("./config.js");
+    assert.deepEqual(validateV4Required(next.profiles.demo, "profiles.demo"), []);
+    const { transport: _dropped, ...rest } = next.profiles.demo;
+    void _dropped;
+    assert.ok(validateV4Required(rest, "profiles.demo").some((error) => error.includes("transport")));
+});
 test("migrated v3 config validates clean", async () => {
     const templates = await loadInitTemplates();
     const config = {

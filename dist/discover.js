@@ -1,11 +1,84 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { runCommand } from "./platform/spawn.js";
-const PLATFORM_SUFFIXES = {
-    desktop: ["desktop", "desktop-app", "app"],
-    mobile: ["mobile", "android", "ios", "app"],
-    web: ["fe", "web", "frontend", "client"]
-};
+function requireStringList(value, path) {
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+        throw new Error(`${path} must be an array of strings (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function requireStringMap(value, path) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${path} must be an object of string arrays (run \`auto-work migrate\`)`);
+    }
+    for (const [key, list] of Object.entries(value)) {
+        requireStringList(list, `${path}.${key}`);
+    }
+    return value;
+}
+function requireNumber(value, path, opts = {}) {
+    const min = opts.min ?? 0;
+    if (typeof value !== "number" ||
+        !Number.isFinite(value) ||
+        value < min ||
+        (opts.integer && !Number.isInteger(value))) {
+        throw new Error(`${path} must be a number >= ${min}${opts.integer ? " (integer)" : ""} (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+/** Resolve and validate the discover policy (init templates fill every key). */
+export function resolveDiscoverPolicy(policy) {
+    if (!policy || typeof policy !== "object") {
+        throw new Error("discover policy is required (run `auto-work migrate`)");
+    }
+    const scores = policy.scores;
+    if (!scores || typeof scores !== "object" || Array.isArray(scores)) {
+        throw new Error("discover.scores must be an object of kind -> number (run `auto-work migrate`)");
+    }
+    const scoreValues = {};
+    for (const key of ["exact", "prefix", "suffixExact", "suffix", "description", "forkBonus"]) {
+        scoreValues[key] = requireNumber(scores[key], `discover.scores.${key}`);
+    }
+    const timeouts = policy.timeouts;
+    if (!timeouts || typeof timeouts !== "object") {
+        throw new Error("discover.timeouts is required (run `auto-work migrate`)");
+    }
+    return {
+        platformSuffixes: requireStringMap(policy.platformSuffixes, "discover.platformSuffixes"),
+        platformPatterns: requireStringMap(policy.platformPatterns, "discover.platformPatterns"),
+        scores: scoreValues,
+        starDivisor: requireNumber(policy.starDivisor, "discover.starDivisor", { min: 1 }),
+        starCap: requireNumber(policy.starCap, "discover.starCap", { min: 0 }),
+        skipArchived: policy.skipArchived !== false,
+        stackMap: requireFlatStringMap(policy.stackMap, "discover.stackMap"),
+        stackPlatform: requireFlatStringMap(policy.stackPlatform, "discover.stackPlatform"),
+        stackPlatformDefault: typeof policy.stackPlatformDefault === "string" && policy.stackPlatformDefault
+            ? policy.stackPlatformDefault
+            : (() => {
+                throw new Error("discover.stackPlatformDefault must be a non-empty string (run `auto-work migrate`)");
+            })(),
+        searchLimit: requireNumber(policy.searchLimit, "discover.searchLimit", { min: 1, integer: true }),
+        timeouts: {
+            searchMs: requireNumber(timeouts.searchMs, "discover.timeouts.searchMs", { min: 1 }),
+            apiMs: requireNumber(timeouts.apiMs, "discover.timeouts.apiMs", { min: 1 }),
+            protocolMs: requireNumber(timeouts.protocolMs, "discover.timeouts.protocolMs", { min: 1 }),
+            forkMs: requireNumber(timeouts.forkMs, "discover.timeouts.forkMs", { min: 1 }),
+            forkAttempts: requireNumber(timeouts.forkAttempts, "discover.timeouts.forkAttempts", { min: 1, integer: true }),
+            forkRetryMs: requireNumber(timeouts.forkRetryMs, "discover.timeouts.forkRetryMs", { min: 0 })
+        }
+    };
+}
+function requireFlatStringMap(value, path) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${path} must be an object of string -> string (run \`auto-work migrate\`)`);
+    }
+    for (const [key, entry] of Object.entries(value)) {
+        if (typeof entry !== "string" || !entry) {
+            throw new Error(`${path}.${key} must be a non-empty string (run \`auto-work migrate\`)`);
+        }
+    }
+    return value;
+}
 export function parseRepoRef(value) {
     if (!value)
         return null;
@@ -24,45 +97,45 @@ export function parseRepoRef(value) {
 export function repoName(fullName) {
     return fullName.split("/")[1] ?? fullName;
 }
-export function inferPlatform(name) {
+export function inferPlatform(name, policy) {
+    const { platformPatterns } = resolveDiscoverPolicy(policy);
     const lower = name.toLowerCase();
-    if (/(^|-)desktop($|-)|-desktop-app$/.test(lower))
-        return "desktop";
-    if (/(^|-)mobile($|-)|-android$|-ios$/.test(lower))
-        return "mobile";
-    if (/(^|-)fe$|-web$|-frontend$|-client$/.test(lower))
-        return "web";
+    for (const [platform, patterns] of Object.entries(platformPatterns)) {
+        if (patterns.some((source) => new RegExp(source, "i").test(lower)))
+            return platform;
+    }
     return null;
 }
-export function rankCandidates(candidates, slug, platform) {
-    const suffixes = platform ? (PLATFORM_SUFFIXES[platform] ?? []) : [];
+export function rankCandidates(candidates, slug, platform, policy) {
+    const resolved = resolveDiscoverPolicy(policy);
+    const suffixes = platform ? (resolved.platformSuffixes[platform] ?? []) : [];
     const scored = candidates
-        .filter((candidate) => !candidate.isArchived)
+        .filter((candidate) => !resolved.skipArchived || !candidate.isArchived)
         .map((candidate) => {
         const name = repoName(candidate.fullName).toLowerCase();
         let score = 0;
         if (name === slug.toLowerCase())
-            score += 60;
+            score += resolved.scores.exact;
         if (name.startsWith(slug.toLowerCase()))
-            score += 40;
+            score += resolved.scores.prefix;
         for (const suffix of suffixes) {
             if (name === `${slug.toLowerCase()}-${suffix}`)
-                score += 100;
+                score += resolved.scores.suffixExact;
             else if (name.endsWith(`-${suffix}`))
-                score += 25;
+                score += resolved.scores.suffix;
         }
         if (candidate.description?.toLowerCase().includes(slug.toLowerCase()))
-            score += 10;
+            score += resolved.scores.description;
         if (!candidate.isFork)
-            score += 5;
-        score += Math.min(10, candidate.stars / 100);
+            score += resolved.scores.forkBonus;
+        score += Math.min(resolved.starCap, candidate.stars / resolved.starDivisor);
         return { candidate, score };
     })
         .sort((a, b) => b.score - a.score || a.candidate.fullName.localeCompare(b.candidate.fullName));
     return scored.map((entry) => entry.candidate);
 }
-async function ghJson(runner, gh, args) {
-    const result = await runner(gh, args, { timeoutMs: 60_000 });
+async function ghJson(runner, gh, args, timeoutMs) {
+    const result = await runner(gh, args, { timeoutMs });
     if (!result.ok)
         return null;
     try {
@@ -72,16 +145,25 @@ async function ghJson(runner, gh, args) {
         return null;
     }
 }
-export async function githubLogin(gh = "gh", runner = runCommand) {
-    const result = await runner(gh, ["api", "user", "--jq", ".login"], { timeoutMs: 60_000 });
+export async function githubLogin(gh = "gh", runner = runCommand, timeoutMs) {
+    const result = await runner(gh, ["api", "user", "--jq", ".login"], {
+        timeoutMs: requireTimeoutMs(timeoutMs, "discover timeout")
+    });
     if (!result.ok || !result.stdout.trim())
         throw new Error("Could not determine the authenticated GitHub user. Run `gh auth login`.");
     return result.stdout.trim();
 }
+function requireTimeoutMs(value, what) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`${what} is required (pass discover policy timeouts; run \`auto-work migrate\`)`);
+    }
+    return value;
+}
 export async function searchRepos(slug, options = {}) {
     const gh = options.gh ?? "gh";
     const runner = options.runner ?? runCommand;
-    const limit = options.limit ?? 30;
+    const resolved = resolveDiscoverPolicy(options.policy);
+    const limit = options.limit ?? resolved.searchLimit;
     const result = await runner(gh, [
         "search",
         "repos",
@@ -90,7 +172,7 @@ export async function searchRepos(slug, options = {}) {
         String(limit),
         "--json",
         "fullName,url,description,isFork,isArchived,stargazersCount,updatedAt"
-    ], { timeoutMs: 60_000 });
+    ], { timeoutMs: resolved.timeouts.searchMs });
     if (!result.ok)
         return [];
     try {
@@ -112,8 +194,8 @@ export async function searchRepos(slug, options = {}) {
         return [];
     }
 }
-export async function repoInfo(fullName, gh = "gh", runner = runCommand) {
-    const data = await ghJson(runner, gh, ["api", `repos/${fullName}`]);
+export async function repoInfo(fullName, gh = "gh", runner = runCommand, timeoutMs) {
+    const data = await ghJson(runner, gh, ["api", `repos/${fullName}`], requireTimeoutMs(timeoutMs, "discover api timeout"));
     if (!data)
         return null;
     return {
@@ -126,21 +208,22 @@ export async function repoInfo(fullName, gh = "gh", runner = runCommand) {
         archived: data.archived === true
     };
 }
-export async function listBranches(fullName, gh = "gh", runner = runCommand) {
+export async function listBranches(fullName, gh = "gh", runner = runCommand, timeoutMs) {
     const result = await runner(gh, ["api", `repos/${fullName}/branches`, "--paginate", "--jq", ".[].name"], {
-        timeoutMs: 60_000
+        timeoutMs: requireTimeoutMs(timeoutMs, "discover api timeout")
     });
     if (!result.ok)
         return [];
     return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
-export async function gitProtocol(gh = "gh", runner = runCommand) {
+export async function gitProtocol(gh = "gh", runner = runCommand, timeoutMs) {
+    const timeout = requireTimeoutMs(timeoutMs, "discover protocol timeout");
     const attempts = [
         ["config", "get", "git_protocol", "-h", "github.com"],
         ["config", "get", "git_protocol"]
     ];
     for (const args of attempts) {
-        const result = await runner(gh, args, { timeoutMs: 20_000 });
+        const result = await runner(gh, args, { timeoutMs: timeout });
         const value = result.ok ? result.stdout.trim() : "";
         if (value)
             return value === "ssh" ? "ssh" : "https";
@@ -155,12 +238,13 @@ export function pickCloneUrl(info, protocol = "https") {
 export async function ensureFork(options) {
     const gh = options.gh ?? "gh";
     const runner = options.runner ?? runCommand;
+    const resolved = resolveDiscoverPolicy(options.policy);
     const upstreamOwner = options.upstream.split("/")[0] ?? "";
     const name = repoName(options.upstream);
-    const protocol = await gitProtocol(gh, runner);
+    const protocol = await gitProtocol(gh, runner, resolved.timeouts.protocolMs);
     const owner = options.org || options.user;
     if (upstreamOwner.toLowerCase() === owner.toLowerCase()) {
-        const info = await repoInfo(options.upstream, gh, runner);
+        const info = await repoInfo(options.upstream, gh, runner, resolved.timeouts.apiMs);
         return {
             forkOwner: owner,
             forkRepo: options.upstream,
@@ -172,7 +256,7 @@ export async function ensureFork(options) {
         };
     }
     const forkFullName = `${owner}/${name}`;
-    let info = await repoInfo(forkFullName, gh, runner);
+    let info = await repoInfo(forkFullName, gh, runner, resolved.timeouts.apiMs);
     if (info) {
         return {
             forkOwner: owner,
@@ -199,13 +283,13 @@ export async function ensureFork(options) {
     if (options.org)
         forkArgs.push("--org", options.org);
     const created = await runner(gh, forkArgs, {
-        timeoutMs: 180_000
+        timeoutMs: resolved.timeouts.forkMs
     });
     if (!created.ok)
         throw new Error(created.stderr || created.stdout || "gh repo fork failed");
-    for (let attempt = 0; attempt < 5 && !info; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        info = await repoInfo(forkFullName, gh, runner);
+    for (let attempt = 0; attempt < resolved.timeouts.forkAttempts && !info; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, resolved.timeouts.forkRetryMs));
+        info = await repoInfo(forkFullName, gh, runner, resolved.timeouts.apiMs);
     }
     if (!info)
         throw new Error(`Fork ${forkFullName} was created but cannot be read yet. Run the command again in a moment.`);
@@ -219,17 +303,23 @@ export async function ensureFork(options) {
         needsFork: false
     };
 }
-export function detectedStackAt(dir) {
-    if (existsSync(path.join(dir, "pubspec.yaml")))
-        return "flutter";
-    if (existsSync(path.join(dir, "package.json")))
-        return "node";
-    if (existsSync(path.join(dir, "pyproject.toml")))
-        return "python";
-    if (existsSync(path.join(dir, "go.mod")))
-        return "go";
-    if (existsSync(path.join(dir, "Cargo.toml")))
-        return "rust";
+export function detectedStackAt(dir, stackMap) {
+    const map = stackMap ?? {};
+    for (const [file, stack] of Object.entries(map)) {
+        if (typeof stack !== "string" || !stack) {
+            throw new Error("discover.stackMap values must be non-empty strings (run `auto-work migrate`)");
+        }
+        if (existsSync(path.join(dir, file)))
+            return stack;
+    }
+    if (!Object.keys(map).length) {
+        throw new Error("discover.stackMap is required (run `auto-work migrate`)");
+    }
     return "generic";
+}
+/** Stack → platform via policy (e.g. flutter → desktop, default web). */
+export function stackPlatform(stack, policy) {
+    const resolved = resolveDiscoverPolicy(policy);
+    return resolved.stackPlatform[stack] ?? resolved.stackPlatformDefault;
 }
 //# sourceMappingURL=discover.js.map

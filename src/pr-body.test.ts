@@ -23,7 +23,8 @@ function profile(templateFile: string): ProfileConfig {
     checks: [],
     platformMatch: { keywords: ["desktop"] },
     prompts: { dir: "prompts/generic" },
-    pr: { templateFile, teamLead: "@lead" },
+    pr: { templateFile, teamLead: "@lead", maxBodyChars: 60000 },
+    safety: { protectedFiles: [".env"], secretPatterns: ["ZIKI_KEY"] },
     urls: {
       envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
       issuePath: "/{org?}/{project}/{issue}",
