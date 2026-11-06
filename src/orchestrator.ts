@@ -4913,6 +4913,17 @@ async function runCycle(ctx: Context): Promise<{
 
   const feedResult = await fetchMergedFeed(ctx);
   await recordFeedHealth(ctx, feedResult.failures);
+  // Warning-level repair (e.g. renamed Ziki categories, dead feed routes):
+  // diagnose + escalate without parking the loop. Runs EVERY cycle, with or
+  // without a feed — a dead feed is itself the failure most in need of
+  // diagnosis, and returning before this call was a deterministic bypass that
+  // parked the loop without ever consulting the agent. Failures here must
+  // never break the cycle.
+  await repairWarningLoop(ctx).catch((error) => {
+    ctx.logger.warn(
+      `Warning-level repair failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  });
   if (!feedResult.feed) {
     ctx.logger.warn("No work feed available this cycle");
     ctx.state.lastCycleMs = Date.now() - started;
@@ -4933,13 +4944,6 @@ async function runCycle(ctx: Context): Promise<{
   // Flush anything queued while the loop was blocked before building the queue.
   await flushOutboxPass(ctx).catch((error) => {
     ctx.logger.warn(`Outbox flush failed: ${error instanceof Error ? error.message : String(error)}`);
-  });
-  // Warning-level repair (e.g. renamed Ziki categories): diagnose + escalate
-  // without parking the loop. Failures here must never break the cycle.
-  await repairWarningLoop(ctx).catch((error) => {
-    ctx.logger.warn(
-      `Warning-level repair failed: ${error instanceof Error ? error.message : String(error)}`
-    );
   });
   const platformNumbers = new Set(ctx.platform.issues.map((issue) => issue.number));
   const platformIdeaNumbers = new Set(ctx.platform.ideas.map((idea) => idea.number));
