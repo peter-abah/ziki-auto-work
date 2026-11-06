@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, deepMerge, defaultConfig, resolveModel, validateConfig } from "./config.js";
+import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, deepMerge, defaultConfig, resolveModel, validateConfig, validateConfigPatch } from "./config.js";
+import { repairConfigFor } from "./config-repair.js";
+import { DEFAULT_ENDPOINTS } from "./ziki-endpoints.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { parseTestFailures, protectedFiles, scanSecrets } from "./checks.js";
@@ -361,5 +363,40 @@ test("validateConfig rejects malformed repair strategies", () => {
     const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
     assert.equal(result.ok, false);
     assert.ok(result.errors.length >= 3, result.errors.join("; "));
+});
+test("defaultConfig ships a usable endpoint registry", () => {
+    const config = defaultConfig();
+    assert.ok(config.defaults);
+    const endpoints = config.defaults.ziki.endpoints;
+    assert.equal(endpoints.issues?.list, "/api/v1/issues");
+    assert.equal(endpoints.work?.feed, "/{org?}/{project}/work");
+    assert.ok(Object.keys(DEFAULT_ENDPOINTS).length > 5);
+});
+test("validateConfig rejects absolute endpoint URLs", () => {
+    const profile = fixtureProfile({
+        ziki: { ...fixtureProfile().ziki, endpoints: { issues: { list: "https://evil.test/x" } } }
+    });
+    const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((error) => error.includes("scheme or host")));
+});
+test("validateConfigPatch accepts endpoint, vars and orgSlug ops", () => {
+    const profile = fixtureProfile();
+    const repair = repairConfigFor(profile);
+    const check = validateConfigPatch(profile, [
+        { path: "ziki.endpoints.issues.list", value: "/api/v2/issues", reason: "v2" },
+        { path: "ziki.vars.team", value: "t1", reason: "new var" },
+        { path: "ziki.orgSlug", value: "zedu", reason: "org" }
+    ], repair);
+    assert.deepEqual(check.errors, []);
+    assert.equal(check.ok, true);
+});
+test("validateConfigPatch rejects unknown template vars and protected paths", () => {
+    const profile = fixtureProfile();
+    const repair = repairConfigFor(profile);
+    const bad = validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.list", value: "/api/v1/{nope}/issues" }], repair);
+    assert.equal(bad.ok, false);
+    const secret = validateConfigPatch(profile, [{ path: "ziki.apiKey", value: "x" }], repair);
+    assert.equal(secret.ok, false);
 });
 //# sourceMappingURL=config.test.js.map

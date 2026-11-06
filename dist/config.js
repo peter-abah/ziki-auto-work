@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
 import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
 import { PROVIDER_IDS } from "./providers/index.js";
+import { BUILTIN_IDENTITY_VARS, DEFAULT_ENDPOINTS, validateEndpointVars, validateEndpoints } from "./ziki-endpoints.js";
 export const PROVIDERS = PROVIDER_IDS;
 export const DEFAULT_LIMITS = {
     maxActiveClaims: "auto",
@@ -61,17 +62,21 @@ export const DEFAULT_ENV_FILES = [".env", ".env.local"];
 export const DEFAULT_REPAIR_MUTABLE_PATHS = [
     "ziki.projectId",
     "ziki.projectSlug",
+    "ziki.orgSlug",
     "ziki.platform",
     "ziki.platformCategoryId",
     "ziki.platformFilter",
+    "ziki.vars.*",
+    "ziki.endpoints.*",
     "pollSeconds",
     "memoryRefreshMinutes",
     "discovery.enabled",
     "discovery.maxIdeasPerRun"
 ];
-export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = ["ziki.platformFilter"];
+export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = ["ziki.platformFilter", "ziki.orgSlug"];
 export const DEFAULT_REPAIR_STRATEGIES = {
     "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
+    "feed:unexpected_response_shape": { enabled: true, role: "configDoctor", maxRounds: 3 },
     "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 }
 };
 const NEVER_MUTABLE_PATTERNS = [
@@ -134,6 +139,12 @@ export function validateConfigPatch(profile, ops, repair) {
     }
     const mutablePaths = repair?.mutablePaths ?? DEFAULT_REPAIR_MUTABLE_PATHS;
     const allowNewKeys = repair?.allowNewKeys ?? DEFAULT_REPAIR_ALLOW_NEW_KEYS;
+    const knownVars = [
+        ...BUILTIN_IDENTITY_VARS,
+        "project",
+        "org",
+        ...Object.keys(profile.ziki?.vars ?? {})
+    ];
     for (const [index, op] of ops.entries()) {
         const label = `ops[${index}]`;
         if (!op || typeof op !== "object" || typeof op.path !== "string" || !op.path.trim()) {
@@ -150,7 +161,16 @@ export function validateConfigPatch(profile, ops, repair) {
             continue;
         }
         const existing = getConfigPath(profile, opPath);
-        if (existing === undefined && !allowNewKeys.includes(opPath)) {
+        // Overriding a known registry endpoint needs no new-key permission: the
+        // default registry is the source of truth and the fallback is identical.
+        let isKnownEndpoint = false;
+        if (opPath === "ziki.endpoints" || opPath.startsWith("ziki.endpoints.")) {
+            const parts = opPath === "ziki.endpoints" ? [] : opPath.slice("ziki.endpoints.".length).split(".");
+            const group = DEFAULT_ENDPOINTS[parts[0]];
+            isKnownEndpoint = parts.length === 0 || (!!group && (parts.length === 1 || parts.slice(1).join(".") in group));
+        }
+        const isNewVarsKey = opPath.startsWith("ziki.vars.") && existing === undefined;
+        if (existing === undefined && !allowNewKeys.includes(opPath) && !isNewVarsKey && !isKnownEndpoint) {
             errors.push(`${label} creates a new key not in repair.allowNewKeys: ${opPath}`);
             continue;
         }
@@ -161,6 +181,15 @@ export function validateConfigPatch(profile, ops, repair) {
                 errors.push(`${label} changes the type of ${opPath} from ${expected} to ${actual}`);
             }
         }
+        if (opPath === "ziki.vars" || opPath.startsWith("ziki.vars.")) {
+            const varsErrors = validateEndpointVars(opPath === "ziki.vars" ? op.value : { [opPath.slice("ziki.vars.".length)]: op.value }, label);
+            errors.push(...varsErrors);
+        }
+        if (opPath === "ziki.endpoints" || opPath.startsWith("ziki.endpoints.")) {
+            const single = opPath === "ziki.endpoints" ? op.value : nestEndpointPath(opPath, op.value);
+            errors.push(...validateEndpoints(single, knownVars, label));
+            continue;
+        }
         try {
             JSON.stringify(op.value);
         }
@@ -169,6 +198,19 @@ export function validateConfigPatch(profile, ops, repair) {
         }
     }
     return { ok: errors.length === 0, errors };
+}
+/** Nest a dotted endpoints op (`ziki.endpoints.issues.list`) back into object form for validation. */
+function nestEndpointPath(opPath, value) {
+    const parts = opPath.slice("ziki.endpoints.".length).split(".");
+    const root = {};
+    let current = root;
+    for (let index = 0; index < parts.length - 1; index += 1) {
+        const next = {};
+        current[parts[index]] = next;
+        current = next;
+    }
+    current[parts[parts.length - 1]] = value;
+    return root;
 }
 export function defaultConfig() {
     return {
@@ -192,6 +234,10 @@ export function defaultConfig() {
             prompts: { dir: "prompts/generic" },
             pr: { templateFile: "prompts/generic/pr.md" },
             prTracking: { ...DEFAULT_PR_TRACKING },
+            ziki: {
+                endpoints: JSON.parse(JSON.stringify(DEFAULT_ENDPOINTS)),
+                vars: {}
+            },
             repair: {
                 enabled: true,
                 mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS],
@@ -340,6 +386,15 @@ export function validateConfig(config) {
         requireString(profile?.ziki?.projectId, `${prefix}.ziki.projectId`, errors);
         requireString(profile?.ziki?.projectSlug, `${prefix}.ziki.projectSlug`, errors);
         requireString(profile?.ziki?.platform, `${prefix}.ziki.platform`, errors);
+        if (profile?.ziki?.orgSlug !== undefined && (typeof profile.ziki.orgSlug !== "string" || !profile.ziki.orgSlug.trim())) {
+            errors.push(`${prefix}.ziki.orgSlug must be a non-empty string when set`);
+        }
+        errors.push(...validateEndpointVars(profile?.ziki?.vars, `${prefix}.ziki.vars`), ...validateEndpoints(profile?.ziki?.endpoints, [
+            ...BUILTIN_IDENTITY_VARS,
+            "project",
+            "org",
+            ...Object.keys(profile?.ziki?.vars ?? {})
+        ], `${prefix}.ziki.endpoints`));
         requireString(profile?.repo?.url, `${prefix}.repo.url`, errors);
         requireString(profile?.repo?.upstream, `${prefix}.repo.upstream`, errors);
         requireString(profile?.repo?.base, `${prefix}.repo.base`, errors);

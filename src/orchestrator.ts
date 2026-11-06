@@ -36,6 +36,7 @@ import {
   validateConfigPatch
 } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
+import { runCommand } from "./platform/spawn.js";
 import type { Logger } from "./log.js";
 import {
   acquireLock,
@@ -102,6 +103,7 @@ import { PACKAGE_ROOT, profilePaths, paths, safeName } from "./platform/paths.js
 import { escalationUrl, inboxUrl, issueUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
 import { isTransientNetworkError } from "./network.js";
+import { flushOutbox, outboxDepth, queueOutbox } from "./outbox.js";
 import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js";
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
@@ -116,9 +118,9 @@ import {
   isProjectNotFoundBlocker,
   latestStrategyEscalation,
   maxRoundsFor,
-  projectRotationPatch,
   repairConfigFor,
-  strategyFor
+  strategyFor,
+  supersedingPaths
 } from "./config-repair.js";
 import { APPROVAL_WORD } from "./hitl.js";
 import { cyclesThisRun, limitReached, remainingCycles } from "./run-limits.js";
@@ -843,6 +845,231 @@ async function maybeReloadConfig(ctx: Context, force = false): Promise<boolean> 
  * and persistence both happen here, and persistence happens only after a
  * human approval — via Ziki escalation reply or `auto-work approve`.
  */
+/** One wedged retry of the whole outbox is enough per cycle; the rest waits. */
+const OUTBOX_FLUSH_PER_CYCLE = 5;
+
+/**
+ * Flush queued Ziki writes FIFO once the loop is healthy again. Runs on the
+ * normal cycle path only (never while blocked). Never throws: failures stay
+ * queued for the next cycle, exhaustions move to outbox.failed with history.
+ */
+async function flushOutboxPass(ctx: Context): Promise<void> {
+  if (!ctx.state.outbox?.items.length) return;
+  if (ctx.dryRun) {
+    ctx.logger.info(`Dry run: would flush ${ctx.state.outbox.items.length} queued write(s)`, {
+      kinds: ctx.state.outbox.items.map((entry) => entry.kind)
+    });
+    return;
+  }
+  const knownIdeaTitles = new Set((ctx.platform.ideas ?? []).map((idea) => idea.title));
+  const result = await flushOutbox(ctx.state, ctx.primary.client, {
+    maxPerFlush: OUTBOX_FLUSH_PER_CYCLE,
+    knownIdeaTitles,
+    logger: ctx.logger,
+    onEvent: (event) => {
+      if (event.type === "flushed") {
+        counter(ctx).aux += 1;
+        history(ctx, {
+          type: "outbox",
+          detail: `flushed queued ${event.entry.kind}${event.entry.issueNumber ? ` #${event.entry.issueNumber}` : ""}${event.entry.title ? ` (${event.entry.title})` : ""}`.slice(0, 200),
+          data: { kind: event.entry.kind, id: event.entry.id }
+        });
+      } else if (event.type === "skipped-duplicate") {
+        history(ctx, {
+          type: "outbox",
+          detail: `skipped duplicate queued idea: ${event.entry.title ?? event.entry.id}`,
+          data: { kind: event.entry.kind, id: event.entry.id }
+        });
+      } else if (event.type === "dropped") {
+        history(ctx, {
+          type: "outbox",
+          detail: `dropped queued ${event.entry.kind} after repeated failures: ${event.error ?? "unknown error"}`,
+          data: { kind: event.entry.kind, id: event.entry.id }
+        });
+      }
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`Outbox flush failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  });
+  if (!result) return;
+  if (result.flushed || result.skipped) {
+    ctx.logger.info(`Outbox flush: ${result.flushed} applied, ${result.skipped} skipped as duplicates, ${result.pending} pending`);
+  }
+  await save(ctx).catch(() => {});
+}
+
+/** PR watch while the loop is blocked: GitHub reads only, local bookkeeping, no Ziki or Git writes. */
+const OFFLINE_WATCH_INTERVAL_MS = 15 * 60_000;
+const OFFLINE_WATCH_MAX_PRS = 5;
+const OFFLINE_WATCH_FRESH_MS = 30 * 60_000;
+
+async function offlineWatchPass(ctx: Context): Promise<void> {
+  const now = Date.now();
+  const last = ctx.state.lastOfflineWatchAt ? new Date(ctx.state.lastOfflineWatchAt).getTime() : 0;
+  if (now - last < OFFLINE_WATCH_INTERVAL_MS) return;
+  ctx.state.lastOfflineWatchAt = new Date().toISOString();
+  const candidates = Object.values(ctx.state.tasks)
+    .filter((task) => task.prUrl && !["done", "failed", "skipped"].includes(task.status))
+    .slice(0, OFFLINE_WATCH_MAX_PRS);
+  for (const task of candidates) {
+    try {
+      if (task.prLastCheckedAt && now - new Date(task.prLastCheckedAt).getTime() < OFFLINE_WATCH_FRESH_MS) continue;
+      const status = await ctx.github.prStatus(task.prUrl!);
+      const changed =
+        task.prState !== status.state ||
+        task.prChecks !== status.checks ||
+        task.prMergeable !== status.mergeable ||
+        task.prReviewDecision !== status.reviewDecision;
+      task.prState = status.state;
+      task.prChecks = status.checks;
+      task.prMergeable = status.mergeable;
+      task.prReviewDecision = status.reviewDecision;
+      task.prLastCheckedAt = new Date().toISOString();
+      if (changed) {
+        history(ctx, {
+          type: "health",
+          detail: `offline PR watch: ${task.prUrl} → ${status.state}/${status.checks}`,
+          data: { pr: task.prUrl, state: status.state, checks: status.checks, number: task.number }
+        });
+        ctx.logger.info(`Offline PR watch: ${task.prUrl} is now ${status.state}/${status.checks}`);
+      }
+    } catch (error) {
+      ctx.logger.warn(
+        `Offline PR watch failed for ${task.prUrl}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+}
+
+/**
+ * Repo health checks while blocked: run the configured non-mutating checks in
+ * the repo clone, record results locally. Mutating checks (format-style) are
+ * skipped — nothing may dirty the working tree outside an agent worktree.
+ * Failures surface as a *warning* health item (visible in NEEDS-HUMAN), never
+ * a blocker.
+ */
+const REPO_HEALTH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+async function repoHealthPass(ctx: Context): Promise<void> {
+  if (!ctx.repoReady) return;
+  const now = Date.now();
+  const last = ctx.state.lastRepoHealthAt ? new Date(ctx.state.lastRepoHealthAt).getTime() : 0;
+  if (now - last < REPO_HEALTH_INTERVAL_MS) return;
+  ctx.state.lastRepoHealthAt = new Date().toISOString();
+  const repoDir = path.join(ctx.profilePaths.reposDir, "repo");
+  const results: Array<{ name: string; ok?: boolean; skipped?: string }> = [];
+  for (const check of ctx.profile.checks ?? []) {
+    const cmdline = `${check.command} ${check.args.join(" ")}`;
+    if (/format/i.test(cmdline)) {
+      results.push({ name: check.name, skipped: "mutating check skipped outside agent worktrees" });
+      continue;
+    }
+    try {
+      const result = await runCommand(check.command, check.args, {
+        cwd: repoDir,
+        timeoutMs: check.timeoutMs ?? 10 * 60_000
+      });
+      results.push({ name: check.name, ok: result.ok });
+      if (!result.ok) {
+        ctx.logger.warn(`Repo health check failed: ${check.name}`, {
+          tail: truncate(`${result.stdout}\n${result.stderr}`.trim(), 1000)
+        });
+      }
+    } catch (error) {
+      results.push({ name: check.name, ok: false });
+      ctx.logger.warn(
+        `Repo health check errored: ${check.name}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  const failing = results.filter((result) => result.ok === false).map((result) => result.name);
+  history(ctx, {
+    type: "health",
+    detail: failing.length
+      ? `offline repo health: FAILING (${failing.join(", ")})`
+      : "offline repo health: all runnable checks pass",
+    data: { results: results.map((result) => ({ name: result.name, ok: result.ok ?? null })) }
+  });
+  if (failing.length) {
+    await applyHealth(ctx, {
+      component: "repo",
+      code: "checks_failing",
+      severity: "warning",
+      message: `Repo checks failing while blocked: ${failing.join(", ")}`,
+      retryMs: REPO_HEALTH_INTERVAL_MS
+    });
+  } else {
+    await clearHealth(ctx, "repo");
+  }
+}
+
+/** Parked-loop bookkeeping: PR watch + repo health, then stay blocked. Never throws. */
+async function parkBlocked(ctx: Context): Promise<{ blocked: true }> {
+  setPhase(ctx, "blocked");
+  try {
+    await offlineWatchPass(ctx);
+  } catch (error) {
+    ctx.logger.warn(
+      `Offline watch failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  try {
+    await repoHealthPass(ctx);
+  } catch (error) {
+    ctx.logger.warn(
+      `Repo health check failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  await save(ctx).catch(() => {});
+  return { blocked: true };
+}
+
+/**
+ * Adopt a bootstrap escalation filed while the config was broken: track it in
+ * state so the normal poll() reaps the human's answer. No strategy attached —
+ * decisions on it are informational only (nothing auto-applies without a
+ * validated configPatch, which bootstrap never creates).
+ */
+async function adoptBootstrapEscalation(
+  state: State,
+  profileName: string,
+  logger: Logger
+): Promise<void> {
+  const { bootstrapFile } = await import("./bootstrap.js");
+  let record: { escalationId?: unknown; reason?: unknown; escalationAnswer?: unknown } | null = null;
+  try {
+    const raw = await readFile(bootstrapFile(profileName), "utf8");
+    record = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  const id = typeof record?.escalationId === "string" && record.escalationId ? record.escalationId : null;
+  if (!id || state.escalations[id]) return;
+  state.escalations[id] = {
+    id,
+    issueId: null,
+    issueNumber: null,
+    issueTitle: null,
+    type: "human_approval",
+    body: `Startup needed help: ${typeof record?.reason === "string" ? record.reason.slice(0, 500) : "config missing or invalid"}`,
+    agentName: "bootstrap",
+    createdAt: new Date().toISOString(),
+    status: "open",
+    answer: typeof record?.escalationAnswer === "string" ? record.escalationAnswer : null,
+    resolvedAt: null,
+    kind: "config",
+    strategy: "bootstrap",
+    configPatch: null,
+    decision: null,
+    rounds: 1,
+    remoteStatus: "open",
+    appliedAt: null,
+    previousId: null
+  };
+  logger.info(`Adopted bootstrap escalation ${id} for answer tracking`);
+}
+
 async function repairBlockedLoop(
   ctx: Context,
   code: string,
@@ -923,6 +1150,27 @@ async function runRepairStateMachine(
         return "wait";
       }
       return startRepairRound(ctx, code, blocker, strategy, existing);
+    }
+    // Open, awaiting the first answer. Re-diagnose: if the fresh diagnosis
+    // covers strictly more than the pending proposal (e.g. a project-ID fix
+    // now needs slugs too), supersede the stale escalation instead of
+    // waiting on an incomplete fix. Monotonic growth guarantees termination.
+    const fresh = await diagnoseForCode(ctx, code, blocker).catch(() => null);
+    const extra = fresh && !fresh.done ? supersedingPaths(existing.configPatch, fresh.ops) : null;
+    if (fresh && extra) {
+      markEscalationExpired(ctx.state, existing.id, `superseded by a deeper diagnosis (${extra.join(", ")})`);
+      history(ctx, {
+        type: "health",
+        detail: `config repair superseded with a deeper patch: ${code}`,
+        data: { previous: existing.id }
+      });
+      await save(ctx).catch(() => {});
+      return startRepairRound(ctx, code, blocker, strategy, existing, {
+        evidence: fresh.evidence,
+        ops: fresh.ops,
+        summary: fresh.summary,
+        done: null
+      });
     }
     await save(ctx).catch(() => {});
     return "wait";
@@ -1049,22 +1297,21 @@ async function applyApprovedRepair(
   return "continue";
 }
 
-/** One proposal round: deterministic diagnosis as evidence + agent proposal + escalation. */
-async function startRepairRound(
+/**
+ * Deterministic diagnosis for a repair code: live reads only, no agent.
+ * Returns ops to propose plus a done flag when the diagnosis itself resolves
+ * the cycle (repair applied inline) or finds nothing actionable.
+ */
+async function diagnoseForCode(
   ctx: Context,
   code: string,
-  blocker: HealthBlocker,
-  strategy: RepairStrategyConfig,
-  previous: EscalationRecord | null
-): Promise<"wait" | "continue"> {
-  const repair = repairConfigFor(ctx.profile);
-  const maxRounds = maxRoundsFor(strategy);
-  const round = (previous?.rounds ?? 0) + 1;
+  blocker: HealthBlocker
+): Promise<{ evidence: string[]; ops: ConfigPatchOp[]; summary: string; done: "wait" | "continue" | null }> {
   const evidence: string[] = [
     `${code} — ${blocker.message} (attempts: ${blocker.attempts ?? "?"}, since: ${blocker.since ?? blocker.lastAttemptAt ?? "?"})`
   ];
-  let deterministicOps: ConfigPatchOp[] = [];
-  let deterministicSummary = "";
+  let ops: ConfigPatchOp[] = [];
+  let summary = "";
   const shortCode = code.includes(":") ? code.split(":").slice(1).join(":") : code;
   if (shortCode === "not_found" && code === "platform:not_found") {
     try {
@@ -1072,16 +1319,33 @@ async function startRepairRound(
       evidence.push(
         `tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`
       );
-      if (diagnosis.match) {
-        deterministicOps = projectRotationPatch(diagnosis.match.project, diagnosis.match.reason);
-        deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone on Ziki; matched replacement ${diagnosis.match.project.slug} (${diagnosis.match.reason}).`;
-      } else if (diagnosis.ambiguous?.length) {
-        deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone; ${diagnosis.ambiguous.length} candidates need a human pick — no automatic proposal.`;
-      } else {
-        deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone; no tenant project matches platform "${ctx.profile.ziki.platform}".`;
-      }
+      ops = diagnosis.ops;
+      summary = diagnosis.detail;
     } catch (error) {
-      deterministicSummary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+      summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  } else if (code === "feed:unexpected_response_shape") {
+    try {
+      const diagnosis = await diagnoseProjectMismatch(ctx.primary.client, ctx.profile, ctx.logger);
+      evidence.push(
+        `tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`
+      );
+      if (!diagnosis.ops.length) {
+        ctx.logger.warn(
+          `Feed shape check failed but project identity matches; leaving the warning up for investigation: ${code}`
+        );
+        history(ctx, {
+          type: "health",
+          detail: `feed shape failure with matching identity (no automatic fix): ${code}`,
+          data: {}
+        });
+        await save(ctx).catch(() => {});
+        return { evidence, ops, summary, done: "wait" };
+      }
+      ops = diagnosis.ops;
+      summary = `Work feed is unreachable in its expected shape; ${diagnosis.detail}`;
+    } catch (error) {
+      summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
     }
   } else if (shortCode === "unknown_filter") {
     try {
@@ -1094,16 +1358,36 @@ async function startRepairRound(
         ctx.logger.info(`Platform filter "${diagnosis.current}" resolves again; clearing ${code}`);
         history(ctx, { type: "health", detail: `config warning cleared: ${code}`, data: {} });
         await save(ctx).catch(() => {});
-        return "continue";
+        return { evidence, ops, summary, done: "continue" };
       }
-      deterministicOps = diagnosis.suggested;
-      deterministicSummary = diagnosis.reason;
+      ops = diagnosis.suggested;
+      summary = diagnosis.reason;
     } catch (error) {
-      deterministicSummary = `Platform list lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+      summary = `Platform list lookup failed: ${error instanceof Error ? error.message : String(error)}`;
     }
   } else {
-    deterministicSummary = `No deterministic diagnosis for ${code}; relying on the agent proposal.`;
+    summary = `No deterministic diagnosis for ${code}; relying on the agent proposal.`;
   }
+  return { evidence, ops, summary, done: null };
+}
+
+/** One proposal round: deterministic diagnosis as evidence + agent proposal + escalation. */
+async function startRepairRound(
+  ctx: Context,
+  code: string,
+  blocker: HealthBlocker,
+  strategy: RepairStrategyConfig,
+  previous: EscalationRecord | null,
+  precomputed?: Awaited<ReturnType<typeof diagnoseForCode>>
+): Promise<"wait" | "continue"> {
+  const repair = repairConfigFor(ctx.profile);
+  const maxRounds = maxRoundsFor(strategy);
+  const round = (previous?.rounds ?? 0) + 1;
+  const diagnosed = precomputed ?? (await diagnoseForCode(ctx, code, blocker));
+  if (diagnosed.done === "continue") return "continue";
+  if (diagnosed.done === "wait") return "wait";
+  const { evidence, summary: deterministicSummary } = diagnosed;
+  let deterministicOps = diagnosed.ops;
 
   if (ctx.dryRun) {
     ctx.logger.info(`Dry run: config-repair round ${round}/${maxRounds} for ${code} (no agent, no escalation)`, {
@@ -1160,7 +1444,9 @@ async function startRepairRound(
     previousId: previous?.id ?? null,
     rounds: round,
     body,
-    agentName: "config-doctor"
+    // Attribute to the posting agent identity so hitl.poll() resolves the
+    // right client for answers — never a synthetic role name.
+    agentName: ctx.primary.name
   });
   if (!escalated.ok) {
     ctx.logger.warn(`Config-repair escalation failed: ${escalated.error ?? "unknown error"}`);
@@ -3913,6 +4199,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
   const filed: string[] = [];
   const skipped: string[] = [];
   const failed: Array<{ title: string; error: string }> = [];
+  const queued: string[] = [];
   for (const idea of ideas) {
     if (!idea?.title || !idea?.description) continue;
     const baseInput = {
@@ -3923,10 +4210,16 @@ async function discoveryPass(ctx: Context): Promise<void> {
       acknowledgeSimilar: false
     };
     const vetted = ctx.profile.discovery.alreadyVetted === true && Boolean(ctx.profile.discovery.vettedNote);
+    const queueForLater = (body: Record<string, unknown>, error: string): void => {
+      queueOutbox(ctx.state, { kind: "createIdea", body, title: idea.title });
+      queued.push(idea.title);
+      ctx.logger.warn(`Could not file idea "${idea.title}" now; queued in outbox: ${error}`);
+    };
     try {
-      const created = await ctx.primary.client.createIdea(
-        vetted ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote } : baseInput
-      );
+      const input = vetted
+        ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote }
+        : baseInput;
+      const created = await ctx.primary.client.createIdea(input);
       const createdIdea = normalizeIdea(created);
       counter(ctx).discoveries += 1;
       ctx.state.run.discoveries += 1;
@@ -3952,31 +4245,36 @@ async function discoveryPass(ctx: Context): Promise<void> {
           ctx.state.run.discoveries += 1;
           filed.push(idea.title);
           ctx.logger.info(`Filed idea #${createdIdea?.number ?? "?"}: ${idea.title}`);
-        } catch (retryError) {
-          const retryStatus = (retryError as { status?: number }).status;
-          const message = retryError instanceof Error ? retryError.message : String(retryError);
-          if (retryStatus === 409) {
-            ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
-            skipped.push(idea.title);
-          } else {
-            ctx.logger.warn(`Could not file idea "${idea.title}": ${message}`);
-            failed.push({ title: idea.title, error: message });
-          }
+      } catch (retryError) {
+        const retryStatus = (retryError as { status?: number }).status;
+        const message = retryError instanceof Error ? retryError.message : String(retryError);
+        if (retryStatus === 409) {
+          ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
+          skipped.push(idea.title);
+        } else {
+          queueForLater(baseInput, message);
         }
+      }
       } else {
         const message = error instanceof Error ? error.message : String(error);
-        ctx.logger.warn(`Could not file idea "${idea.title}": ${message}`);
-        failed.push({ title: idea.title, error: message });
+        queueForLater(
+          vetted ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote } : baseInput,
+          message
+        );
       }
     }
   }
   if (ideas.length) {
     history(ctx, {
       type: "discovery",
-      detail: `discovery: ${filed.length} filed, ${skipped.length} similar, ${failed.length} failed of ${ideas.length} proposed`,
-      data: { filed, skipped, failed: failed.map((entry) => entry.title) }
+      detail: `discovery: ${filed.length} filed, ${skipped.length} similar, ${queued.length} queued for filing, ${failed.length} failed of ${ideas.length} proposed`,
+      data: { filed, skipped, queued, failed: failed.map((entry) => entry.title) }
     });
-    await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${filed.length} of ${ideas.length} idea(s)`, [...filed.map((title) => `- ${title}`), ...failed.map((entry) => `- FAILED ${entry.title}: ${entry.error}`)].join("\n"), ctx.state, ctx.primary.name);
+    try {
+      await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${filed.length} of ${ideas.length} idea(s)${queued.length ? `, ${queued.length} queued for filing` : ""}`, [...filed.map((title) => `- ${title}`), ...queued.map((title) => `- QUEUED: ${title}`), ...failed.map((entry) => `- FAILED ${entry.title}: ${entry.error}`)].join("\n"), ctx.state, ctx.primary.name);
+    } catch (error) {
+      ctx.logger.warn(`Discovery note skipped (will retry with the queue): ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   await save(ctx);
 }
@@ -4177,13 +4475,9 @@ async function runCycle(ctx: Context): Promise<{
         );
         return "wait" as const;
       });
-      if (outcome === "wait") {
-        setPhase(ctx, "blocked");
-        return { blocked: true };
-      }
+      if (outcome === "wait") return parkBlocked(ctx);
     } else if (nextRetryDelay(ctx.state.health) !== null) {
-      setPhase(ctx, "blocked");
-      return { blocked: true };
+      return parkBlocked(ctx);
     }
   }
 
@@ -4233,6 +4527,10 @@ async function runCycle(ctx: Context): Promise<{
   }
 
   ctx.platform = await loadPlatformSets(ctx);
+  // Flush anything queued while the loop was blocked before building the queue.
+  await flushOutboxPass(ctx).catch((error) => {
+    ctx.logger.warn(`Outbox flush failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
   // Warning-level repair (e.g. renamed Ziki categories): diagnose + escalate
   // without parking the loop. Failures here must never break the cycle.
   await repairWarningLoop(ctx).catch((error) => {
@@ -4797,6 +5095,9 @@ export async function runLoop(options: {
   state.profile = loaded.profileName;
   state.startedAt ??= new Date().toISOString();
   state.stoppedAt = null;
+  await adoptBootstrapEscalation(state, loaded.profileName, logger).catch((error) => {
+    logger.warn(`Bootstrap adoption failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
   const stalePids = killStalePids(state, logger);
   for (const task of Object.values(state.tasks)) {
     if (task.status === "working") task.status = "queued";

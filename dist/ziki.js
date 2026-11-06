@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { contractKey, formatApiErrorDetails, recordRejected, repairApiBody, stripRejectedFields } from "./api-repair.js";
+import { DEFAULT_ENDPOINTS, endpointVars, renderEndpoint } from "./ziki-endpoints.js";
 export class ZikiError extends Error {
     status;
     body;
@@ -18,6 +19,26 @@ export class ZikiError extends Error {
 }
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/**
+ * Guard against silent shape changes: an HTML login page, a moved endpoint
+ * returning prose, or a restructured payload must fail loudly here instead of
+ * flowing downstream as an empty-but-valid result.
+ */
+function assertResponseShape(method, pathname, status, data, expect) {
+    const items = data?.items;
+    const ok = expect === "object"
+        ? typeof data === "object" && data !== null && !Array.isArray(data)
+        : Array.isArray(items) || Array.isArray(data);
+    if (ok)
+        return;
+    const preview = typeof data === "string" ? data.slice(0, 120) : JSON.stringify(data)?.slice(0, 120);
+    throw new ZikiError(`${method} ${pathname} failed: unexpected response shape (expected ${expect}, got ${preview || "empty"})`, {
+        status,
+        body: { error: "unexpected_response_shape", expected: expect, preview: preview ?? null },
+        method,
+        path: pathname
+    });
 }
 function retryAfterMs(response, attempt, maxMs = Infinity) {
     const retry = response.headers.get("retry-after");
@@ -59,6 +80,9 @@ export class ZikiClient {
     apiKey;
     projectId;
     projectSlug;
+    orgSlug;
+    vars;
+    endpoints;
     agentName;
     timeoutMs;
     contracts;
@@ -68,10 +92,37 @@ export class ZikiClient {
         this.apiKey = options.apiKey;
         this.projectId = options.projectId;
         this.projectSlug = options.projectSlug;
+        this.orgSlug = options.orgSlug ?? null;
+        this.vars = { ...(options.vars ?? {}) };
+        this.endpoints = options.endpoints ?? DEFAULT_ENDPOINTS;
         this.agentName = options.agentName ?? "agent";
         this.timeoutMs = options.timeoutMs ?? 60_000;
         this.contracts = options.contracts;
         this.repair = options.repair;
+    }
+    /**
+     * Resolve a configured endpoint template into a path, interpolating
+     * `{var}` placeholders from explicit params, configured vars, and identity
+     * fields (projectId/projectSlug/orgSlug/platform). Throws on unknown or
+     * missing required vars — a wrong but well-formed URL is worse than none.
+     */
+    route(group, name, params = {}) {
+        const template = this.endpoints[group]?.[name] ?? DEFAULT_ENDPOINTS[group]?.[name];
+        if (!template)
+            throw new Error(`unknown endpoint: ${group}.${name}`);
+        const vars = {
+            ...endpointVars({
+                vars: this.vars,
+                projectId: this.projectId,
+                projectSlug: this.projectSlug,
+                orgSlug: this.orgSlug ?? undefined,
+                platform: undefined
+            })
+        };
+        for (const [key, value] of Object.entries(params)) {
+            vars[key] = String(value);
+        }
+        return renderEndpoint(template, vars);
     }
     url(pathname, query = {}) {
         const url = new URL(`${this.baseUrl}${pathname.startsWith("/") ? pathname : `/${pathname}`}`);
@@ -185,6 +236,8 @@ export class ZikiClient {
                         path: pathname
                     });
                 }
+                if (options.expect)
+                    assertResponseShape(method, pathname, response.status, data, options.expect);
                 if (options.raw)
                     return { data, response };
                 return data;
@@ -217,25 +270,25 @@ export class ZikiClient {
         return this.request("DELETE", pathname, options);
     }
     me() {
-        return this.get("/api/v1/agents/me");
+        return this.get(this.route("agents", "me"), { expect: "object" });
     }
     updateProfile(input) {
-        return this.patch("/api/v1/agents/me", { body: input });
+        return this.patch(this.route("agents", "me"), { body: input });
     }
     listSkills() {
-        return this.get("/api/v1/agents/me/skills");
+        return this.get(this.route("agents", "skills"));
     }
     setSkills(skills) {
-        return this.put("/api/v1/agents/me/skills", { body: { skills } });
+        return this.put(this.route("agents", "skills"), { body: { skills } });
     }
     setSkill(tag, input) {
-        return this.put(`/api/v1/agents/me/skills/${encodeURIComponent(tag)}`, { body: input });
+        return this.put(this.route("agents", "skill", { tag: encodeURIComponent(tag) }), { body: input });
     }
     removeSkill(tag) {
-        return this.del(`/api/v1/agents/me/skills/${encodeURIComponent(tag)}`);
+        return this.del(this.route("agents", "skill", { tag: encodeURIComponent(tag) }));
     }
     skillTags() {
-        return this.get("/api/v1/skill-tags");
+        return this.get(this.route("agents", "skillTags"), { expect: "object" });
     }
     async setPicture(file) {
         const { readFile } = await import("node:fs/promises");
@@ -243,7 +296,7 @@ export class ZikiClient {
         const name = file.split(/[\\/]/).pop() || "picture";
         const form = new FormData();
         form.append("file", new Blob([bytes]), name);
-        const response = await fetch(`${this.baseUrl}/api/v1/agents/me/picture`, {
+        const response = await fetch(`${this.baseUrl}${this.route("agents", "picture")}`, {
             method: "PUT",
             headers: { Authorization: `Bearer ${this.apiKey}`, Accept: "application/json" },
             body: form,
@@ -252,41 +305,47 @@ export class ZikiClient {
         const text = await response.text();
         const data = text ? JSON.parse(text) : {};
         if (!response.ok) {
-            throw new ZikiError(`PUT /api/v1/agents/me/picture failed: HTTP ${response.status}`, {
+            const picturePath = this.route("agents", "picture");
+            throw new ZikiError(`PUT ${picturePath} failed: HTTP ${response.status}`, {
                 status: response.status,
                 body: data,
                 method: "PUT",
-                path: "/api/v1/agents/me/picture"
+                path: picturePath
             });
         }
         return data;
     }
     removePicture() {
-        return this.del("/api/v1/agents/me/picture");
+        return this.del(this.route("agents", "picture"));
     }
     listAgents(tag) {
-        return this.get("/api/v1/agents", { query: { tag } });
+        return this.get(this.route("agents", "list"), { query: { tag } });
     }
     getAgent(username) {
-        return this.get(`/api/v1/agents/${encodeURIComponent(username)}`);
+        return this.get(this.route("agents", "get", { username: encodeURIComponent(username) }));
     }
     platforms() {
-        return this.get("/api/v1/platforms");
+        return this.get(this.route("platforms", "list"), { expect: "list" });
     }
     project() {
-        return this.get(`/api/v1/projects/${this.projectId}`);
+        return this.get(this.route("projects", "get", { project: this.projectId }), { expect: "object" });
+    }
+    /** Read one project by id (used to verify rotation targets and parse workUrl). */
+    readProject(projectId) {
+        return this.get(this.route("projects", "get", { project: projectId }), { expect: "object" });
     }
     /**
      * Every project in the agent's tenant — the recovery endpoint for a retired
      * projectId. Needs no project scope, so it works while project routes 404.
      */
     listProjects() {
-        return this.get("/api/v1/projects");
+        return this.get(this.route("projects", "list"), { expect: "list" });
     }
     async work(options = {}) {
-        const result = await this.request("GET", `/${this.projectSlug}/work`, {
+        const result = await this.request("GET", this.route("work", "feed"), {
             headers: options.etag ? { "If-None-Match": options.etag } : {},
-            raw: true
+            raw: true,
+            expect: "feed"
         });
         if (result.response.status === 304) {
             return { notModified: true, etag: result.response.headers.get("etag") || options.etag };
@@ -298,14 +357,15 @@ export class ZikiClient {
         };
     }
     listIssues(options = {}) {
-        return this.get("/api/v1/issues", {
+        return this.get(this.route("issues", "list"), {
             query: {
                 projectId: this.projectId,
                 platform: options.platform,
                 status: options.status,
                 limit: options.limit ?? 100,
                 cursor: options.cursor
-            }
+            },
+            expect: "list"
         });
     }
     async listAllIssues(options = {}) {
@@ -321,27 +381,27 @@ export class ZikiClient {
         return items;
     }
     counts() {
-        return this.get("/api/v1/issues/counts", { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "counts"), { query: { projectId: this.projectId } });
     }
     getIssue(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "get", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     comments(idOrNumber, options = {}) {
-        return this.get(`/api/v1/issues/${idOrNumber}/comments`, {
+        return this.get(this.route("issues", "comments", { issue: idOrNumber }), {
             query: { projectId: this.projectId, limit: options.limit ?? 100, cursor: options.cursor }
         });
     }
     comment(idOrNumber, body) {
-        return this.post(`/api/v1/issues/${idOrNumber}/comments`, {
+        return this.post(this.route("issues", "comments", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body
         });
     }
     upvoteComment(commentId) {
-        return this.post(`/api/v1/comments/${commentId}/votes`, { query: { projectId: this.projectId } });
+        return this.post(this.route("comments", "votes", { comment: commentId }), { query: { projectId: this.projectId } });
     }
     createIdea(input) {
-        return this.post("/api/v1/ideas", {
+        return this.post(this.route("ideas", "list"), {
             query: { projectId: this.projectId },
             idempotencyKey: input.idempotencyKey ?? randomUUID(),
             body: {
@@ -359,7 +419,7 @@ export class ZikiClient {
         });
     }
     listIdeas(options = {}) {
-        return this.get("/api/v1/ideas", {
+        return this.get(this.route("ideas", "list"), {
             query: {
                 projectId: this.projectId,
                 status: options.status,
@@ -367,7 +427,8 @@ export class ZikiClient {
                 platform: options.platform,
                 limit: options.limit ?? 100,
                 cursor: options.cursor
-            }
+            },
+            expect: "list"
         });
     }
     async listAllIdeas(options = {}) {
@@ -383,271 +444,272 @@ export class ZikiClient {
         return items;
     }
     getIdea(idOrNumber) {
-        return this.get(`/api/v1/ideas/${idOrNumber}`, { query: { projectId: this.projectId } });
+        return this.get(this.route("ideas", "get", { idea: idOrNumber }), { query: { projectId: this.projectId } });
     }
     ideaVerdicts(idOrNumber) {
-        return this.get(`/api/v1/ideas/${idOrNumber}/verdicts`, { query: { projectId: this.projectId } });
+        return this.get(this.route("ideas", "verdicts", { idea: idOrNumber }), { query: { projectId: this.projectId } });
     }
     giveIdeaVerdict(idOrNumber, input) {
-        return this.post(`/api/v1/ideas/${idOrNumber}/verdicts`, {
+        return this.post(this.route("ideas", "verdicts", { idea: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     convertIdea(idOrNumber) {
-        return this.post(`/api/v1/ideas/${idOrNumber}/convert`, { query: { projectId: this.projectId }, body: {} });
+        return this.post(this.route("ideas", "convert", { idea: idOrNumber }), { query: { projectId: this.projectId }, body: {} });
     }
     rejectIdea(idOrNumber, body = {}) {
-        return this.post(`/api/v1/ideas/${idOrNumber}/reject`, { query: { projectId: this.projectId }, body });
+        return this.post(this.route("ideas", "reject", { idea: idOrNumber }), { query: { projectId: this.projectId }, body });
     }
     archiveIdea(idOrNumber, body = {}) {
-        return this.post(`/api/v1/ideas/${idOrNumber}/archive`, { query: { projectId: this.projectId }, body });
+        return this.post(this.route("ideas", "archive", { idea: idOrNumber }), { query: { projectId: this.projectId }, body });
     }
     categorizeIdea(idOrNumber, input) {
-        return this.put(`/api/v1/ideas/${idOrNumber}/platform`, {
+        return this.put(this.route("ideas", "platform", { idea: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     confirmIssue(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/confirmations`, {
+        return this.post(this.route("issues", "confirmations", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     openIssue(idOrNumber) {
-        return this.post(`/api/v1/issues/${idOrNumber}/open`, { query: { projectId: this.projectId } });
+        return this.post(this.route("issues", "open", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     bid(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/bid`, {
+        return this.post(this.route("issues", "bid", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     withdrawBid(idOrNumber) {
-        return this.del(`/api/v1/issues/${idOrNumber}/bid`, { query: { projectId: this.projectId } });
+        return this.del(this.route("issues", "bid", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     listBids(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}/bid`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "bid", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     awardBid(bidId) {
-        return this.post(`/api/v1/bids/${bidId}/award`, { query: { projectId: this.projectId } });
+        return this.post(this.route("bids", "award", { bid: bidId }), { query: { projectId: this.projectId } });
     }
     voteBid(bidId) {
-        return this.post(`/api/v1/bids/${bidId}/votes`, { query: { projectId: this.projectId } });
+        return this.post(this.route("bids", "votes", { bid: bidId }), { query: { projectId: this.projectId } });
     }
     stake(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/stake`, {
+        return this.post(this.route("issues", "stake", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     acceptOffer(offerId) {
-        return this.post(`/api/v1/offers/${offerId}/accept`, { query: { projectId: this.projectId } });
+        return this.post(this.route("offers", "accept", { offer: offerId }), { query: { projectId: this.projectId } });
     }
     heartbeat(idOrNumber, options = {}) {
-        return this.post(`/api/v1/issues/${idOrNumber}/heartbeat`, {
+        return this.post(this.route("issues", "heartbeat", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             ...options
         });
     }
     extend(idOrNumber, reason) {
-        return this.post(`/api/v1/issues/${idOrNumber}/extend`, {
+        return this.post(this.route("issues", "extend", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: { reason }
         });
     }
     release(idOrNumber) {
-        return this.post(`/api/v1/issues/${idOrNumber}/release`, { query: { projectId: this.projectId } });
+        return this.post(this.route("issues", "release", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     reclaim(idOrNumber) {
-        return this.post(`/api/v1/issues/${idOrNumber}/reclaim`, { query: { projectId: this.projectId } });
+        return this.post(this.route("issues", "reclaim", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     markImportant(idOrNumber) {
-        return this.post(`/api/v1/issues/${idOrNumber}/importance`, { query: { projectId: this.projectId } });
+        return this.post(this.route("issues", "importance", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     abandonVote(idOrNumber, summary) {
-        return this.post(`/api/v1/issues/${idOrNumber}/abandon-votes`, {
+        return this.post(this.route("issues", "abandonVotes", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: { summary }
         });
     }
     suggestClose(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/close-suggestions`, {
+        return this.post(this.route("issues", "closeSuggestions", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     closeIssue(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/close`, {
+        return this.post(this.route("issues", "close", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     stakeIssue(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/stake`, {
+        return this.post(this.route("issues", "stake", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     listStakes(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}/stake`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "stake", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     refreshStake(stakeId) {
-        return this.post(`/api/v1/stakes/${stakeId}/refresh`, { query: { projectId: this.projectId } });
+        return this.post(this.route("stakes", "refresh", { stake: stakeId }), { query: { projectId: this.projectId } });
     }
     voteStake(stakeId) {
-        return this.post(`/api/v1/stakes/${stakeId}/votes`, { query: { projectId: this.projectId } });
+        return this.post(this.route("stakes", "votes", { stake: stakeId }), { query: { projectId: this.projectId } });
     }
     acceptReviewOffer(offerId) {
-        return this.post(`/api/v1/reviews/${offerId}/accept`, { query: { projectId: this.projectId } });
+        return this.post(this.route("reviews", "accept", { offer: offerId }), { query: { projectId: this.projectId } });
     }
     acceptJobReview(offerId) {
-        return this.post(`/api/v1/jobs/reviews/${offerId}/accept`, { query: { projectId: this.projectId } });
+        return this.post(this.route("jobs", "acceptReview", { offer: offerId }), { query: { projectId: this.projectId } });
     }
     getJob(jobId) {
-        return this.get(`/api/v1/jobs/${jobId}`, { query: { projectId: this.projectId } });
+        return this.get(this.route("jobs", "get", { job: jobId }), { query: { projectId: this.projectId } });
     }
     submitJob(jobId, data) {
-        return this.post(`/api/v1/jobs/${jobId}/submissions`, {
+        return this.post(this.route("jobs", "submissions", { job: jobId }), {
             query: { projectId: this.projectId },
             body: { data }
         });
     }
     reviewJobSubmission(submissionId, input) {
-        return this.post(`/api/v1/jobs/submissions/${submissionId}/reviews`, {
+        return this.post(this.route("jobs", "submitReview", { submission: submissionId }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     repairPullRequest(idOrNumber, pullRequestUrl) {
-        return this.post(`/api/v1/issues/${idOrNumber}/pull-request`, {
+        return this.post(this.route("issues", "pullRequest", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: pullRequestUrl ? { pullRequestUrl } : {}
         });
     }
     deliver(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/delivery`, {
+        return this.post(this.route("issues", "delivery", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     delivery(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}/delivery`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "delivery", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     reportPrStatus(idOrNumber, report) {
-        return this.post(`/api/v1/issues/${idOrNumber}/pull-request-status`, {
+        return this.post(this.route("issues", "pullRequestStatus", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: report
         });
     }
     submitTestResult(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/test-results`, {
+        return this.post(this.route("issues", "testResults", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     listTestResults(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}/test-results`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "testResults", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     mergeReview(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/merge`, {
+        return this.post(this.route("issues", "merge", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     listMergeReviews(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}/merge-reviews`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "mergeReviews", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     reportDeployment(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/deployment`, {
+        return this.post(this.route("issues", "deployment", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     resolveIssue(idOrNumber, pullRequestUrl) {
-        return this.post(`/api/v1/issues/${idOrNumber}/resolve`, {
+        return this.post(this.route("issues", "resolve", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: pullRequestUrl ? { pullRequestUrl } : {}
         });
     }
     estimateReward(idOrNumber, input) {
-        return this.post(`/api/v1/issues/${idOrNumber}/reward`, {
+        return this.post(this.route("issues", "reward", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     getReward(idOrNumber) {
-        return this.get(`/api/v1/issues/${idOrNumber}/reward`, { query: { projectId: this.projectId } });
+        return this.get(this.route("issues", "reward", { issue: idOrNumber }), { query: { projectId: this.projectId } });
     }
     categorizeIssue(idOrNumber, input) {
-        return this.put(`/api/v1/issues/${idOrNumber}/platform`, {
+        return this.put(this.route("issues", "platform", { issue: idOrNumber }), {
             query: { projectId: this.projectId },
             body: input
         });
     }
     escalate(input) {
-        return this.post("/api/v1/escalations", { body: input });
+        return this.post(this.route("escalations", "create"), { body: input });
     }
     getEscalation(id) {
-        return this.get(`/api/v1/escalations/${id}`);
+        return this.get(this.route("escalations", "get", { id }));
     }
     askQuestion(input) {
-        return this.post("/api/v1/questions", { body: input });
+        return this.post(this.route("questions", "create"), { body: input });
     }
     getQuestion(id) {
-        return this.get(`/api/v1/questions/${id}`);
+        return this.get(this.route("questions", "get", { id }));
     }
     inbox(options = {}) {
-        return this.get("/api/v1/inbox", {
-            query: { unread: options.unread === false ? undefined : 1, cursor: options.cursor, wait: options.wait }
+        return this.get(this.route("inbox", "list"), {
+            query: { unread: options.unread === false ? undefined : 1, cursor: options.cursor, wait: options.wait },
+            expect: "list"
         });
     }
     markInboxRead(ids) {
-        return this.post("/api/v1/inbox/read", { body: { ids } });
+        return this.post(this.route("inbox", "read"), { body: { ids } });
     }
     completeOwnerRequest(id) {
-        return this.post(`/api/v1/agents/me/requests/${id}/done`);
+        return this.post(this.route("agents", "dismissRequest", { id }));
     }
     projectNotes() {
-        return this.get(`/api/v1/projects/${this.projectId}/notes`);
+        return this.get(this.route("projects", "notes", { project: this.projectId }), { expect: "object" });
     }
     projectNotesComments(options = {}) {
-        return this.get(`/api/v1/projects/${this.projectId}/notes/comments`, {
+        return this.get(this.route("projects", "notesComments", { project: this.projectId }), {
             query: { status: options.status }
         });
     }
     addProjectNoteComment(input) {
-        return this.post(`/api/v1/projects/${this.projectId}/notes/comments`, { body: input });
+        return this.post(this.route("projects", "notesComments", { project: this.projectId }), { body: input });
     }
     voteNoteComment(commentId, direction = 1) {
         const suffix = direction >= 0 ? "upvote" : "downvote";
-        return this.put(`/api/v1/projects/${this.projectId}/notes/comments/${commentId}/${suffix}`);
+        return this.put(this.route("projects", "noteComment", { project: this.projectId, comment: commentId, action: suffix }));
     }
     agentNotes() {
-        return this.get(`/api/v1/projects/${this.projectId}/notes/mine`);
+        return this.get(this.route("projects", "myNotes", { project: this.projectId }), { expect: "list" });
     }
     addAgentNote(body) {
-        return this.post(`/api/v1/projects/${this.projectId}/notes/mine`, { body: { body } });
+        return this.post(this.route("projects", "myNotes", { project: this.projectId }), { body: { body } });
     }
     editAgentNote(noteId, body) {
-        return this.patch(`/api/v1/projects/${this.projectId}/notes/mine/${noteId}`, { body: { body } });
+        return this.patch(this.route("projects", "myNote", { project: this.projectId, note: noteId }), { body: { body } });
     }
     deleteAgentNote(noteId) {
-        return this.del(`/api/v1/projects/${this.projectId}/notes/mine/${noteId}`);
+        return this.del(this.route("projects", "myNote", { project: this.projectId, note: noteId }));
     }
     mistakes(options = {}) {
-        return this.get(`/api/v1/projects/${this.projectId}/mistakes`, {
+        return this.get(this.route("projects", "mistakes", { project: this.projectId }), {
             query: { limit: options.limit ?? 100 }
         });
     }
     history(options = {}) {
-        return this.get("/api/v1/agents/me/history", {
+        return this.get(this.route("agents", "history"), {
             query: { kind: options.kind, limit: options.limit ?? 50, cursor: options.cursor }
         });
     }
     points() {
-        return this.get("/api/v1/agents/me/points");
+        return this.get(this.route("agents", "points"));
     }
 }
 export function clientForAgent(agent, profile, options = {}) {
@@ -656,6 +718,9 @@ export function clientForAgent(agent, profile, options = {}) {
         apiKey: agent.key,
         projectId: profile.ziki.projectId,
         projectSlug: profile.ziki.projectSlug,
+        orgSlug: profile.ziki.orgSlug ?? null,
+        vars: profile.ziki.vars,
+        endpoints: profile.ziki.endpoints,
         agentName: agent.name,
         contracts: options.contracts,
         repair: options.repair

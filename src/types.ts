@@ -41,6 +41,12 @@ export interface ZikiConfig {
   platform: string;
   platformCategoryId?: string;
   /**
+   * Organisation slug for `/{org}/{project}/…` addresses. Absent on tenants
+   * without organisations (legacy single-segment addresses are used then).
+   * Learned from the project's `workUrl` during project re-resolution.
+   */
+  orgSlug?: string | null;
+  /**
    * Value sent as the `platform` query parameter on Ziki list endpoints.
    * - `undefined` (absent): send `ziki.platform` (legacy behavior).
    * - a slug: send that instead (category renames without touching identity).
@@ -48,6 +54,19 @@ export interface ZikiConfig {
    * Agent-mutable via the config-repair flow (see RepairConfig).
    */
   platformFilter?: string | null;
+  /**
+   * Extra interpolation variables for endpoint templates (future Ziki
+   * identifiers like `teamId`). Keys: `[A-Za-z0-9_-]+`, no dots.
+   * Agent-mutable; new keys are always allowed here.
+   */
+  vars?: Record<string, string>;
+  /**
+   * Endpoint path templates, e.g. `{ issues: { list: "/api/v1/issues" } }`.
+   * `{var}` interpolates from vars + identity fields; `{var?}` is optional
+   * (drops out with slash-collapse). Agent-mutable: unknown Ziki URL shapes
+   * are fixed in config, not code.
+   */
+  endpoints?: Record<string, Record<string, string>>;
   projectName?: string;
 }
 
@@ -811,6 +830,36 @@ export interface State {
   lastRun: RunSummary | null;
   activePids: number[];
   health: LoopHealth;
+  /**
+   * Writes that could not reach Ziki (outage/blocked project), queued FIFO
+   * for the flush pass once the loop is healthy again. Tombstoned on success;
+   * dropped with a history note after too many failed attempts. Never holds
+   * secrets — only API payloads the loop would have sent anyway.
+   */
+  outbox?: OutboxQueue;
+  /** Last ISO timestamps for the blocked-loop background passes. */
+  lastOfflineWatchAt?: string | null;
+  lastRepoHealthAt?: string | null;
+}
+
+export type OutboxKind = "createIdea" | "reportPrStatus" | "reportDeployment";
+
+export interface OutboxEntry {
+  id: string;
+  kind: OutboxKind;
+  /** Exact body the live call would have sent. */
+  body: Record<string, unknown>;
+  issueId?: string | null;
+  issueNumber?: number | string | null;
+  title?: string | null;
+  addedAt: string;
+  attempts: number;
+  lastError?: string | null;
+}
+
+export interface OutboxQueue {
+  items: OutboxEntry[];
+  failed: OutboxEntry[];
 }
 
 export interface HistoryEntry {
@@ -830,6 +879,7 @@ export interface HistoryEntry {
     | "decision"
     | "unsupported"
     | "health"
+    | "outbox"
     | "stop";
   issue?: number | string | null;
   idea?: number | string | null;

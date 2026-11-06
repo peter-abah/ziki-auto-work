@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, validateConfigPatch } from "./config.js";
 import { APPROVAL_WORD, approveEscalation, applyRemoteAnswer, interpretHumanAnswer, isApprovalText, markEscalationExpired, openConfigEscalations, rejectEscalation } from "./hitl.js";
-import { applyConfigPatch, blockerCode, matchReplacementProject, maxRoundsFor, projectRotationPatch, repairConfigFor, strategyFor } from "./config-repair.js";
+import { applyConfigPatch, blockerCode, diagnoseProjectMismatch, matchReplacementProject, maxRoundsFor, repairConfigFor, strategyFor, supersedingPaths } from "./config-repair.js";
 function fixtureProfile(overrides = {}) {
     return {
         ziki: {
@@ -161,12 +161,30 @@ test("matchReplacementProject reports ambiguity and misses", () => {
     const missing = matchReplacementProject([], fixtureProfile());
     assert.equal(missing, null);
 });
-test("projectRotationPatch builds a single op", () => {
-    const projects = fixtureProjects();
-    const ops = projectRotationPatch(projects[0], "slug match");
-    assert.deepEqual(ops, [
-        { path: "ziki.projectId", value: "c17fc461d8ec6105f842b1c84", reason: "slug match" }
-    ]);
+test("diagnoseProjectMismatch proposes only differing identity fields", async () => {
+    const profile = fixtureProfile();
+    const client = {
+        listProjects: async () => ({ items: fixtureProjects() }),
+        readProject: async () => ({ id: "c17fc461d8ec6105f842b1c84", workUrl: "https://ziki.dev/zedu/desktop/work" })
+    };
+    const diagnosis = await diagnoseProjectMismatch(client, profile);
+    assert.ok(diagnosis.match);
+    assert.deepEqual(diagnosis.ops.map((op) => op.path).sort(), ["ziki.orgSlug", "ziki.projectId", "ziki.projectSlug"]);
+    assert.equal(diagnosis.ops.find((op) => op.path === "ziki.projectId")?.value, "c17fc461d8ec6105f842b1c84");
+    assert.equal(diagnosis.ops.find((op) => op.path === "ziki.orgSlug")?.value, "zedu");
+    const aligned = fixtureProfile({
+        ziki: {
+            baseUrl: "https://ziki.dev",
+            projectId: "c17fc461d8ec6105f842b1c84",
+            projectSlug: "desktop",
+            platform: "desktop",
+            orgSlug: "zedu",
+            projectName: "Desktop"
+        }
+    });
+    const quiet = await diagnoseProjectMismatch(client, aligned);
+    assert.deepEqual(quiet.ops, []);
+    assert.match(quiet.detail, /already matches/);
 });
 test("validateConfigPatch accepts an allowlisted change", () => {
     const profile = fixtureProfile();
@@ -341,6 +359,18 @@ test("diagnoseUnknownFilter matches identity and single-platform cases", async (
     const failed = await diagnoseUnknownFilter(failing, profile);
     assert.equal(failed.resolves, false);
     assert.match(failed.reason, /boom/);
+});
+test("supersedingPaths requires strict superset growth", () => {
+    const toOps = (paths) => paths.map((path) => ({ path, value: "x" }));
+    assert.deepEqual(supersedingPaths(toOps(["ziki.projectId"]), toOps(["ziki.projectId", "ziki.orgSlug"])), [
+        "ziki.orgSlug"
+    ]);
+    assert.equal(supersedingPaths(toOps(["ziki.projectId"]), toOps(["ziki.projectId"])), null);
+    assert.equal(supersedingPaths(toOps(["ziki.projectId"]), toOps(["ziki.orgSlug"])), null);
+    assert.equal(supersedingPaths(toOps(["ziki.projectId"]), []), null);
+    // No pending patch + a real diagnosis fills the gap.
+    assert.deepEqual(supersedingPaths(null, toOps(["ziki.projectId"])), ["ziki.projectId"]);
+    assert.deepEqual(supersedingPaths([], toOps(["ziki.projectId"])), ["ziki.projectId"]);
 });
 test("loadPrompt resolves the config-doctor template", async () => {
     const { loadPrompt } = await import("./agent.js");

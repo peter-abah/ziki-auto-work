@@ -3,6 +3,7 @@ import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DEFAULT_REPAIR_ALLOW_NEW_KEYS, DEFAULT_REPAIR_MUTABLE_PATHS, DEFAULT_REPAIR_STRATEGIES, setConfigPath, validateConfig, validateConfigPatch, saveConfig } from "./config.js";
 import { apiPlatformFilter } from "./ziki.js";
+import { parseWorkUrl } from "./ziki-endpoints.js";
 export const PROJECT_NOT_FOUND_MESSAGE = "Project not found.";
 /** True only for the retired-project signature — not for any other 404 (e.g. a renamed route). */
 export function isProjectNotFoundBlocker(code, message) {
@@ -123,7 +124,11 @@ function githubRepoName(value) {
     const bare = trimmed.match(/^([^/]+\/[^/]+)$/);
     return bare ? bare[1].toLowerCase() : null;
 }
-/** Live diagnosis: list the tenant's projects and match a replacement. Read-only. */
+/**
+ * Live diagnosis: list the tenant's projects, match a replacement, read it
+ * back and diff every identity field (projectId, projectSlug, orgSlug from
+ * workUrl) against the profile. Read-only; proposes only what differs.
+ */
 export async function diagnoseProjectMismatch(client, profile, logger) {
     const response = await client.listProjects();
     const projects = Array.isArray(response?.items) ? response.items : [];
@@ -131,14 +136,48 @@ export async function diagnoseProjectMismatch(client, profile, logger) {
         slugs: projects.map((project) => project.slug)
     });
     const matched = matchReplacementProject(projects, profile);
-    if (matched && "project" in matched) {
-        return { projects, match: { project: matched.project, reason: matched.reason }, ambiguous: null };
+    if (!matched || !("project" in matched)) {
+        return {
+            projects,
+            match: null,
+            ambiguous: matched && "ambiguous" in matched ? matched.ambiguous : null,
+            ops: [],
+            detail: matched && "ambiguous" in matched
+                ? `multiple tenant projects match; need a human pick: ${matched.ambiguous.map((project) => project.slug).join(", ")}`
+                : `no tenant project matches platform "${profile.ziki.platform}" or repo "${profile.repo.githubRepo}"`
+        };
     }
-    return { projects, match: null, ambiguous: matched && "ambiguous" in matched ? matched.ambiguous : null };
-}
-/** Build the patch ops for adopting a replacement project. */
-export function projectRotationPatch(project, reason) {
-    return [{ path: "ziki.projectId", value: project.id, reason }];
+    const project = matched.project;
+    let work = null;
+    try {
+        const full = await client.readProject(project.id);
+        work = parseWorkUrl(typeof full?.workUrl === "string" ? full.workUrl : null);
+    }
+    catch (error) {
+        logger?.warn(`Project read failed for ${project.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const ops = [];
+    if (profile.ziki.projectId !== project.id) {
+        ops.push({ path: "ziki.projectId", value: project.id, reason: matched.reason });
+    }
+    if (profile.ziki.projectSlug !== project.slug) {
+        ops.push({ path: "ziki.projectSlug", value: project.slug, reason: `tenant project slug is "${project.slug}"` });
+    }
+    if (work?.org && profile.ziki.orgSlug !== work.org) {
+        ops.push({ path: "ziki.orgSlug", value: work.org, reason: `project workUrl lives under org "${work.org}"` });
+    }
+    if (work && work.project !== project.slug) {
+        logger?.warn(`Project slug mismatch: list says "${project.slug}" but workUrl points at "${work.project}"`);
+    }
+    return {
+        projects,
+        match: { project, reason: matched.reason },
+        ambiguous: null,
+        ops,
+        detail: ops.length
+            ? `Project ${profile.ziki.projectId} is gone on Ziki; matched replacement ${project.slug} (${matched.reason}).`
+            : `Project identity already matches tenant project ${project.slug}; no rotation needed.`
+    };
 }
 /**
  * Diagnose an unknown platform/area filter: list the tenant's current
@@ -286,5 +325,20 @@ export function latestStrategyEscalation(state, strategy) {
         escalation.status === "open")
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return open[0] ?? null;
+}
+/**
+ * Supersede check: returns the newly covered paths when the fresh diagnosis is
+ * a strict superset of the pending proposal (monotonic growth guarantees the
+ * escalation chain terminates), else null. Pure function — extracted for testing.
+ */
+export function supersedingPaths(existing, fresh) {
+    if (!fresh?.length)
+        return null;
+    const pending = new Set((existing ?? []).map((op) => op.path));
+    const covers = new Set(fresh.map((op) => op.path));
+    const extra = [...covers].filter((path) => !pending.has(path));
+    if ([...pending].every((path) => covers.has(path)) && extra.length)
+        return extra;
+    return null;
 }
 //# sourceMappingURL=config-repair.js.map

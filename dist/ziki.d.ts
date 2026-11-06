@@ -38,6 +38,9 @@ export declare class ZikiClient {
     apiKey: string;
     projectId: string;
     projectSlug: string;
+    orgSlug?: string | null;
+    vars: Record<string, string>;
+    endpoints: Record<string, Record<string, string>>;
     agentName: string;
     timeoutMs: number;
     contracts?: ApiContractStore;
@@ -47,11 +50,21 @@ export declare class ZikiClient {
         apiKey: string;
         projectId: string;
         projectSlug: string;
+        orgSlug?: string | null;
+        vars?: Record<string, string>;
+        endpoints?: Record<string, Record<string, string>>;
         agentName?: string;
         timeoutMs?: number;
         contracts?: ApiContractStore;
         repair?: ApiRepairHandler;
     });
+    /**
+     * Resolve a configured endpoint template into a path, interpolating
+     * `{var}` placeholders from explicit params, configured vars, and identity
+     * fields (projectId/projectSlug/orgSlug/platform). Throws on unknown or
+     * missing required vars — a wrong but well-formed URL is worse than none.
+     */
+    route(group: string, name: string, params?: Record<string, string | number>): string;
     private url;
     request<T = any>(method: string, pathname: string, options?: {
         query?: Record<string, unknown>;
@@ -62,6 +75,12 @@ export declare class ZikiClient {
         retries?: number;
         timeoutMs?: number;
         maxRetryAfterMs?: number;
+        /**
+         * Expected shape of a successful response. Mismatches throw instead of
+         * being swallowed downstream (e.g. an HTML login page where a JSON feed
+         * was expected). Keep narrow: only set where the shape is contractual.
+         */
+        expect?: "feed" | "list" | "object";
     }): Promise<T>;
     private requestOnce;
     get<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
@@ -105,6 +124,10 @@ export declare class ZikiClient {
     getAgent(username: string): Promise<AgentProfile>;
     platforms(): Promise<any>;
     project(): Promise<any>;
+    /** Read one project by id (used to verify rotation targets and parse workUrl). */
+    readProject(projectId: string): Promise<ProjectSummary & {
+        workUrl?: string;
+    }>;
     /**
      * Every project in the agent's tenant — the recovery endpoint for a retired
      * projectId. Needs no project scope, so it works while project routes 404.

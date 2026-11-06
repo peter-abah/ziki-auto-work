@@ -178,9 +178,11 @@ export async function runAgent(options) {
         return { ok: false, error: `agent failed to start: ${exit.error.message}`, logPath, tail: truncate(tail, 2000), providerLimit: null };
     }
     let parsed = null;
+    let parsedFrom = null;
     if (existsSync(resultPath)) {
         try {
             parsed = JSON.parse(await readFile(resultPath, "utf8"));
+            parsedFrom = "file";
         }
         catch (error) {
             return {
@@ -193,8 +195,15 @@ export async function runAgent(options) {
             };
         }
     }
-    else if (resultMode === "stdout") {
+    else {
+        // The agent printed instead of writing the result file. The stdout tail
+        // often still holds a complete, valid answer — parse it rather than
+        // discarding the work, whatever the provider's result mode is.
         parsed = extractJsonResult(tail);
+        if (parsed) {
+            parsedFrom = "stdout";
+            logger?.info(`Agent result recovered from stdout (missing ${resultPath})`);
+        }
     }
     if (!parsed) {
         return {

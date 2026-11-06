@@ -967,6 +967,25 @@ async function providersCommand(flags) {
         console.log(`${id.padEnd(14)} ${label}${kind}${status ? ` — ${status}` : ""}`);
     }
 }
+/**
+ * Startup fallback when the config is missing or invalid: try the zero-config
+ * bootstrap (reap or file a Ziki escalation, always write NEEDS-HUMAN.md),
+ * then exit non-zero with actionable guidance instead of a bare stack trace.
+ */
+async function bootstrapAndExit(profileName, error, step) {
+    const { bootstrapOnConfigFailure } = await import("./bootstrap.js");
+    const result = await bootstrapOnConfigFailure({ profileName, reason: error }).catch(() => null);
+    console.error(`auto-work cannot start: failed to ${step}.`);
+    console.error(error instanceof Error ? error.message : String(error));
+    if (result?.escalationId) {
+        console.error(`An escalation was filed on Ziki (${result.escalationId}); answer there or fix the config and retry.`);
+    }
+    else if (result) {
+        console.error(`Details written to ${result.needsHumanFile}.`);
+    }
+    console.error("Next: `auto-work init` (interactive setup) or `auto-work init --discover` (key-first auto setup).");
+    process.exitCode = 1;
+}
 async function profiles() {
     const config = await loadConfig();
     if (!Object.keys(config.profiles).length) {
@@ -979,7 +998,14 @@ async function profiles() {
     }
 }
 async function start(flags) {
-    const config = await loadConfig();
+    let config;
+    try {
+        config = await loadConfig();
+    }
+    catch (error) {
+        await bootstrapAndExit(null, error, "load the auto-work config");
+        return;
+    }
     const overrides = parseRunLimits(flags);
     if (flags.all) {
         const results = [];
@@ -995,9 +1021,18 @@ async function start(flags) {
         return;
     }
     const profileName = await resolveProfileName(flags);
-    if (!profileName)
-        throw new Error("No profile configured. Run `auto-work init`.");
-    const loaded = await loadProfile(profileName);
+    if (!profileName) {
+        await bootstrapAndExit(null, new Error("No profile configured."), "choose or create a profile");
+        return;
+    }
+    let loaded;
+    try {
+        loaded = await loadProfile(profileName);
+    }
+    catch (error) {
+        await bootstrapAndExit(profileName, error, `load profile "${profileName}"`);
+        return;
+    }
     const limits = resolveRunLimits(loaded.profile, overrides);
     const once = Boolean(flags.once);
     const dryRun = Boolean(flags["dry-run"]);

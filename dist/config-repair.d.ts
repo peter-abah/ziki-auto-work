@@ -38,11 +38,17 @@ export interface ProjectDiagnosis {
     projects: ProjectSummary[];
     match: ProjectMatch | null;
     ambiguous: ProjectSummary[] | null;
+    /** Patch ops for identity fields that differ from the profile (may be empty). */
+    ops: ConfigPatchOp[];
+    /** Human-readable diagnosis summary. */
+    detail: string;
 }
-/** Live diagnosis: list the tenant's projects and match a replacement. Read-only. */
+/**
+ * Live diagnosis: list the tenant's projects, match a replacement, read it
+ * back and diff every identity field (projectId, projectSlug, orgSlug from
+ * workUrl) against the profile. Read-only; proposes only what differs.
+ */
 export declare function diagnoseProjectMismatch(client: ZikiClient, profile: ProfileConfig, logger?: Logger): Promise<ProjectDiagnosis>;
-/** Build the patch ops for adopting a replacement project. */
-export declare function projectRotationPatch(project: ProjectSummary, reason: string): ConfigPatchOp[];
 export interface FilterDiagnosis {
     platforms: Array<{
         slug?: string | null;
@@ -82,3 +88,9 @@ export declare function formatRepairEscalationBody(options: {
 }): string;
 /** Latest open config escalation for a strategy (reaps local CLI approvals first). */
 export declare function latestStrategyEscalation(state: State, strategy: string): EscalationRecord | null;
+/**
+ * Supersede check: returns the newly covered paths when the fresh diagnosis is
+ * a strict superset of the pending proposal (monotonic growth guarantees the
+ * escalation chain terminates), else null. Pure function — extracted for testing.
+ */
+export declare function supersedingPaths(existing: ConfigPatchOp[] | null | undefined, fresh: ConfigPatchOp[] | null | undefined): string[] | null;
