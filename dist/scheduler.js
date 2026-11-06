@@ -1,3 +1,4 @@
+import { sleep } from "./log.js";
 export class TaskPool {
     limits;
     tasks = new Map();
@@ -56,6 +57,22 @@ export class TaskPool {
         if (!this.tasks.size)
             return;
         await Promise.race([...this.tasks.values()].map((task) => task.promise));
+    }
+    /**
+     * Inter-cycle wait: sleep the full interval, but wake early when a pooled
+     * agent finishes. A bare `Promise.race([pool.waitForAny(), sleep(ms)])`
+     * resolves instantly on an empty pool (waitForAny is pre-resolved), which
+     * hot-spins the loop whenever nothing is in flight — so the pool side only
+     * joins the race when it is non-empty.
+     */
+    async waitForPoolOrTimeout(ms, signal) {
+        const waitMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+        if (this.tasks.size > 0) {
+            await Promise.race([this.waitForAny(), sleep(waitMs, signal)]);
+        }
+        else {
+            await sleep(waitMs, signal);
+        }
     }
     async drain(timeoutMs = 60_000) {
         const deadline = Date.now() + timeoutMs;

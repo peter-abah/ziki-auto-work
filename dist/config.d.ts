@@ -1,4 +1,4 @@
-import type { Config, ProfileConfig, ProfilePaths, LimitsConfig, LoadedProfile, ProviderName, PushMode, Role, RunLimitConfig, WorkflowConfig } from "./types.js";
+import type { Config, ConfigPatchOp, ProfileConfig, ProfilePaths, LimitsConfig, LoadedProfile, ProviderName, PushMode, RepairConfig, RepairStrategyConfig, Role, RunLimitConfig, WorkflowConfig } from "./types.js";
 import { expandHome } from "./platform/paths.js";
 export declare const PROVIDERS: ProviderName[];
 export declare const DEFAULT_LIMITS: LimitsConfig;
@@ -17,6 +17,34 @@ export declare const DEFAULT_PR_TRACKING: {
 };
 export declare const DEFAULT_WORKFLOW: WorkflowConfig;
 export declare const DEFAULT_ENV_FILES: string[];
+/**
+ * Agent-driven config repair (approval-gated) defaults.
+ *
+ * The agent may only PROPOSE patches; the orchestrator validates every op
+ * against the allowlist below, and nothing persists without human approval.
+ * Paths the agent must never touch — even if explicitly allowlisted — are
+ * refused in `validateConfig` (fail closed): repo/executor/providers/agents
+ * (push targets, command execution, key bindings), hitl/repair itself (the
+ * agent must not loosen its own gating), prompts, secrets, and config roots.
+ */
+export declare const DEFAULT_REPAIR_MUTABLE_PATHS: string[];
+export declare const DEFAULT_REPAIR_ALLOW_NEW_KEYS: string[];
+export declare const DEFAULT_REPAIR_STRATEGIES: Record<string, RepairStrategyConfig>;
+export declare function isNeverMutablePath(path: string): boolean;
+/** Read a dot-path (`ziki.projectId`) from a profile object. */
+export declare function getConfigPath(obj: unknown, path: string): unknown;
+/** Return a deep clone of `obj` with the dot-path set to `value`. */
+export declare function setConfigPath<T>(obj: T, path: string, value: unknown): T;
+export interface PatchValidation {
+    ok: boolean;
+    errors: string[];
+}
+/**
+ * Validate an agent-proposed patch WITHOUT applying it. Fails closed:
+ * unknown paths, denylisted paths, new keys outside allowNewKeys, and
+ * type changes are all rejected.
+ */
+export declare function validateConfigPatch(profile: ProfileConfig, ops: ConfigPatchOp[] | null | undefined, repair?: RepairConfig): PatchValidation;
 export declare function defaultConfig(): Config;
 export declare function deepMerge<T>(base: T, override: unknown): T;
 export declare function parseEnvFile(text: string): Record<string, string>;

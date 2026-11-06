@@ -29,5 +29,13 @@ export declare class TaskPool {
     reserve(key: string, kind: TaskKind, run: () => Promise<void>, label?: string, agent?: string): boolean;
     list(): InFlightTask[];
     waitForAny(): Promise<void>;
+    /**
+     * Inter-cycle wait: sleep the full interval, but wake early when a pooled
+     * agent finishes. A bare `Promise.race([pool.waitForAny(), sleep(ms)])`
+     * resolves instantly on an empty pool (waitForAny is pre-resolved), which
+     * hot-spins the loop whenever nothing is in flight — so the pool side only
+     * joins the race when it is non-empty.
+     */
+    waitForPoolOrTimeout(ms: number, signal?: AbortSignal): Promise<void>;
     drain(timeoutMs?: number): Promise<void>;
 }

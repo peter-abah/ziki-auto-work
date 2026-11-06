@@ -38,6 +38,18 @@ test("classifies auth, rate limits and network errors", () => {
   assert.equal(classifyError(Object.assign(new Error("reset"), { code: "ECONNRESET" }), "github").code, "network");
 });
 
+test("normalizes restructured-taxonomy 422s to unknown_filter warnings", () => {
+  const report = classifyError(
+    zikiError(422, { error: 'Unknown platform "general". Use a slug from GET /api/v1/platforms, or "none".' }),
+    "platform"
+  );
+  assert.equal(report.code, "unknown_filter");
+  assert.equal(report.severity, "warning");
+  const other = classifyError(zikiError(422, { error: "Send a valid JSON body." }), "inbox");
+  assert.equal(other.code, "Send a valid JSON body.");
+  assert.equal(other.severity, "warning");
+});
+
 test("reports, summarizes and clears blockers", () => {
   const health = emptyHealth();
   const first = reportBlocker(health, {

@@ -129,3 +129,24 @@ test("TaskPool notifies when tasks start and finish", async () => {
   await pool.drain(1000);
   assert.equal(changes, 2);
 });
+
+test("waitForPoolOrTimeout sleeps the full interval on an empty pool", async () => {
+  const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+  // Regression: Promise.race([pool.waitForAny(), sleep]) resolves instantly
+  // when the pool is empty (waitForAny is pre-resolved), hot-spinning the
+  // loop. The full interval must elapse instead.
+  const started = Date.now();
+  await pool.waitForPoolOrTimeout(150);
+  assert.ok(Date.now() - started >= 120, `returned after ${Date.now() - started}ms`);
+});
+
+test("waitForPoolOrTimeout wakes early when a pooled task finishes", async () => {
+  const pool = new TaskPool({ delivery: 2, followup: 1, review: 1, aux: 2, discovery: 1, owner: 1, agents: 4 });
+  const gate = gated();
+  assert.equal(pool.reserve("d1", "delivery", gate.run), true);
+  setTimeout(() => gate.release(), 50);
+  const started = Date.now();
+  await pool.waitForPoolOrTimeout(5000);
+  assert.ok(Date.now() - started < 2000, `did not wake early (${Date.now() - started}ms)`);
+  await pool.drain(1000);
+});

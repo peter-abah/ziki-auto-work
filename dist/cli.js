@@ -8,6 +8,7 @@ import { runCommand } from "./platform/spawn.js";
 import { runDoctor, formatDoctor } from "./doctor.js";
 import { installService, pauseService, resumeService, startService, statusService, stopService } from "./service.js";
 import { loadState, readHistory, readPid } from "./state.js";
+import { queueLocalApproval } from "./config-repair.js";
 import { clientForAgent } from "./ziki.js";
 import { escalationUrl } from "./urls.js";
 import { BUILTIN_PROVIDERS, getProvider, listProviderIds } from "./providers/index.js";
@@ -47,6 +48,9 @@ Usage:
   auto-work report [--profile <name>] [--all] [--since 24h] [--json]
   auto-work history [--profile <name>] [--limit 50]
   auto-work logs [--profile <name>] [--lines 80] [--follow]
+  auto-work escalations [--profile <name>]
+  auto-work approve <escalation-id> [--note <text>] [--profile <name>]
+  auto-work reject <escalation-id> [--note <text>] [--profile <name>]
   auto-work escalations [--profile <name>]
   auto-work memory [--profile <name>]
   auto-work config [--show] [--validate]
@@ -1351,6 +1355,20 @@ async function escalations(flags) {
         loaded = null;
     }
     for (const escalation of open) {
+        if ((escalation.kind ?? "issue") === "config") {
+            console.log(`config repair · ${escalation.strategy ?? escalation.type} · rounds ${escalation.rounds ?? 1}`);
+            console.log(`  ${escalation.body.split("\n")[0]}`);
+            for (const op of escalation.configPatch ?? []) {
+                console.log(`  ~ ${op.path} → ${JSON.stringify(op.value)}`);
+            }
+            if (escalation.decision === "needs_info") {
+                console.log(`  awaiting revised proposal; last answer: ${escalation.answer ?? "(empty)"}`);
+            }
+            console.log(`  id: ${escalation.id}`);
+            console.log(`  approve: auto-work approve ${escalation.id}`);
+            console.log("");
+            continue;
+        }
         console.log(`${escalation.type} · #${escalation.issueNumber ?? "?"} ${escalation.issueTitle ?? ""}`);
         console.log(`  ${escalation.body}`);
         console.log(`  id: ${escalation.id}`);
@@ -1358,6 +1376,37 @@ async function escalations(flags) {
             console.log(`  link: ${escalationUrl(loaded.profile, escalation.issueNumber)}`);
         console.log("");
     }
+}
+async function approveCommand(flags, positionals, decision) {
+    const id = positionals[0];
+    if (!id) {
+        console.error(`Usage: auto-work ${decision === "approved" ? "approve" : "reject"} <escalation-id> [--note <text>] [--profile <name>]`);
+        process.exitCode = 2;
+        return;
+    }
+    const profileName = await resolveProfileName(flags);
+    const paths = profilePaths(profileName);
+    const state = await loadState(paths);
+    const escalation = state.escalations[id];
+    if (!escalation) {
+        console.error(`No escalation ${id} in profile "${profileName}".`);
+        process.exitCode = 1;
+        return;
+    }
+    if ((escalation.kind ?? "issue") !== "config") {
+        console.error(`Escalation ${id} is not a config repair (kind: ${escalation.kind ?? "issue"}).`);
+        process.exitCode = 1;
+        return;
+    }
+    if (escalation.status !== "open") {
+        console.error(`Escalation ${id} is ${escalation.status}, not open.`);
+        process.exitCode = 1;
+        return;
+    }
+    const note = str(flags, "note") || undefined;
+    await queueLocalApproval(paths, { id, decision, note, at: new Date().toISOString() });
+    console.log(`Queued ${decision} for config escalation ${id} (${escalation.strategy ?? escalation.type}). ` +
+        `The loop applies it on its next repair pass.`);
 }
 async function memory(flags) {
     const loaded = await loadProfile(str(flags, "profile"));
@@ -1534,6 +1583,12 @@ export async function main(argv = process.argv.slice(2)) {
             break;
         case "escalations":
             await escalations(flags);
+            break;
+        case "approve":
+            await approveCommand(flags, positionals, "approved");
+            break;
+        case "reject":
+            await approveCommand(flags, positionals, "rejected");
             break;
         case "memory":
             await memory(flags);

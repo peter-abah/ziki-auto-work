@@ -302,8 +302,24 @@ Auto-work also tells you directly:
 auto-work status --line     # one line, tmux/script friendly
 auto-work status --watch    # refresh every 30s
 auto-work escalations       # detailed list; exits 1 when something is open
+auto-work approve <id>      # approve a config-repair proposal (loop applies it)
+auto-work reject <id>       # reject a config-repair proposal
 auto-work report            # last run summary, including an abrupt end
 ```
+
+### Config repair (approval-gated self-healing)
+
+When a health blocker has an enabled repair strategy (see `repair` in
+Configuration), a `config-doctor` agent diagnoses the failure and proposes a
+minimal config patch. The orchestrator validates it against
+`repair.mutablePaths` — protected paths (repo/executor/providers/agents,
+hitl/repair, prompts, secrets) are refused even if listed — and posts it as a
+`human_approval` escalation on Ziki. Reply starting with `APPROVE` to apply it
+(atomic save + timestamped backup, hot-reload, loop resumes); anything else
+keeps the escalation open and triggers a revised proposal (max rounds
+configurable, then expiry). No agent output is ever applied without your
+approval. If Ziki is unreachable, use the local fallback above; the loop picks
+the decision up on its next repair pass.
 
 If you run headless, use `auto-work status --line` or configure
 `hitl.notify: "command"` with a local script.
@@ -389,6 +405,7 @@ auto-work report [--profile <name>] [--all] [--since 24h] [--json]
 auto-work history [--profile <name>] [--limit 50]
 auto-work logs [--profile <name>] [--lines 80] [--follow]
 auto-work escalations | memory | prompts
+auto-work approve <escalation-id> | reject <escalation-id>
 auto-work config [--show] [--validate]
 ```
 

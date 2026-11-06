@@ -67,6 +67,12 @@ export function classifyError(error, component) {
         if (error.status === 404) {
             return { component, code: "not_found", severity: "blocked", message, retryMs: RETRY_MS.config };
         }
+        if (error.status === 422 && /unknown platform|unknown .* id|unknown filter/i.test(`${code} ${message}`)) {
+            // Stable code for restructured Ziki taxonomies (categories/areas renamed
+            // server-side). Per-item failures stay warnings; the repair flow can
+            // propose a filter remap. See config-repair strategy "*:unknown_filter".
+            return { component, code: "unknown_filter", severity: "warning", message, retryMs: RETRY_MS.config };
+        }
         return { component, code: code || "error", severity: "warning", message, retryMs: RETRY_MS.generic };
     }
     if (isTransientNetworkError(error)) {

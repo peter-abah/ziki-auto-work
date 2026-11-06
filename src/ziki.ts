@@ -14,7 +14,8 @@ import type {
   TestVerdict,
   WorkFeed,
   WorkItem,
-  ApiContractStore
+  ApiContractStore,
+  ProjectSummary
 } from "./types.js";
 import { contractKey, formatApiErrorDetails, recordRejected, repairApiBody, stripRejectedFields } from "./api-repair.js";
 
@@ -77,6 +78,19 @@ export interface ApiRepairResult {
 }
 
 export type ApiRepairHandler = (context: ApiRepairContext) => Promise<ApiRepairResult | null>;
+
+/**
+ * Value to send as the `platform` query parameter on Ziki list endpoints.
+ * - `ziki.platformFilter` set → send it (category renames without touching identity).
+ * - `ziki.platformFilter: null` → omit the parameter.
+ * - absent → send `ziki.platform` (legacy behavior).
+ */
+export function apiPlatformFilter(profile: ProfileConfig): string | undefined {
+  const override = profile.ziki.platformFilter;
+  if (override === null) return undefined;
+  if (typeof override === "string" && override.trim()) return override.trim();
+  return profile.ziki.platform;
+}
 
 export class ZikiClient {
   baseUrl: string;
@@ -360,6 +374,14 @@ export class ZikiClient {
 
   project(): Promise<any> {
     return this.get(`/api/v1/projects/${this.projectId}`);
+  }
+
+  /**
+   * Every project in the agent's tenant — the recovery endpoint for a retired
+   * projectId. Needs no project scope, so it works while project routes 404.
+   */
+  listProjects(): Promise<{ items: ProjectSummary[] }> {
+    return this.get("/api/v1/projects");
   }
 
   async work(options: { etag?: string } = {}): Promise<{ notModified: boolean; data?: WorkFeed; etag?: string }> {

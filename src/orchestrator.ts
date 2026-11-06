@@ -1,9 +1,13 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type {
   AgentKey,
   Config,
+  ConfigPatchOp,
+  EscalationRecord,
+  HealthBlocker,
   HistoryEntry,
   Idea,
   Issue,
@@ -12,6 +16,7 @@ import type {
   LoadedProfile,
   Queue,
   QueueEntry,
+  RepairStrategyConfig,
   RunLimitConfig,
   State,
   TokenUsage,
@@ -27,7 +32,8 @@ import {
   resolveMergeMethod,
   resolveMergeMode,
   resolveParityFile,
-  resolveRunLimits
+  resolveRunLimits,
+  validateConfigPatch
 } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
 import type { Logger } from "./log.js";
@@ -51,7 +57,8 @@ import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
 import type { TaskKind } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
-import type { ApiRepairContext, ApiRepairResult, ZikiClient } from "./ziki.js";
+import { apiPlatformFilter } from "./ziki.js";
+import type { ApiRepairContext, ApiRepairHandler, ApiRepairResult, ZikiClient } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import type { PrComment } from "./github.js";
 import { formatPrContext } from "./pr-context.js";
@@ -63,6 +70,7 @@ import {
   runWorker,
   runDiscovery,
   runApiRepair,
+  runConfigDoctor,
   runReview,
   runFollowUp,
   runConfirm,
@@ -84,13 +92,13 @@ import {
 import { killProcessTree } from "./platform/process.js";
 import { loadMemoryContext, formatMemoryForPrompt, recordTaskNote } from "./memory.js";
 import type { MemoryContext } from "./memory.js";
-import { escalate, poll, writeNeedsHuman } from "./hitl.js";
+import { escalate, markEscalationExpired, poll, writeNeedsHuman } from "./hitl.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { rotatedKinds } from "./fair-queue.js";
 import { countGoodVerdicts, reviewGate, verdictsNeeded } from "./review-gate.js";
 import { errorMessage, isNoopZikiError, NOOP_PATTERNS } from "./noop.js";
 import { scanSecrets, protectedFiles } from "./checks.js";
-import { PACKAGE_ROOT, profilePaths, paths } from "./platform/paths.js";
+import { PACKAGE_ROOT, profilePaths, paths, safeName } from "./platform/paths.js";
 import { escalationUrl, inboxUrl, issueUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
 import { isTransientNetworkError } from "./network.js";
@@ -98,6 +106,21 @@ import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 import { resolveCapacity } from "./capacity.js";
+import {
+  applyConfigPatch,
+  blockerCode,
+  consumeLocalApprovals,
+  diagnoseProjectMismatch,
+  diagnoseUnknownFilter,
+  formatRepairEscalationBody,
+  isProjectNotFoundBlocker,
+  latestStrategyEscalation,
+  maxRoundsFor,
+  projectRotationPatch,
+  repairConfigFor,
+  strategyFor
+} from "./config-repair.js";
+import { APPROVAL_WORD } from "./hitl.js";
 import { cyclesThisRun, limitReached, remainingCycles } from "./run-limits.js";
 import { mergeWorkItemFeeds } from "./feed.js";
 import type { AgentFeed } from "./feed.js";
@@ -173,6 +196,8 @@ interface Context {
   unsupportedKinds: Set<string>;
   profileSynced: boolean;
   feedAgentCounts: Record<string, number>;
+  /** mtime of config.json when ctx.profile was loaded; hot-reload on change. */
+  configMtimeMs: number | null;
   zikiWorkflow: Record<string, unknown> | null;
   reservedTargets: Set<string>;
   statusTimer: NodeJS.Timeout | null;
@@ -749,6 +774,455 @@ async function clearHealth(ctx: Context, component: HealthComponent, code?: stri
   await writeNeedsHuman(ctx.state, ctx.profile, ctx.profilePaths).catch(() => {});
 }
 
+/** Recreate the apiRepair closure for the current profile (used at startup and on hot-reload). */
+function makeRepairHandler(options: {
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
+  logger: Logger;
+  dryRun: boolean;
+}): ApiRepairHandler {
+  return async (context: ApiRepairContext): Promise<ApiRepairResult | null> => {
+    if (options.dryRun) return null;
+    const result = await runApiRepair({
+      profile: options.profile,
+      profilePaths: options.profilePaths,
+      repoDir: path.join(options.profilePaths.reposDir, "repo"),
+      context,
+      logger: options.logger
+    });
+    const repaired = result.apiRepair;
+    if (!result.ok || !repaired) return null;
+    if (repaired.action === "abandon") return { abandon: repaired.reason ?? "agent abandoned the repair" };
+    if (repaired.action === "retry" && repaired.input !== undefined) return { body: repaired.input };
+    return null;
+  };
+}
+
+/**
+ * Hot-reload config.json when it changed on disk (human edits or an applied
+ * repair). Swaps the profile and rebuilds Ziki clients in place; the agent
+ * pool, worktrees and capacity stay untouched and apply on restart.
+ */
+async function maybeReloadConfig(ctx: Context, force = false): Promise<boolean> {
+  const mtime = await configFileMtimeMs();
+  if (!force && (mtime === null || mtime === ctx.configMtimeMs)) return false;
+  let loaded: LoadedProfile;
+  try {
+    loaded = await loadProfile(ctx.profileName);
+  } catch (error) {
+    ctx.logger.warn(
+      `Hot-reload skipped (keeping running config): ${error instanceof Error ? error.message : String(error)}`
+    );
+    return false;
+  }
+  ctx.loaded = loaded;
+  ctx.config = loaded.config;
+  ctx.profile = loaded.profile;
+  const repair = makeRepairHandler({
+    profile: loaded.profile,
+    profilePaths: loaded.profilePaths,
+    logger: ctx.logger,
+    dryRun: ctx.dryRun
+  });
+  const built = buildAgentClients(loaded, ctx.state, repair);
+  ctx.clients = built.clients;
+  ctx.primary = built.primary;
+  ctx.configMtimeMs = await configFileMtimeMs();
+  ctx.logger.info("Config reloaded from disk; Ziki clients rebuilt", {
+    projectId: loaded.profile.ziki.projectId
+  });
+  return true;
+}
+
+/**
+ * Approval-gated config repair for a blocked loop. Called when the top health
+ * blocker has an enabled repair strategy. Returns "wait" to stay parked or
+ * "continue" when the loop was repaired and a normal cycle may proceed.
+ *
+ * The agent only ever PROPOSES. Enforcement (allowlist, validation, backup)
+ * and persistence both happen here, and persistence happens only after a
+ * human approval — via Ziki escalation reply or `auto-work approve`.
+ */
+async function repairBlockedLoop(
+  ctx: Context,
+  code: string,
+  blocker: HealthBlocker
+): Promise<"wait" | "continue"> {
+  const strategy = strategyFor(ctx.profile, code);
+  if (!strategy) return "wait";
+  if (code === "platform:not_found" && !isProjectNotFoundBlocker(code, blocker.message)) {
+    // A 404 with any other body (renamed route, moved endpoint) is not a
+    // retired project — stay parked and let a human look.
+    ctx.logger.warn(`Blocked on ${code} with an unrecognized message; skipping config repair`, {
+      message: blocker.message
+    });
+    return "wait";
+  }
+  setPhase(ctx, "repair", code);
+  return runRepairStateMachine(ctx, code, blocker, strategy);
+}
+
+/**
+ * Warning-level repair driver: warning blockers never park the loop, but a
+ * matching strategy (e.g. "*:unknown_filter") still gets its diagnosis +
+ * proposal + escalation cycle. Flow always continues afterwards.
+ */
+async function repairWarningLoop(ctx: Context): Promise<void> {
+  const blockers = Object.values(ctx.state.health.blockers ?? {}).filter(
+    (blocker) => blocker.severity === "warning"
+  );
+  for (const blocker of blockers) {
+    const code = blockerCode(blocker);
+    if (!code) continue;
+    const strategy = strategyFor(ctx.profile, code);
+    if (!strategy) continue;
+    await runRepairStateMachine(ctx, code, blocker, strategy).catch((error) => {
+      ctx.logger.warn(
+        `Config repair failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+  }
+}
+
+/** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. */
+async function runRepairStateMachine(
+  ctx: Context,
+  code: string,
+  blocker: HealthBlocker,
+  strategy: RepairStrategyConfig
+): Promise<"wait" | "continue"> {
+  setPhase(ctx, "repair", code);
+
+  await reapRepairAnswers(ctx);
+  await consumeRepairApprovals(ctx);
+
+  const existing = latestStrategyEscalation(ctx.state, code);
+  if (existing) {
+    if (existing.decision === "approved" && existing.configPatch?.length) {
+      return applyApprovedRepair(ctx, code, existing);
+    }
+    if (existing.decision === "rejected" || existing.status === "dismissed") {
+      ctx.logger.info(`Config repair for ${code} was rejected; staying parked until the config changes`);
+      await save(ctx).catch(() => {});
+      return "wait";
+    }
+    if (existing.decision === "needs_info") {
+      const maxRounds = maxRoundsFor(strategy);
+      if ((existing.rounds ?? 1) >= maxRounds) {
+        markEscalationExpired(
+          ctx.state,
+          existing.id,
+          `max proposal rounds (${maxRounds}) reached without approval`
+        );
+        history(ctx, {
+          type: "health",
+          detail: `config repair expired: ${code}`,
+          data: { escalation: existing.id }
+        });
+        await save(ctx).catch(() => {});
+        return "wait";
+      }
+      return startRepairRound(ctx, code, blocker, strategy, existing);
+    }
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
+  return startRepairRound(ctx, code, blocker, strategy, null);
+}
+
+/** Poll Ziki for escalation answers without touching other health state. */
+async function reapRepairAnswers(ctx: Context): Promise<void> {
+  try {
+    await poll(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
+      logger: ctx.logger,
+      markInboxRead: !ctx.dryRun,
+      clientForName: (name) => clientByName(ctx, name)?.client ?? null
+    });
+  } catch (error) {
+    ctx.logger.warn(
+      `Repair poll failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+/** Consume locally queued CLI approvals (`auto-work approve`) into open config escalations. */
+async function consumeRepairApprovals(ctx: Context): Promise<void> {
+  const approvals = await consumeLocalApprovals(ctx.profilePaths).catch(() => []);
+  for (const approval of approvals) {
+    const escalation = ctx.state.escalations[approval.id];
+    if (!escalation || (escalation.kind ?? "issue") !== "config" || escalation.status !== "open") {
+      ctx.logger.warn(`Ignoring local approval for unknown/closed escalation ${approval.id}`);
+      continue;
+    }
+    if (approval.decision === "approved") {
+      escalation.decision = "approved";
+      escalation.answer = approval.note ?? `${APPROVAL_WORD} via CLI`;
+      escalation.resolvedAt = new Date().toISOString();
+      ctx.logger.info(`Config escalation ${approval.id} approved via CLI`);
+      history(ctx, {
+        type: "health",
+        detail: `config repair approved via CLI: ${escalation.strategy ?? "?"}`,
+        data: { escalation: approval.id }
+      });
+    } else {
+      escalation.decision = "rejected";
+      escalation.answer = approval.note ?? "rejected via CLI";
+      escalation.status = "dismissed";
+      escalation.resolvedAt = new Date().toISOString();
+      ctx.logger.info(`Config escalation ${approval.id} rejected via CLI`);
+      history(ctx, {
+        type: "health",
+        detail: `config repair rejected via CLI: ${escalation.strategy ?? "?"}`,
+        data: { escalation: approval.id }
+      });
+    }
+  }
+  if (approvals.length) await save(ctx).catch(() => {});
+}
+
+/** Validate + persist an approved patch, clear the blocker, adopt it in memory. */
+async function applyApprovedRepair(
+  ctx: Context,
+  code: string,
+  escalation: EscalationRecord
+): Promise<"wait" | "continue"> {
+  const ops = escalation.configPatch ?? [];
+  const repair = repairConfigFor(ctx.profile);
+  const check = validateConfigPatch(ctx.profile, ops, repair);
+  if (!check.ok) {
+    markEscalationExpired(
+      ctx.state,
+      escalation.id,
+      `approved patch no longer validates: ${check.errors.join("; ")}`
+    );
+    history(ctx, {
+      type: "health",
+      detail: `config repair expired (stale patch): ${code}`,
+      data: { escalation: escalation.id, errors: check.errors }
+    });
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
+  const applied = await applyConfigPatch(ctx.config, ctx.profileName, ctx.profilePaths, ops, ctx.logger);
+  if (!applied.ok) {
+    markEscalationExpired(
+      ctx.state,
+      escalation.id,
+      `approved patch failed to apply: ${(applied.errors ?? []).join("; ")}`
+    );
+    history(ctx, {
+      type: "health",
+      detail: `config repair failed to apply: ${code}`,
+      data: { escalation: escalation.id, errors: applied.errors ?? [] }
+    });
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
+  escalation.status = "applied";
+  escalation.appliedAt = new Date().toISOString();
+  const [component, ...rest] = code.split(":");
+  await clearHealth(ctx, component as HealthComponent, rest.join(":") || undefined);
+  ctx.platform = { issues: [], ideas: [], fetchedAt: null };
+  await unlink(ctx.profilePaths.desktopCacheFile).catch(() => {});
+  await maybeReloadConfig(ctx, true);
+  try {
+    const data = await ctx.primary.client.project();
+    const project = data?.project ?? data;
+    ctx.zikiWorkflow = (project?.workflow ?? null) as Record<string, unknown> | null;
+  } catch (error) {
+    ctx.logger.warn(
+      `Post-repair project read failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  history(ctx, {
+    type: "health",
+    detail: `config repair applied: ${code}`,
+    data: { escalation: escalation.id, backup: applied.backupFile ?? null }
+  });
+  await notifyProfile(
+    ctx.profile,
+    "auto-work: config repair applied",
+    `Approved patch applied for ${code}; loop resumed. Backup: ${applied.backupFile ?? "n/a"}`,
+    ctx.logger
+  ).catch(() => {});
+  await save(ctx).catch(() => {});
+  return "continue";
+}
+
+/** One proposal round: deterministic diagnosis as evidence + agent proposal + escalation. */
+async function startRepairRound(
+  ctx: Context,
+  code: string,
+  blocker: HealthBlocker,
+  strategy: RepairStrategyConfig,
+  previous: EscalationRecord | null
+): Promise<"wait" | "continue"> {
+  const repair = repairConfigFor(ctx.profile);
+  const maxRounds = maxRoundsFor(strategy);
+  const round = (previous?.rounds ?? 0) + 1;
+  const evidence: string[] = [
+    `${code} — ${blocker.message} (attempts: ${blocker.attempts ?? "?"}, since: ${blocker.since ?? blocker.lastAttemptAt ?? "?"})`
+  ];
+  let deterministicOps: ConfigPatchOp[] = [];
+  let deterministicSummary = "";
+  const shortCode = code.includes(":") ? code.split(":").slice(1).join(":") : code;
+  if (shortCode === "not_found" && code === "platform:not_found") {
+    try {
+      const diagnosis = await diagnoseProjectMismatch(ctx.primary.client, ctx.profile, ctx.logger);
+      evidence.push(
+        `tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`
+      );
+      if (diagnosis.match) {
+        deterministicOps = projectRotationPatch(diagnosis.match.project, diagnosis.match.reason);
+        deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone on Ziki; matched replacement ${diagnosis.match.project.slug} (${diagnosis.match.reason}).`;
+      } else if (diagnosis.ambiguous?.length) {
+        deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone; ${diagnosis.ambiguous.length} candidates need a human pick — no automatic proposal.`;
+      } else {
+        deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone; no tenant project matches platform "${ctx.profile.ziki.platform}".`;
+      }
+    } catch (error) {
+      deterministicSummary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  } else if (shortCode === "unknown_filter") {
+    try {
+      const diagnosis = await diagnoseUnknownFilter(ctx.primary.client, ctx.profile, ctx.logger);
+      evidence.push(
+        `tenant platforms: ${diagnosis.platforms.map((platform) => platform.slug ?? platform.name ?? "?").join(", ") || "(none listed)"}`
+      );
+      if (diagnosis.resolves) {
+        await clearHealth(ctx, blocker.component, blocker.code);
+        ctx.logger.info(`Platform filter "${diagnosis.current}" resolves again; clearing ${code}`);
+        history(ctx, { type: "health", detail: `config warning cleared: ${code}`, data: {} });
+        await save(ctx).catch(() => {});
+        return "continue";
+      }
+      deterministicOps = diagnosis.suggested;
+      deterministicSummary = diagnosis.reason;
+    } catch (error) {
+      deterministicSummary = `Platform list lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  } else {
+    deterministicSummary = `No deterministic diagnosis for ${code}; relying on the agent proposal.`;
+  }
+
+  if (ctx.dryRun) {
+    ctx.logger.info(`Dry run: config-repair round ${round}/${maxRounds} for ${code} (no agent, no escalation)`, {
+      deterministicOps,
+      summary: deterministicSummary
+    });
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
+
+  const doctor = await runRepairDoctor(ctx, code, blocker, evidence, previous).catch((error) => {
+    ctx.logger.warn(
+      `Config-doctor agent failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return null;
+  });
+  let ops = doctor?.configPatch ?? [];
+  let summary = doctor?.summary || deterministicSummary;
+  let agentNotes = doctor?.notes ?? null;
+  if ((!ops.length || !validateConfigPatch(ctx.profile, ops, repair).ok) && deterministicOps.length) {
+    ctx.logger.info("Config-doctor proposal unusable; escalating the deterministic diagnosis instead");
+    ops = deterministicOps;
+    summary = deterministicSummary;
+    agentNotes = [agentNotes, doctor ? "agent proposal failed validation" : "agent failed to run"]
+      .filter(Boolean)
+      .join("; ");
+  }
+  const check = validateConfigPatch(ctx.profile, ops, repair);
+  if (!check.ok || !ops.length) {
+    ctx.logger.warn(`Config-repair round produced no valid patch for ${code}`, { errors: check.errors });
+    history(ctx, {
+      type: "health",
+      detail: `config repair round ${round} produced no valid patch: ${code}`,
+      data: { errors: check.errors }
+    });
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
+
+  const body = formatRepairEscalationBody({
+    strategy: code,
+    failureMessage: blocker.message,
+    summary,
+    ops,
+    evidence: [...evidence, ...(agentNotes ? [`agent notes: ${agentNotes}`] : [])],
+    round,
+    previousAnswer: previous?.answer ?? null
+  });
+  const escalated = await escalate(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
+    kind: "config",
+    type: "human_approval",
+    strategy: code,
+    configPatch: ops,
+    previousId: previous?.id ?? null,
+    rounds: round,
+    body,
+    agentName: "config-doctor"
+  });
+  if (!escalated.ok) {
+    ctx.logger.warn(`Config-repair escalation failed: ${escalated.error ?? "unknown error"}`);
+    history(ctx, {
+      type: "health",
+      detail: `config repair escalation failed: ${code}`,
+      data: { error: escalated.error ?? "unknown" }
+    });
+  } else {
+    ctx.logger.info(`Config repair proposed for ${code}; awaiting human approval`, {
+      escalation: escalated.escalation?.id
+    });
+  }
+  await save(ctx).catch(() => {});
+  return "wait";
+}
+
+/** Spawn the config-doctor agent for one proposal round. */
+async function runRepairDoctor(
+  ctx: Context,
+  code: string,
+  blocker: HealthBlocker,
+  evidence: string[],
+  previous: EscalationRecord | null
+): Promise<{ configPatch?: ConfigPatchOp[]; summary?: string; notes?: string } | null> {
+  const repair = repairConfigFor(ctx.profile);
+  const loopContext = await loopContextFor(ctx, {}).catch(() => "(loop context unavailable)");
+  const hooks = agentHooks(ctx);
+  const result = await runConfigDoctor({
+    profile: ctx.profile,
+    profilePaths: ctx.profilePaths,
+    repoDir: path.join(ctx.profilePaths.reposDir, "repo"),
+    failureCode: code,
+    failureMessage: blocker.message,
+    attempts: blocker.attempts ?? 0,
+    evidence: evidence.join("\n"),
+    configSlice: {
+      ziki: ctx.profile.ziki,
+      discovery: ctx.profile.discovery,
+      pollSeconds: ctx.profile.pollSeconds,
+      memoryRefreshMinutes: ctx.profile.memoryRefreshMinutes
+    },
+    mutablePaths: repair.mutablePaths,
+    allowNewKeys: repair.allowNewKeys,
+    previousAnswer: previous?.answer ?? null,
+    loopContext,
+    memoryText: ctx.memoryText,
+    logger: ctx.logger,
+    onSpawn: hooks.onSpawn,
+    onExit: hooks.onExit
+  });
+  if (!result.ok || result.blocked) {
+    ctx.logger.warn(`Config-doctor blocked/failed: ${result.blocker ?? result.error ?? "unknown"}`);
+    return null;
+  }
+  return {
+    configPatch: result.configPatch,
+    summary: result.summary,
+    notes: result.notes?.join("; ")
+  };
+}
+
 interface FeedFailure {
   agent: string;
   error: unknown;
@@ -1285,8 +1759,8 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
   }
   try {
     const [issues, ideas] = await Promise.all([
-      ctx.primary.client.listAllIssues({ platform: ctx.profile.ziki.platform, max: 2000 }),
-      ctx.primary.client.listAllIdeas({ platform: ctx.profile.ziki.platform, max: 1000 })
+      ctx.primary.client.listAllIssues({ platform: apiPlatformFilter(ctx.profile), max: 2000 }),
+      ctx.primary.client.listAllIdeas({ platform: apiPlatformFilter(ctx.profile), max: 1000 })
     ]);
     const data: Context["platform"] = {
       fetchedAt: new Date().toISOString(),
@@ -3436,6 +3910,9 @@ async function discoveryPass(ctx: Context): Promise<void> {
     return;
   }
   const ideas = (result.ideas ?? []).slice(0, ctx.profile.discovery.maxIdeasPerRun ?? 3);
+  const filed: string[] = [];
+  const skipped: string[] = [];
+  const failed: Array<{ title: string; error: string }> = [];
   for (const idea of ideas) {
     if (!idea?.title || !idea?.description) continue;
     const baseInput = {
@@ -3453,6 +3930,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
       const createdIdea = normalizeIdea(created);
       counter(ctx).discoveries += 1;
       ctx.state.run.discoveries += 1;
+      filed.push(idea.title);
       const converted = created?.converted;
       ctx.logger.info(
         converted?.issueNumber
@@ -3464,6 +3942,7 @@ async function discoveryPass(ctx: Context): Promise<void> {
       const code = String((error as { body?: { error?: string } }).body?.error ?? "");
       if (status === 409) {
         ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
+        skipped.push(idea.title);
       } else if (vetted && (status === 429 || code === "vetted_limit" || status === 400 || code === "invalid_request")) {
         ctx.logger.warn(`Vetted idea refused (${code || status}); filing it normally: ${idea.title}`);
         try {
@@ -3471,20 +3950,33 @@ async function discoveryPass(ctx: Context): Promise<void> {
           const createdIdea = normalizeIdea(retried);
           counter(ctx).discoveries += 1;
           ctx.state.run.discoveries += 1;
+          filed.push(idea.title);
           ctx.logger.info(`Filed idea #${createdIdea?.number ?? "?"}: ${idea.title}`);
         } catch (retryError) {
           const retryStatus = (retryError as { status?: number }).status;
-          if (retryStatus === 409) ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
-          else ctx.logger.warn(`Could not file idea "${idea.title}": ${retryError instanceof Error ? retryError.message : String(retryError)}`);
+          const message = retryError instanceof Error ? retryError.message : String(retryError);
+          if (retryStatus === 409) {
+            ctx.logger.info(`Idea skipped as similar: ${idea.title}`);
+            skipped.push(idea.title);
+          } else {
+            ctx.logger.warn(`Could not file idea "${idea.title}": ${message}`);
+            failed.push({ title: idea.title, error: message });
+          }
         }
       } else {
-        ctx.logger.warn(`Could not file idea "${idea.title}": ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.logger.warn(`Could not file idea "${idea.title}": ${message}`);
+        failed.push({ title: idea.title, error: message });
       }
     }
   }
   if (ideas.length) {
-    history(ctx, { type: "discovery", detail: `filed ${ideas.length} idea(s)`, data: { ideas: ideas.map((idea) => idea.title) } });
-    await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${ideas.length} idea(s)`, ideas.map((idea) => `- ${idea.title}`).join("\n"), ctx.state, ctx.primary.name);
+    history(ctx, {
+      type: "discovery",
+      detail: `discovery: ${filed.length} filed, ${skipped.length} similar, ${failed.length} failed of ${ideas.length} proposed`,
+      data: { filed, skipped, failed: failed.map((entry) => entry.title) }
+    });
+    await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${filed.length} of ${ideas.length} idea(s)`, [...filed.map((title) => `- ${title}`), ...failed.map((entry) => `- FAILED ${entry.title}: ${entry.error}`)].join("\n"), ctx.state, ctx.primary.name);
   }
   await save(ctx);
 }
@@ -3669,10 +4161,30 @@ async function runCycle(ctx: Context): Promise<{
     ctx.logger.info("Paused; waiting for resume");
     return { paused: true };
   }
+  await maybeReloadConfig(ctx).catch((error) => {
+    ctx.logger.warn(
+      `Config hot-reload check failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  });
   const healthState = summarizeHealth(ctx.state.health);
-  if (healthState.state === "blocked" && nextRetryDelay(ctx.state.health) !== null) {
-    setPhase(ctx, "blocked");
-    return { blocked: true };
+  if (healthState.state === "blocked") {
+    const top = healthState.blockers[0];
+    const code = top ? blockerCode(top) : null;
+    if (code && strategyFor(ctx.profile, code)) {
+      const outcome = await repairBlockedLoop(ctx, code, top!).catch((error) => {
+        ctx.logger.warn(
+          `Config repair failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+        return "wait" as const;
+      });
+      if (outcome === "wait") {
+        setPhase(ctx, "blocked");
+        return { blocked: true };
+      }
+    } else if (nextRetryDelay(ctx.state.health) !== null) {
+      setPhase(ctx, "blocked");
+      return { blocked: true };
+    }
   }
 
   setPhase(ctx, "poll");
@@ -3721,6 +4233,13 @@ async function runCycle(ctx: Context): Promise<{
   }
 
   ctx.platform = await loadPlatformSets(ctx);
+  // Warning-level repair (e.g. renamed Ziki categories): diagnose + escalate
+  // without parking the loop. Failures here must never break the cycle.
+  await repairWarningLoop(ctx).catch((error) => {
+    ctx.logger.warn(
+      `Warning-level repair failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  });
   const platformNumbers = new Set(ctx.platform.issues.map((issue) => issue.number));
   const platformIdeaNumbers = new Set(ctx.platform.ideas.map((idea) => idea.number));
   ctx.queue = buildQueue({
@@ -4002,28 +4521,10 @@ async function createContext(
   options: { dryRun: boolean; runLimits: RunLimitConfig }
 ): Promise<Context> {
   const { profile, profileName, keys } = loaded;
-  const repair = async (context: ApiRepairContext): Promise<ApiRepairResult | null> => {
-    if (options.dryRun) return null;
-    const result = await runApiRepair({
-      profile,
-      profilePaths: loaded.profilePaths,
-      repoDir: path.join(loaded.profilePaths.reposDir, "repo"),
-      context,
-      logger
-    });
-    const repaired = result.apiRepair;
-    if (!result.ok || !repaired) return null;
-    if (repaired.action === "abandon") return { abandon: repaired.reason ?? "agent abandoned the repair" };
-    if (repaired.action === "retry" && repaired.input !== undefined) return { body: repaired.input };
-    return null;
-  };
-  const toClients = (agents: AgentKey[]): AgentClient[] =>
-    agents.map((agent) => ({ ...agent, client: clientForAgent(agent, profile, { contracts: state.apiContracts, repair }) }));
-  const clients = {
-    workers: toClients(keys.workers),
-    managers: toClients(keys.managers)
-  };
-  const primary = clients.workers[0] ?? clients.managers[0];
+  const repair = makeRepairHandler({ profile, profilePaths: loaded.profilePaths, logger, dryRun: options.dryRun });
+  const built = buildAgentClients(loaded, state, repair);
+  const clients = built.clients;
+  const primary = built.primary;
   if (!primary) throw new Error("No valid agent keys. Add them to the env file.");
   const capacity = resolveCapacity(profile, keys);
   let zikiWorkflow: Record<string, unknown> | null = null;
@@ -4097,10 +4598,39 @@ async function createContext(
     unsupportedKinds: new Set(),
     profileSynced: false,
     feedAgentCounts: {},
+    configMtimeMs: await configFileMtimeMs(),
     zikiWorkflow,
     reservedTargets: new Set(),
     statusTimer: null
   };
+}
+
+/** Build per-agent Ziki clients for one loaded profile (rebuilt on repair/hot-reload). */
+function buildAgentClients(
+  loaded: LoadedProfile,
+  state: State,
+  repair: ApiRepairHandler | undefined
+): { clients: Context["clients"]; primary: AgentClient } {
+  const toClients = (agents: AgentKey[]): AgentClient[] =>
+    agents.map((agent) => ({
+      ...agent,
+      client: clientForAgent(agent, loaded.profile, { contracts: state.apiContracts, repair })
+    }));
+  const clients = {
+    workers: toClients(loaded.keys.workers),
+    managers: toClients(loaded.keys.managers)
+  };
+  const primary = clients.workers[0] ?? clients.managers[0];
+  if (!primary) throw new Error("No valid agent keys. Add them to the env file.");
+  return { clients, primary };
+}
+
+async function configFileMtimeMs(): Promise<number | null> {
+  try {
+    return (await stat(paths().configFile)).mtimeMs;
+  } catch {
+    return null;
+  }
 }
 
 async function readRunLimitsFile(profilePaths: ProfilePaths): Promise<Partial<RunLimitConfig> | null> {
@@ -4110,6 +4640,31 @@ async function readRunLimitsFile(profilePaths: ProfilePaths): Promise<Partial<Ru
   } catch {
     return null;
   }
+}
+
+/**
+ * Split-brain guard: the state dir depends on ambient env (XDG_STATE_HOME /
+ * AUTO_WORK_STATE_DIR), so a loop started from another shell may live in a
+ * different directory for the same profile. Refuse to start when that other
+ * directory holds a live lock — otherwise two loops diverge and both the
+ * queue and the cycle counters fork.
+ */
+async function findForeignLoop(
+  profileName: string,
+  activeDir: string
+): Promise<{ dir: string; pid: number } | null> {
+  const candidates = new Set<string>([
+    path.join(os.homedir(), ".local", "state", "auto-work", "profiles", safeName(profileName))
+  ]);
+  const xdg = process.env.XDG_STATE_HOME;
+  if (xdg) candidates.add(path.join(xdg, "auto-work", "profiles", safeName(profileName)));
+  for (const dir of candidates) {
+    if (path.resolve(dir) === path.resolve(activeDir)) continue;
+    const raw = await readFile(path.join(dir, "auto-work.pid"), "utf8").catch(() => "");
+    const pid = Number(raw.trim());
+    if (pid && isAlive(pid)) return { dir, pid };
+  }
+  return null;
 }
 
 function killStalePids(state: State, logger: Logger): number[] {
@@ -4225,6 +4780,16 @@ export async function runLoop(options: {
   const lock = await acquireLock(loaded.profilePaths);
   if (!lock.acquired) {
     logger.error(`Another auto-work loop is running for profile "${loaded.profileName}" (pid ${lock.pid}).`);
+    return 1;
+  }
+  logger.info(`State dir: ${loaded.profilePaths.stateDir}`);
+  const foreignLoop = await findForeignLoop(loaded.profileName, loaded.profilePaths.stateDir);
+  if (foreignLoop) {
+    logger.error(
+      `Another auto-work loop holds profile "${loaded.profileName}" in a different state dir (${foreignLoop.dir}, pid ${foreignLoop.pid}). Stop it first, or run every command with the same AUTO_WORK_STATE_DIR.`
+    );
+    await releaseLock(loaded.profilePaths);
+    await clearPid(loaded.profilePaths);
     return 1;
   }
 
@@ -4407,9 +4972,9 @@ export async function runLoop(options: {
         await ctx.pool.drain(120_000);
         break;
       }
-      const retry = nextRetryDelay(ctx.state.health);
-      const waitMs = Math.max(ctx.profile.pollSeconds * 1000, retry ?? 0);
-      await Promise.race([ctx.pool.waitForAny(), sleep(waitMs, controller.signal)]);
+            const retry = nextRetryDelay(ctx.state.health);
+            const waitMs = Math.max(ctx.profile.pollSeconds * 1000, retry ?? 0);
+            await ctx.pool.waitForPoolOrTimeout(Number.isFinite(waitMs) ? waitMs : ctx.profile.pollSeconds * 1000, controller.signal);
     } while (!controller.signal.aborted);
   } catch (error) {
     stopReason = "error";
