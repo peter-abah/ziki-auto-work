@@ -11,6 +11,11 @@ export declare function initTemplatesPath(): string;
 export declare function loadInitTemplates(): Promise<InitTemplates>;
 /** Synchronous variant for tests that pre-load via loadInitTemplates first. */
 export declare function getCachedTemplates(): InitTemplates | null;
+/**
+ * Synchronous template load for sync call sites (defaultConfig, patch
+ * validation). Same file, same data as the async loader; result is cached.
+ */
+export declare function loadInitTemplatesSync(): InitTemplates;
 export declare function templateVersion(templates: InitTemplates): number;
 /**
  * Fill every missing top-level section of a profile from init templates.

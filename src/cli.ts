@@ -414,25 +414,22 @@ function discoveryConfig(
 
 function baseProfile(overrides: Partial<ProfileConfig>): ProfileConfig {
   const defaults = defaultConfig().defaults ?? {};
+  // Structural placeholders only — every behavioral value (limits, workflow,
+  // prTracking, discovery, poll cadence, hitl, transport, operations, …) is
+  // filled from config/init-templates.json by stampV4, never from literals.
   return deepMerge(
     {
-      ziki: { baseUrl: "https://ziki.dev", projectId: "", projectSlug: "", platform: "" },
+      ziki: { baseUrl: "", projectId: "", projectSlug: "", platform: "" },
       repo: { url: "", upstream: "", base: "main", githubRepo: "", forkOwner: "", defaultBranch: "main" },
       agents: { workers: [], managers: [] },
-      executor: { provider: "opencode", model: null, timeoutMs: 2_700_000, permissionMode: "auto" },
+      executor: { provider: "opencode", model: null },
       toolchain: {},
       checks: [],
       platformMatch: {},
       prompts: { dir: "prompts/generic" },
       pr: { templateFile: "prompts/generic/pr.md" },
-      prTracking: { enabled: true, pollMinutes: 10, maxFollowUps: 10, fixFailingChecks: true, fixReviewComments: true },
-      discovery: { enabled: false, maxIdeasPerRun: 3 },
-      limits: { ...DEFAULT_LIMITS },
-      workflow: { ...DEFAULT_WORKFLOW },
-      pollSeconds: 120,
-      memoryRefreshMinutes: 30,
-      hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null }
-    } as ProfileConfig,
+      discovery: { enabled: false }
+    } as unknown as ProfileConfig,
     { ...defaults, ...overrides }
   ) as ProfileConfig;
 }
@@ -445,6 +442,19 @@ async function initFromExample(name: string): Promise<Config> {
   if (!validation.ok) throw new Error(`Example is invalid: ${validation.errors.join("; ")}`);
   await saveConfig(example);
   return example;
+}
+
+async function templateBaseUrl(): Promise<string> {
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = (await loadInitTemplates()) as unknown as Record<string, unknown>;
+  if (typeof templates.defaultBaseUrl !== "string" || !templates.defaultBaseUrl) {
+    throw new Error("init templates missing defaultBaseUrl");
+  }
+  return templates.defaultBaseUrl;
+}
+
+async function flagBaseUrl(flags: Flags): Promise<string> {
+  return str(flags, "base-url") || (await templateBaseUrl());
 }
 
 async function stampV4(config: Config): Promise<Config> {
@@ -488,7 +498,7 @@ async function ask(question: string, fallback: string): Promise<string> {
 
 async function initWizard(flags: Flags): Promise<Config | null> {
   const yes = Boolean(flags.yes);
-  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const baseUrl = await flagBaseUrl(flags);
 
   let existing: Config;
   try {
@@ -656,7 +666,7 @@ async function initWizard(flags: Flags): Promise<Config | null> {
 async function initDiscover(flags: Flags): Promise<void> {
   const yes = Boolean(flags.yes);
   const dryRun = Boolean(flags["dry-run"]);
-  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const baseUrl = await flagBaseUrl(flags);
   const gh = str(flags, "gh") || "gh";
 
   let existing: Config;
@@ -1596,7 +1606,7 @@ async function memory(flags: Flags): Promise<void> {
 
 async function keysCommand(flags: Flags, positionals: string[]): Promise<void> {
   const sub = positionals[0] || "check";
-  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const baseUrl = await flagBaseUrl(flags);
   if (sub === "import") {
     const file = positionals[1] || str(flags, "file") || str(flags, "keys-file");
     if (!file) throw new Error("Usage: auto-work keys import <file>");

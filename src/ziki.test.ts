@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ZikiClient } from "./ziki.js";
-import type { ApiContractStore } from "./types.js";
+import type { ApiContractStore, OperationConfig, TransportConfig } from "./types.js";
+import { loadInitTemplates } from "./config-templates.js";
+
+const templates = await loadInitTemplates();
+const testTransport = templates.transport as unknown as TransportConfig;
+const testOperations = templates.operations as unknown as Record<string, Record<string, OperationConfig>>;
+const testEndpoints = templates.endpoints as unknown as Record<string, Record<string, string>>;
 
 interface Call {
   method: string;
@@ -26,6 +32,9 @@ function fakeClient(): { client: ZikiClient; calls: Call[] } {
       apiKey: "key",
       projectId: "project_1",
       projectSlug: "demo",
+      endpoints: testEndpoints,
+      transport: testTransport,
+      operations: testOperations,
       agentName: "agent"
     }),
     calls
@@ -146,6 +155,9 @@ test("unknown validation fields are dropped, recorded and retried", async () => 
     apiKey: "key",
     projectId: "project_1",
     projectSlug: "demo",
+    endpoints: testEndpoints,
+    transport: testTransport,
+    operations: testOperations,
     agentName: "agent",
     contracts
   });
@@ -182,6 +194,9 @@ test("an agent repair callback can correct an otherwise rejected payload", async
     apiKey: "key",
     projectId: "project_1",
     projectSlug: "demo",
+    endpoints: testEndpoints,
+    transport: testTransport,
+    operations: testOperations,
     agentName: "agent",
     repair: async () => ({ body: { title: "x", summary: "A sufficiently detailed summary for the API." } })
   });
@@ -201,6 +216,9 @@ test("a login page instead of a work feed fails loudly, not silently", async () 
     apiKey: "key",
     projectId: "project_1",
     projectSlug: "demo",
+    endpoints: testEndpoints,
+    transport: testTransport,
+    operations: testOperations,
     agentName: "agent"
   });
   await assert.rejects(client.work(), /unexpected response shape/);
@@ -219,6 +237,9 @@ test("a valid work feed passes shape validation", async () => {
     apiKey: "key",
     projectId: "project_1",
     projectSlug: "demo",
+    endpoints: testEndpoints,
+    transport: testTransport,
+    operations: testOperations,
     agentName: "agent"
   });
   const result = await client.work();

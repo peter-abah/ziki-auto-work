@@ -1,7 +1,29 @@
 import { ZikiClient } from "./ziki.js";
-export async function inspectKey(envName, key, baseUrl = "https://ziki.dev") {
+import { loadInitTemplates } from "./config-templates.js";
+/** Key-validation client: transport/operations/endpoints come from init templates (data, not code). */
+async function validationClient(baseUrl, apiKey, agentName) {
+    const templates = await loadInitTemplates();
+    return new ZikiClient({
+        baseUrl,
+        apiKey,
+        projectId: "",
+        projectSlug: "",
+        endpoints: (templates.endpoints ?? {}),
+        transport: (templates.transport ?? {}),
+        operations: (templates.operations ?? {}),
+        agentName
+    });
+}
+async function defaultBaseUrl() {
+    const templates = await loadInitTemplates();
+    const url = templates.defaultBaseUrl;
+    if (typeof url !== "string" || !url)
+        throw new Error("init templates missing defaultBaseUrl");
+    return url;
+}
+export async function inspectKey(envName, key, baseUrl) {
     try {
-        const client = new ZikiClient({ baseUrl, apiKey: key, projectId: "", projectSlug: "" });
+        const client = await validationClient(baseUrl ?? (await defaultBaseUrl()), key, envName);
         const me = await client.me();
         const projects = Array.isArray(me?.projects)
             ? me.projects
@@ -34,7 +56,7 @@ export async function inspectKey(envName, key, baseUrl = "https://ziki.dev") {
         };
     }
 }
-export async function inspectKeys(env, baseUrl = "https://ziki.dev") {
+export async function inspectKeys(env, baseUrl) {
     const names = Object.keys(env).filter((name) => name.startsWith("ZIKI_") && env[name]);
     return Promise.all(names.map((name) => inspectKey(name, env[name], baseUrl)));
 }
@@ -90,7 +112,7 @@ export function knownProjects(items) {
     return [...seen.values()];
 }
 export async function listPlatforms(baseUrl, key) {
-    const client = new ZikiClient({ baseUrl, apiKey: key, projectId: "", projectSlug: "" });
+    const client = await validationClient(baseUrl, key, "bootstrap");
     const data = await client.platforms();
     const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
     return items

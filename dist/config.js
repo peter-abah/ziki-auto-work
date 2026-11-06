@@ -3,7 +3,12 @@ import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
 import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
 import { PROVIDER_IDS } from "./providers/index.js";
-import { BUILTIN_IDENTITY_VARS, DEFAULT_ENDPOINTS, validateEndpointVars, validateEndpoints } from "./ziki-endpoints.js";
+import { BUILTIN_IDENTITY_VARS, validateEndpointVars, validateEndpoints } from "./ziki-endpoints.js";
+import { loadInitTemplatesSync } from "./config-templates.js";
+function templateEndpoints() {
+    const templates = loadInitTemplatesSync();
+    return (templates.endpoints ?? {});
+}
 export const PROVIDERS = PROVIDER_IDS;
 export const DEFAULT_LIMITS = {
     maxActiveClaims: "auto",
@@ -210,7 +215,7 @@ export function validateConfigPatch(profile, ops, repair) {
         let isKnownEndpoint = false;
         if (opPath === "ziki.endpoints" || opPath.startsWith("ziki.endpoints.")) {
             const parts = opPath === "ziki.endpoints" ? [] : opPath.slice("ziki.endpoints.".length).split(".");
-            const group = DEFAULT_ENDPOINTS[parts[0]];
+            const group = templateEndpoints()[parts[0]];
             isKnownEndpoint = parts.length === 0 || (!!group && (parts.length === 1 || parts.slice(1).join(".") in group));
         }
         const isNewVarsKey = opPath.startsWith("ziki.vars.") && existing === undefined;
@@ -302,7 +307,7 @@ export function defaultConfig() {
             pr: { templateFile: "prompts/generic/pr.md" },
             prTracking: { ...DEFAULT_PR_TRACKING },
             ziki: {
-                endpoints: JSON.parse(JSON.stringify(DEFAULT_ENDPOINTS)),
+                endpoints: JSON.parse(JSON.stringify(templateEndpoints())),
                 vars: {},
                 statuses: JSON.parse(JSON.stringify(DEFAULT_ZIKI_STATUSES))
             },
@@ -901,16 +906,22 @@ export async function loadProfile(profileName) {
     if (!rawProfile) {
         throw new Error(`Unknown profile "${name || "(none)"}". Available: ${Object.keys(config.profiles ?? {}).join(", ") || "none"}. Run \`auto-work init\`.`);
     }
-    const profile = deepMerge(config.defaults ?? {}, rawProfile);
-    profile.limits = { ...DEFAULT_LIMITS, ...(profile.limits ?? {}) };
-    profile.workflow = { ...DEFAULT_WORKFLOW, ...(profile.workflow ?? {}) };
-    profile.providers = { ...(config.providers ?? {}), ...(profile.providers ?? {}) };
-    profile.repo = { ...profile.repo, envFiles: profile.repo?.envFiles ?? DEFAULT_ENV_FILES };
-    profile.executor = { ...profile.executor, timeoutMs: profile.executor?.timeoutMs ?? 2_700_000, permissionMode: profile.executor?.permissionMode ?? "auto" };
-    const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });
+    const merged = deepMerge(config.defaults ?? {}, rawProfile);
+    merged.limits = { ...DEFAULT_LIMITS, ...(merged.limits ?? {}) };
+    merged.workflow = { ...DEFAULT_WORKFLOW, ...(merged.workflow ?? {}) };
+    merged.providers = { ...(config.providers ?? {}), ...(merged.providers ?? {}) };
+    merged.repo = { ...merged.repo, envFiles: merged.repo?.envFiles ?? DEFAULT_ENV_FILES };
+    merged.executor = { ...merged.executor, timeoutMs: merged.executor?.timeoutMs ?? 2_700_000, permissionMode: merged.executor?.permissionMode ?? "auto" };
+    const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: merged } });
     if (!validation.ok) {
         throw new Error(`Invalid profile "${name}":\n${validation.errors.join("\n")}`);
     }
+    // v4 sections are data-filled from init templates (never code literals), so
+    // unmigrated v3 profiles run with template-sourced transport/operations.
+    // `config --explain` reports this provenance; `migrate` persists it to disk.
+    const { loadInitTemplates, fillProfileFromTemplates } = await import("./config-templates.js");
+    const templates = await loadInitTemplates();
+    const { profile } = fillProfileFromTemplates(merged, templates);
     const env = await loadEnv();
     const getKey = (keyName) => env[keyName] || process.env[keyName] || null;
     const toKeys = (names) => names

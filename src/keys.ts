@@ -1,5 +1,28 @@
 import type { PlatformRef } from "./types.js";
 import { ZikiClient } from "./ziki.js";
+import { loadInitTemplates } from "./config-templates.js";
+
+/** Key-validation client: transport/operations/endpoints come from init templates (data, not code). */
+async function validationClient(baseUrl: string, apiKey: string, agentName: string): Promise<ZikiClient> {
+  const templates = await loadInitTemplates();
+  return new ZikiClient({
+    baseUrl,
+    apiKey,
+    projectId: "",
+    projectSlug: "",
+    endpoints: (templates.endpoints ?? {}) as Record<string, Record<string, string>>,
+    transport: (templates.transport ?? {}) as never,
+    operations: (templates.operations ?? {}) as never,
+    agentName
+  });
+}
+
+async function defaultBaseUrl(): Promise<string> {
+  const templates = await loadInitTemplates();
+  const url = (templates as Record<string, unknown>).defaultBaseUrl;
+  if (typeof url !== "string" || !url) throw new Error("init templates missing defaultBaseUrl");
+  return url;
+}
 
 export interface KeyProject {
   id: string;
@@ -23,10 +46,10 @@ export interface KeyInspection {
 export async function inspectKey(
   envName: string,
   key: string,
-  baseUrl = "https://ziki.dev"
+  baseUrl?: string
 ): Promise<KeyInspection> {
   try {
-    const client = new ZikiClient({ baseUrl, apiKey: key, projectId: "", projectSlug: "" });
+    const client = await validationClient(baseUrl ?? (await defaultBaseUrl()), key, envName);
     const me = await client.me();
     const projects: KeyProject[] = Array.isArray(me?.projects)
       ? me.projects
@@ -61,7 +84,7 @@ export async function inspectKey(
 
 export async function inspectKeys(
   env: Record<string, string>,
-  baseUrl = "https://ziki.dev"
+  baseUrl?: string
 ): Promise<KeyInspection[]> {
   const names = Object.keys(env).filter((name) => name.startsWith("ZIKI_") && env[name]);
   return Promise.all(names.map((name) => inspectKey(name, env[name]!, baseUrl)));
@@ -118,7 +141,7 @@ export function knownProjects(items: KeyInspection[]): KeyProject[] {
 }
 
 export async function listPlatforms(baseUrl: string, key: string): Promise<PlatformRef[]> {
-  const client = new ZikiClient({ baseUrl, apiKey: key, projectId: "", projectSlug: "" });
+  const client = await validationClient(baseUrl, key, "bootstrap");
   const data = await client.platforms();
   const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
   return items

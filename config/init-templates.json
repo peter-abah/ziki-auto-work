@@ -1,4 +1,115 @@
 {
+  "defaultBaseUrl": "https://ziki.dev",
+  "pollSeconds": 120,
+  "memoryRefreshMinutes": 30,
+  "hitl": { "enabled": true, "defaultType": "question", "notify": "auto", "notifyCommand": null },
+  "executor": { "timeoutMs": 2700000, "permissionMode": "auto" },
+  "endpoints": {
+    "work": {
+      "feed": "/{org?}/{project}/work"
+    },
+    "agents": {
+      "me": "/api/v1/agents/me",
+      "list": "/api/v1/agents",
+      "get": "/api/v1/agents/{username}",
+      "skills": "/api/v1/agents/me/skills",
+      "skill": "/api/v1/agents/me/skills/{tag}",
+      "skillTags": "/api/v1/skill-tags",
+      "picture": "/api/v1/agents/me/picture",
+      "dismissRequest": "/api/v1/agents/me/requests/{id}/done",
+      "history": "/api/v1/agents/me/history",
+      "points": "/api/v1/agents/me/points"
+    },
+    "projects": {
+      "list": "/api/v1/projects",
+      "get": "/api/v1/projects/{project}",
+      "mistakes": "/api/v1/projects/{project}/mistakes",
+      "notes": "/api/v1/projects/{project}/notes",
+      "notesComments": "/api/v1/projects/{project}/notes/comments",
+      "noteComment": "/api/v1/projects/{project}/notes/comments/{comment}/{action}",
+      "myNotes": "/api/v1/projects/{project}/notes/mine",
+      "myNote": "/api/v1/projects/{project}/notes/mine/{note}"
+    },
+    "platforms": {
+      "list": "/api/v1/platforms"
+    },
+    "issues": {
+      "list": "/api/v1/issues",
+      "counts": "/api/v1/issues/counts",
+      "get": "/api/v1/issues/{issue}",
+      "comments": "/api/v1/issues/{issue}/comments",
+      "bid": "/api/v1/issues/{issue}/bid",
+      "confirmations": "/api/v1/issues/{issue}/confirmations",
+      "open": "/api/v1/issues/{issue}/open",
+      "stake": "/api/v1/issues/{issue}/stake",
+      "getStake": "/api/v1/issues/{issue}/stake",
+      "heartbeat": "/api/v1/issues/{issue}/heartbeat",
+      "extend": "/api/v1/issues/{issue}/extend",
+      "release": "/api/v1/issues/{issue}/release",
+      "reclaim": "/api/v1/issues/{issue}/reclaim",
+      "importance": "/api/v1/issues/{issue}/importance",
+      "abandonVotes": "/api/v1/issues/{issue}/abandon-votes",
+      "closeSuggestions": "/api/v1/issues/{issue}/close-suggestions",
+      "close": "/api/v1/issues/{issue}/close",
+      "reward": "/api/v1/issues/{issue}/reward",
+      "getReward": "/api/v1/issues/{issue}/reward",
+      "platform": "/api/v1/issues/{issue}/platform",
+      "pullRequest": "/api/v1/issues/{issue}/pull-request",
+      "delivery": "/api/v1/issues/{issue}/delivery",
+      "getDelivery": "/api/v1/issues/{issue}/delivery",
+      "pullRequestStatus": "/api/v1/issues/{issue}/pull-request-status",
+      "testResults": "/api/v1/issues/{issue}/test-results",
+      "getTestResults": "/api/v1/issues/{issue}/test-results",
+      "merge": "/api/v1/issues/{issue}/merge",
+      "mergeReviews": "/api/v1/issues/{issue}/merge-reviews",
+      "deployment": "/api/v1/issues/{issue}/deployment",
+      "resolve": "/api/v1/issues/{issue}/resolve"
+    },
+    "ideas": {
+      "list": "/api/v1/ideas",
+      "get": "/api/v1/ideas/{idea}",
+      "verdicts": "/api/v1/ideas/{idea}/verdicts",
+      "convert": "/api/v1/ideas/{idea}/convert",
+      "reject": "/api/v1/ideas/{idea}/reject",
+      "archive": "/api/v1/ideas/{idea}/archive",
+      "platform": "/api/v1/ideas/{idea}/platform"
+    },
+    "comments": {
+      "votes": "/api/v1/comments/{comment}/votes"
+    },
+    "bids": {
+      "award": "/api/v1/bids/{bid}/award",
+      "votes": "/api/v1/bids/{bid}/votes"
+    },
+    "offers": {
+      "accept": "/api/v1/offers/{offer}/accept"
+    },
+    "reviews": {
+      "accept": "/api/v1/reviews/{offer}/accept"
+    },
+    "stakes": {
+      "refresh": "/api/v1/stakes/{stake}/refresh",
+      "votes": "/api/v1/stakes/{stake}/votes"
+    },
+    "jobs": {
+      "get": "/api/v1/jobs/{job}",
+      "submissions": "/api/v1/jobs/{job}/submissions",
+      "submitReview": "/api/v1/jobs/submissions/{submission}/reviews",
+      "acceptReview": "/api/v1/jobs/reviews/{offer}/accept"
+    },
+    "escalations": {
+      "create": "/api/v1/escalations",
+      "get": "/api/v1/escalations/{id}"
+    },
+    "questions": {
+      "create": "/api/v1/questions",
+      "get": "/api/v1/questions/{id}"
+    },
+    "inbox": {
+      "list": "/api/v1/inbox",
+      "read": "/api/v1/inbox/read"
+    }
+  },
   "_meta": {
     "configVersion": 4,
     "source": "snapshot of built-in behavior; init writes these explicitly, runtime never falls back to them",
@@ -29,7 +140,16 @@
     "maxFiles": 5,
     "maxLines": 400,
     "branchPrefix": "fix",
-    "commitTypes": ["fix", "feat", "test", "refactor", "chore", "docs", "perf", "security"],
+    "commitTypes": [
+      "fix",
+      "feat",
+      "test",
+      "refactor",
+      "chore",
+      "docs",
+      "perf",
+      "security"
+    ],
     "requireTests": true,
     "autoVoteBids": "agent",
     "autoUpvoteComments": "agent"
@@ -59,20 +179,67 @@
     "rateLimitChunkMs": 300000
   },
   "statuses": {
-    "workable": ["requires_confirmation", "open", "in_progress"],
-    "terminal": ["resolved", "closed", "done", "merge", "accepted"],
-    "terminalSubstatus": ["done", "merge"],
-    "confirmation": ["requires_confirmation"],
+    "workable": [
+      "requires_confirmation",
+      "open",
+      "in_progress"
+    ],
+    "terminal": [
+      "resolved",
+      "closed",
+      "done",
+      "merge",
+      "accepted"
+    ],
+    "terminalSubstatus": [
+      "done",
+      "merge"
+    ],
+    "confirmation": [
+      "requires_confirmation"
+    ],
     "known": [
-      "open", "requires_confirmation", "in_progress", "resolved", "closed",
-      "done", "merge", "accepted", "archived", "converted", "rejected",
-      "on_dev", "on_staging", "on_prod",
-      "ready_issue", "test_fix", "award_bid", "review_bid", "review_comment",
-      "reclaim_issue", "investigate_issue", "report_deployment", "report_pr_status",
-      "categorize", "sense_check", "active_claim", "offer", "review_offer",
-      "job_review_offer", "open_issue", "confirm_issue", "vote_importance",
-      "estimate_reward", "refresh_stake", "vote_stake", "merge_review",
-      "close_issue", "research_job", "review_idle", "join_request", "idea"
+      "open",
+      "requires_confirmation",
+      "in_progress",
+      "resolved",
+      "closed",
+      "done",
+      "merge",
+      "accepted",
+      "archived",
+      "converted",
+      "rejected",
+      "on_dev",
+      "on_staging",
+      "on_prod",
+      "ready_issue",
+      "test_fix",
+      "award_bid",
+      "review_bid",
+      "review_comment",
+      "reclaim_issue",
+      "investigate_issue",
+      "report_deployment",
+      "report_pr_status",
+      "categorize",
+      "sense_check",
+      "active_claim",
+      "offer",
+      "review_offer",
+      "job_review_offer",
+      "open_issue",
+      "confirm_issue",
+      "vote_importance",
+      "estimate_reward",
+      "refresh_stake",
+      "vote_stake",
+      "merge_review",
+      "close_issue",
+      "research_job",
+      "review_idle",
+      "join_request",
+      "idea"
     ]
   },
   "repair": {
@@ -95,11 +262,26 @@
       "discovery.enabled",
       "discovery.maxIdeasPerRun"
     ],
-    "allowNewKeys": ["ziki.platformFilter", "ziki.orgSlug"],
+    "allowNewKeys": [
+      "ziki.platformFilter",
+      "ziki.orgSlug"
+    ],
     "strategies": {
-      "platform:not_found": { "enabled": true, "role": "configDoctor", "maxRounds": 3 },
-      "feed:unexpected_response_shape": { "enabled": true, "role": "configDoctor", "maxRounds": 3 },
-      "*:unknown_filter": { "enabled": true, "role": "configDoctor", "maxRounds": 2 }
+      "platform:not_found": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 3
+      },
+      "feed:unexpected_response_shape": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 3
+      },
+      "*:unknown_filter": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 2
+      }
     }
   },
   "transport": {
@@ -113,120 +295,697 @@
   },
   "operations": {
     "work": {
-      "feed": { "method": "GET", "expect": "feed" }
+      "feed": {
+        "method": "GET",
+        "expect": "feed"
+      }
     },
     "agents": {
-      "me": { "method": "GET", "expect": "object" },
-      "updateMe": { "method": "PATCH", "body": ["username", "tagline", "about"] },
-      "skills": { "method": "GET" },
-      "putSkills": { "method": "PUT", "body": ["skills"] },
-      "skill": { "method": "PUT", "body": ["tag", "summary", "description"] },
-      "deleteSkill": { "method": "DELETE" },
-      "skillTags": { "method": "GET", "expect": "object" },
-      "picture": { "method": "POST" },
-      "deletePicture": { "method": "DELETE" },
-      "list": { "method": "GET", "query": ["tag"] },
-      "get": { "method": "GET" },
-      "dismissRequest": { "method": "POST" },
-      "history": { "method": "GET", "query": ["kind", "limit", "cursor"], "pagination": { "limitKey": "limit", "cursorKey": "cursor", "itemsKey": "items", "nextCursorKey": "nextCursor", "defaultLimit": 50, "maxPages": 20, "maxItems": 600 } },
-      "points": { "method": "GET" }
+      "me": {
+        "method": "GET",
+        "expect": "object"
+      },
+      "updateMe": {
+        "route": "me",
+        "method": "PATCH",
+        "body": [
+          "username",
+          "tagline",
+          "about"
+        ]
+      },
+      "skills": {
+        "method": "GET"
+      },
+      "putSkills": {
+        "route": "skills",
+        "method": "PUT",
+        "body": [
+          "skills"
+        ]
+      },
+      "skill": {
+        "method": "PUT",
+        "body": [
+          "tag",
+          "summary",
+          "description"
+        ]
+      },
+      "deleteSkill": {
+        "route": "skill",
+        "method": "DELETE"
+      },
+      "skillTags": {
+        "method": "GET",
+        "expect": "object"
+      },
+      "picture": {
+        "method": "PUT"
+      },
+      "deletePicture": {
+        "route": "picture",
+        "method": "DELETE"
+      },
+      "list": {
+        "method": "GET",
+        "query": [
+          "tag"
+        ]
+      },
+      "get": {
+        "method": "GET"
+      },
+      "dismissRequest": {
+        "method": "POST"
+      },
+      "history": {
+        "method": "GET",
+        "query": [
+          "kind",
+          "limit",
+          "cursor"
+        ],
+        "pagination": {
+          "limitKey": "limit",
+          "cursorKey": "cursor",
+          "itemsKey": "items",
+          "nextCursorKey": "nextCursor",
+          "defaultLimit": 50,
+          "maxPages": 20,
+          "maxItems": 600
+        }
+      },
+      "points": {
+        "method": "GET"
+      }
     },
     "platforms": {
-      "list": { "method": "GET", "expect": "list" }
+      "list": {
+        "method": "GET",
+        "expect": "list"
+      }
     },
     "projects": {
-      "list": { "method": "GET", "expect": "list" },
-      "get": { "method": "GET", "expect": "object" },
-      "mistakes": { "method": "GET", "query": ["limit"], "pagination": { "limitKey": "limit", "defaultLimit": 100, "maxPages": 1, "maxItems": 600 } },
-      "notes": { "method": "GET", "expect": "object" },
-      "notesComments": { "method": "GET", "query": ["status"] },
-      "postNotesComment": { "method": "POST", "body": ["body", "parentId"] },
-      "noteComment": { "method": "PUT" },
-      "myNotes": { "method": "GET", "expect": "list" },
-      "postMyNote": { "method": "POST", "body": ["body"] },
-      "myNote": { "method": "PATCH", "body": ["body"] },
-      "deleteMyNote": { "method": "DELETE" }
+      "list": {
+        "method": "GET",
+        "expect": "list"
+      },
+      "get": {
+        "method": "GET",
+        "expect": "object"
+      },
+      "mistakes": {
+        "method": "GET",
+        "query": [
+          "limit"
+        ],
+        "pagination": {
+          "limitKey": "limit",
+          "cursorKey": "cursor",
+          "itemsKey": "mistakes",
+          "nextCursorKey": "nextCursor",
+          "defaultLimit": 100,
+          "maxPages": 1,
+          "maxItems": 600
+        }
+      },
+      "notes": {
+        "method": "GET",
+        "expect": "object"
+      },
+      "notesComments": {
+        "method": "GET",
+        "query": [
+          "status"
+        ]
+      },
+      "postNotesComment": {
+        "route": "notesComments",
+        "method": "POST",
+        "body": [
+          "body",
+          "parentId"
+        ]
+      },
+      "noteComment": {
+        "method": "PUT"
+      },
+      "myNotes": {
+        "method": "GET",
+        "expect": "list"
+      },
+      "postMyNote": {
+        "route": "myNotes",
+        "method": "POST",
+        "body": [
+          "body"
+        ]
+      },
+      "myNote": {
+        "method": "PATCH",
+        "body": [
+          "body"
+        ]
+      },
+      "deleteMyNote": {
+        "route": "myNote",
+        "method": "DELETE"
+      }
     },
     "issues": {
-      "list": { "method": "GET", "expect": "list", "query": ["projectId", "platform", "status", "limit", "cursor"], "pagination": { "limitKey": "limit", "cursorKey": "cursor", "itemsKey": "items", "nextCursorKey": "nextCursor", "defaultLimit": 100, "maxPages": 20, "maxItems": 600 } },
-      "counts": { "method": "GET", "query": ["projectId"] },
-      "get": { "method": "GET", "query": ["projectId"] },
-      "comments": { "method": "GET", "query": ["projectId", "limit", "cursor"], "pagination": { "limitKey": "limit", "cursorKey": "cursor", "itemsKey": "items", "nextCursorKey": "nextCursor", "defaultLimit": 100, "maxPages": 20, "maxItems": 600 } },
-      "postComment": { "method": "POST", "query": ["projectId"], "body": ["body", "parentId"] },
-      "confirmations": { "method": "POST", "query": ["projectId"], "body": ["verdict", "summary", "description", "files", "duplicateOfId", "attachmentIds"] },
-      "open": { "method": "POST", "query": ["projectId"] },
-      "bid": { "method": "POST", "query": ["projectId"], "body": ["summary", "description"] },
-      "withdrawBid": { "method": "DELETE", "query": ["projectId"] },
-      "listBids": { "method": "GET", "query": ["projectId"] },
-      "stake": { "method": "POST", "query": ["projectId"], "body": ["summary", "description"] },
-      "listStakes": { "method": "GET", "query": ["projectId"] },
-      "heartbeat": { "method": "POST", "query": ["projectId"], "timeoutMs": 15000, "retries": 0 },
-      "extend": { "method": "POST", "query": ["projectId"], "body": ["reason"] },
-      "release": { "method": "POST", "query": ["projectId"] },
-      "reclaim": { "method": "POST", "query": ["projectId"] },
-      "importance": { "method": "POST", "query": ["projectId"] },
-      "abandonVotes": { "method": "POST", "query": ["projectId"], "body": ["summary"] },
-      "closeSuggestions": { "method": "POST", "query": ["projectId"], "body": ["reason", "evidence", "summary", "description", "duplicateOf"] },
-      "close": { "method": "POST", "query": ["projectId"], "body": ["reason", "evidence", "duplicateOf"] },
-      "reward": { "method": "POST", "query": ["projectId"], "body": ["value", "reason"] },
-      "getReward": { "method": "GET", "query": ["projectId"] },
-      "platform": { "method": "PUT", "query": ["projectId"], "body": ["platform", "reason"] },
-      "pullRequest": { "method": "POST", "query": ["projectId"], "body": ["pullRequestUrl"] },
-      "delivery": { "method": "POST", "query": ["projectId"], "body": ["pullRequestUrl", "summary", "description", "screenshots", "testResults", "headSha"] },
-      "getDelivery": { "method": "GET", "query": ["projectId"] },
-      "pullRequestStatus": { "method": "POST", "query": ["projectId"], "body": ["report"] },
-      "testResults": { "method": "POST", "query": ["projectId"], "body": ["goodToMerge", "summary", "description", "files", "headSha"] },
-      "getTestResults": { "method": "GET", "query": ["projectId"] },
-      "merge": { "method": "POST", "query": ["projectId"], "body": ["verdict", "summary", "description"] },
-      "mergeReviews": { "method": "GET", "query": ["projectId"] },
-      "deployment": { "method": "POST", "query": ["projectId"], "body": ["environment", "note"] },
-      "resolve": { "method": "POST", "query": ["projectId"], "body": ["pullRequestUrl"] }
+      "list": {
+        "method": "GET",
+        "expect": "list",
+        "query": [
+          "projectId",
+          "platform",
+          "status",
+          "limit",
+          "cursor"
+        ],
+        "pagination": {
+          "limitKey": "limit",
+          "cursorKey": "cursor",
+          "itemsKey": "items",
+          "nextCursorKey": "nextCursor",
+          "defaultLimit": 100,
+          "maxPages": 20,
+          "maxItems": 600
+        }
+      },
+      "counts": {
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "get": {
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "comments": {
+        "method": "GET",
+        "query": [
+          "projectId",
+          "limit",
+          "cursor"
+        ],
+        "pagination": {
+          "limitKey": "limit",
+          "cursorKey": "cursor",
+          "itemsKey": "items",
+          "nextCursorKey": "nextCursor",
+          "defaultLimit": 100,
+          "maxPages": 20,
+          "maxItems": 600
+        }
+      },
+      "postComment": {
+        "route": "comments",
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "body",
+          "parentId"
+        ]
+      },
+      "confirmations": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "verdict",
+          "summary",
+          "description",
+          "files",
+          "duplicateOfId",
+          "attachmentIds"
+        ]
+      },
+      "open": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "bid": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "summary",
+          "description"
+        ]
+      },
+      "withdrawBid": {
+        "route": "bid",
+        "method": "DELETE",
+        "query": [
+          "projectId"
+        ]
+      },
+      "listBids": {
+        "route": "bid",
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "stake": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "summary",
+          "description"
+        ]
+      },
+      "listStakes": {
+        "route": "stake",
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "heartbeat": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "timeoutMs": 15000,
+        "retries": 0
+      },
+      "extend": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "reason"
+        ]
+      },
+      "release": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "reclaim": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "importance": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "abandonVotes": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "summary"
+        ]
+      },
+      "closeSuggestions": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "reason",
+          "evidence",
+          "summary",
+          "description",
+          "duplicateOf"
+        ]
+      },
+      "close": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "reason",
+          "evidence",
+          "duplicateOf"
+        ]
+      },
+      "reward": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "value",
+          "reason"
+        ]
+      },
+      "getReward": {
+        "route": "reward",
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "platform": {
+        "method": "PUT",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "platform",
+          "reason"
+        ]
+      },
+      "pullRequest": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "pullRequestUrl"
+        ]
+      },
+      "delivery": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "pullRequestUrl",
+          "summary",
+          "description",
+          "screenshots",
+          "testResults",
+          "headSha"
+        ]
+      },
+      "getDelivery": {
+        "route": "delivery",
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "pullRequestStatus": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "report"
+        ]
+      },
+      "testResults": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "goodToMerge",
+          "summary",
+          "description",
+          "files",
+          "headSha"
+        ]
+      },
+      "getTestResults": {
+        "route": "testResults",
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "merge": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "verdict",
+          "summary",
+          "description"
+        ]
+      },
+      "mergeReviews": {
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "deployment": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "environment",
+          "note"
+        ]
+      },
+      "resolve": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "pullRequestUrl"
+        ]
+      }
     },
     "ideas": {
-      "list": { "method": "GET", "expect": "list", "query": ["projectId", "status", "convertible", "platform", "limit", "cursor"], "pagination": { "limitKey": "limit", "cursorKey": "cursor", "itemsKey": "items", "nextCursorKey": "nextCursor", "defaultLimit": 100, "maxPages": 20, "maxItems": 600 } },
-      "create": { "method": "POST", "query": ["projectId"], "body": ["title", "summary", "description", "areaId", "typeId", "proofLinks", "attachmentIds", "acknowledgeSimilar", "alreadyVetted", "vettedNote"], "idempotency": true },
-      "get": { "method": "GET", "query": ["projectId"] },
-      "verdicts": { "method": "POST", "query": ["projectId"], "body": ["opinion", "votes", "summary", "description"] },
-      "listVerdicts": { "method": "GET", "query": ["projectId"] },
-      "convert": { "method": "POST", "query": ["projectId"], "body": [] },
-      "reject": { "method": "POST", "query": ["projectId"] },
-      "archive": { "method": "POST", "query": ["projectId"] },
-      "platform": { "method": "PUT", "query": ["projectId"], "body": ["platform", "reason"] }
+      "list": {
+        "method": "GET",
+        "expect": "list",
+        "query": [
+          "projectId",
+          "status",
+          "convertible",
+          "platform",
+          "limit",
+          "cursor"
+        ],
+        "pagination": {
+          "limitKey": "limit",
+          "cursorKey": "cursor",
+          "itemsKey": "items",
+          "nextCursorKey": "nextCursor",
+          "defaultLimit": 100,
+          "maxPages": 20,
+          "maxItems": 600
+        }
+      },
+      "create": {
+        "route": "list",
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "title",
+          "summary",
+          "description",
+          "areaId",
+          "typeId",
+          "proofLinks",
+          "attachmentIds",
+          "acknowledgeSimilar",
+          "alreadyVetted",
+          "vettedNote"
+        ],
+        "idempotency": true
+      },
+      "get": {
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "verdicts": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "opinion",
+          "votes",
+          "summary",
+          "description"
+        ]
+      },
+      "listVerdicts": {
+        "route": "verdicts",
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "convert": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": []
+      },
+      "reject": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "archive": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "platform": {
+        "method": "PUT",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "platform",
+          "reason"
+        ]
+      }
     },
     "comments": {
-      "votes": { "method": "POST", "query": ["projectId"] }
+      "votes": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      }
     },
     "bids": {
-      "award": { "method": "POST", "query": ["projectId"] },
-      "votes": { "method": "POST", "query": ["projectId"] }
+      "award": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "votes": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      }
     },
     "offers": {
-      "accept": { "method": "POST", "query": ["projectId"] }
+      "accept": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      }
     },
     "reviews": {
-      "accept": { "method": "POST", "query": ["projectId"] }
+      "accept": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      }
     },
     "stakes": {
-      "refresh": { "method": "POST", "query": ["projectId"] },
-      "votes": { "method": "POST", "query": ["projectId"] }
+      "refresh": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      },
+      "votes": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      }
     },
     "jobs": {
-      "get": { "method": "GET", "query": ["projectId"] },
-      "submissions": { "method": "POST", "query": ["projectId"], "body": ["data"] },
-      "submitReview": { "method": "POST", "body": ["verdict", "notes"] },
-      "acceptReview": { "method": "POST", "query": ["projectId"] }
+      "get": {
+        "method": "GET",
+        "query": [
+          "projectId"
+        ]
+      },
+      "submissions": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ],
+        "body": [
+          "data"
+        ]
+      },
+      "submitReview": {
+        "method": "POST",
+        "body": [
+          "verdict",
+          "notes"
+        ]
+      },
+      "acceptReview": {
+        "method": "POST",
+        "query": [
+          "projectId"
+        ]
+      }
     },
     "escalations": {
-      "create": { "method": "POST", "body": ["body", "type", "bugId"] },
-      "get": { "method": "GET" }
+      "create": {
+        "method": "POST",
+        "body": [
+          "body",
+          "type",
+          "bugId"
+        ]
+      },
+      "get": {
+        "method": "GET"
+      }
     },
     "questions": {
-      "create": { "method": "POST", "body": ["body", "bugId"] },
-      "get": { "method": "GET" }
+      "create": {
+        "method": "POST",
+        "body": [
+          "body",
+          "bugId"
+        ]
+      },
+      "get": {
+        "method": "GET"
+      }
     },
     "inbox": {
-      "list": { "method": "GET", "expect": "list", "query": ["unread", "cursor", "wait"] },
-      "read": { "method": "POST", "body": ["ids"] }
+      "list": {
+        "method": "GET",
+        "expect": "list",
+        "query": [
+          "unread",
+          "cursor",
+          "wait"
+        ]
+      },
+      "read": {
+        "method": "POST",
+        "body": [
+          "ids"
+        ]
+      }
     }
   },
   "queue": {
@@ -267,60 +1026,169 @@
       "categorize": 33
     },
     "buckets": {
-      "owner": ["owner_request"],
-      "work": ["offer", "review_offer", "job_review_offer", "active_claim", "ready_issue", "open_issue", "reclaim_issue"],
-      "review": ["test_fix", "accept_fix", "review_idle", "deliver_stranded", "merge_fix", "reconcile_merged"],
-      "aux": ["idea", "convert_idea", "reject_idea", "confirm_issue", "close_issue", "sense_check", "vote_importance", "estimate_reward", "investigate_issue", "review_comment", "refresh_stake", "vote_stake", "report_pr_status", "report_deployment", "repair_pull_request", "await_release", "research_job", "award_bid", "review_bid", "categorize"]
+      "owner": [
+        "owner_request"
+      ],
+      "work": [
+        "offer",
+        "review_offer",
+        "job_review_offer",
+        "active_claim",
+        "ready_issue",
+        "open_issue",
+        "reclaim_issue"
+      ],
+      "review": [
+        "test_fix",
+        "accept_fix",
+        "review_idle",
+        "deliver_stranded",
+        "merge_fix",
+        "reconcile_merged"
+      ],
+      "aux": [
+        "idea",
+        "convert_idea",
+        "reject_idea",
+        "confirm_issue",
+        "close_issue",
+        "sense_check",
+        "vote_importance",
+        "estimate_reward",
+        "investigate_issue",
+        "review_comment",
+        "refresh_stake",
+        "vote_stake",
+        "report_pr_status",
+        "report_deployment",
+        "repair_pull_request",
+        "await_release",
+        "research_job",
+        "award_bid",
+        "review_bid",
+        "categorize"
+      ]
     },
-    "noIssueKinds": ["owner_request", "categorize", "research_job", "job_review_offer", "refresh_stake", "vote_stake"],
+    "noIssueKinds": [
+      "owner_request",
+      "categorize",
+      "research_job",
+      "job_review_offer",
+      "refresh_stake",
+      "vote_stake"
+    ],
     "recentMs": 1800000
   },
   "reviewGate": {
     "transientMs": 300000,
     "terminalMs": 1800000,
     "openState": "OPEN",
-    "checkStates": { "passing": "passing", "failing": "failing", "pending": "pending", "none": "none" },
-    "workflowKeys": ["verdictsNeeded", "testVerdictsNeeded", "requiredTestVerdicts", "reviewsRequired"]
+    "checkStates": {
+      "passing": "passing",
+      "failing": "failing",
+      "pending": "pending",
+      "none": "none"
+    },
+    "workflowKeys": [
+      "verdictsNeeded",
+      "testVerdictsNeeded",
+      "requiredTestVerdicts",
+      "reviewsRequired"
+    ]
   },
   "heartbeatPolicy": {
     "intervalMs": 600000,
-    "eligibleStates": ["queued", "claimed", "working", "waiting_human", "delivered"],
-    "lostStatuses": [403, 404, 409, 410],
+    "eligibleStates": [
+      "queued",
+      "claimed",
+      "working",
+      "waiting_human",
+      "delivered"
+    ],
+    "lostStatuses": [
+      403,
+      404,
+      409,
+      410
+    ],
     "rateLimitMs": 900000,
     "genericMs": 300000,
     "workflowKey": "heartbeatMinutes"
   },
   "decisions": {
     "marker": "**Decision from the owner:**",
-    "kinds": ["confirm", "merge"],
-    "trueWords": ["yes", "y", "true"],
-    "falseWords": ["no", "n", "false"]
+    "kinds": [
+      "confirm",
+      "merge"
+    ],
+    "trueWords": [
+      "yes",
+      "y",
+      "true"
+    ],
+    "falseWords": [
+      "no",
+      "n",
+      "false"
+    ]
   },
   "noop": {
-    "statuses": [400, 409, 422],
+    "statuses": [
+      400,
+      409,
+      422
+    ],
     "patterns": {
-      "reclaim": ["nothing to reclaim", "not stale"],
-      "open": ["not awaiting confirmation", "requires confirmation", "already open"],
-      "review": ["already has .*judgements?", "already (?:been )?(?:accepted|reviewed)", "not (?:awaiting|reviewable)"],
-      "convert": ["valid JSON body"]
+      "reclaim": [
+        "nothing to reclaim",
+        "not stale"
+      ],
+      "open": [
+        "not awaiting confirmation",
+        "requires confirmation",
+        "already open"
+      ],
+      "review": [
+        "already has .*judgements?",
+        "already (?:been )?(?:accepted|reviewed)",
+        "not (?:awaiting|reviewable)"
+      ],
+      "convert": [
+        "valid JSON body"
+      ]
     }
   },
   "votes": {
     "defaultPolicy": "agent",
     "bidMinChars": 40,
-    "bidKeywords": ["fix", "implement", "add", "update", "test", "change"],
-    "commentKeywords": ["root cause", "reproduction", "file:", ".dart:"]
+    "bidKeywords": [
+      "fix",
+      "implement",
+      "add",
+      "update",
+      "test",
+      "change"
+    ],
+    "commentKeywords": [
+      "root cause",
+      "reproduction",
+      "file:",
+      ".dart:"
+    ]
   },
   "idea": {
     "summaryMin": 20,
-    "suffix": " — desktop parity gap.",
+    "suffix": " \u2014 desktop parity gap.",
     "summaryMax": 300,
     "fallback": ""
   },
   "apiRepair": {
     "deterministicRetries": 2,
     "agentRepairs": 1,
-    "statuses": [400, 422]
+    "statuses": [
+      400,
+      422
+    ]
   },
   "capacity": {
     "floor": 1,
@@ -328,35 +1196,107 @@
     "ownerSlots": 1
   },
   "urls": {
-    "envSuffixes": { "on_dev": "dev", "on_staging": "staging", "on_prod": "prod" },
+    "envSuffixes": {
+      "on_dev": "dev",
+      "on_staging": "staging",
+      "on_prod": "prod"
+    },
     "issuePath": "/{org?}/{project}/{issue}",
     "ideaPath": "/{org?}/{project}/ideas/{idea}",
     "inboxPath": "/inbox"
   },
   "discover": {
     "platformSuffixes": {
-      "desktop": ["desktop", "desktop-app", "app"],
-      "mobile": ["mobile", "android", "ios", "app"],
-      "web": ["fe", "web", "frontend", "client"]
+      "desktop": [
+        "desktop",
+        "desktop-app",
+        "app"
+      ],
+      "mobile": [
+        "mobile",
+        "android",
+        "ios",
+        "app"
+      ],
+      "web": [
+        "fe",
+        "web",
+        "frontend",
+        "client"
+      ]
     },
-    "scores": { "exact": 60, "prefix": 40, "suffixExact": 100, "suffix": 25, "description": 10, "forkBonus": 5 },
+    "scores": {
+      "exact": 60,
+      "prefix": 40,
+      "suffixExact": 100,
+      "suffix": 25,
+      "description": 10,
+      "forkBonus": 5
+    },
     "starDivisor": 100,
     "starCap": 10,
     "skipArchived": true,
-    "stackMap": { "pubspec.yaml": "flutter", "package.json": "node", "pyproject.toml": "python", "go.mod": "go", "Cargo.toml": "rust" },
-    "stackPlatform": { "flutter": "desktop" },
+    "stackMap": {
+      "pubspec.yaml": "flutter",
+      "package.json": "node",
+      "pyproject.toml": "python",
+      "go.mod": "go",
+      "Cargo.toml": "rust"
+    },
+    "stackPlatform": {
+      "flutter": "desktop"
+    },
     "stackPlatformDefault": "web"
   },
   "github": {
-    "stateMap": { "merged": ["MERGED"], "closed": ["CLOSED"] },
-    "mergeableMap": { "mergeable": "MERGEABLE", "conflicting": "CONFLICTING" },
-    "mergeFlags": { "merge": "--merge", "squash": "--squash", "rebase": "--rebase" },
+    "stateMap": {
+      "merged": [
+        "MERGED"
+      ],
+      "closed": [
+        "CLOSED"
+      ]
+    },
+    "mergeableMap": {
+      "mergeable": "MERGEABLE",
+      "conflicting": "CONFLICTING"
+    },
+    "mergeFlags": {
+      "merge": "--merge",
+      "squash": "--squash",
+      "rebase": "--rebase"
+    },
     "defaultMergeMethod": "squash",
-    "timeouts": { "fetch": 300000, "view": 60000, "create": 120000, "merge": 300000 }
+    "timeouts": {
+      "fetch": 300000,
+      "view": 60000,
+      "create": 120000,
+      "merge": 300000
+    }
   },
   "safety": {
-    "protectedFiles": [".github/**", "AGENTS.md", "CONTRIBUTING.md", ".env", ".env.*", "*.p12", "*.pfx", "*.pem", "*.p8", "*.jks", "*.keystore"],
-    "secretPatterns": ["ZIKI_KEY[A-Z0-9_]*\\s*=\\s*\\S+", "ghp_[A-Za-z0-9]{20,}", "github_pat_[A-Za-z0-9_]{20,}", "sk-[A-Za-z0-9]{20,}", "AKIA[0-9A-Z]{16}", "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY", "password\\s*[:=]\\s*[\"'][^\"']{4,}[\"']"]
+    "protectedFiles": [
+      ".github/**",
+      "AGENTS.md",
+      "CONTRIBUTING.md",
+      ".env",
+      ".env.*",
+      "*.p12",
+      "*.pfx",
+      "*.pem",
+      "*.p8",
+      "*.jks",
+      "*.keystore"
+    ],
+    "secretPatterns": [
+      "ZIKI_KEY[A-Z0-9_]*\\s*=\\s*\\S+",
+      "ghp_[A-Za-z0-9]{20,}",
+      "github_pat_[A-Za-z0-9_]{20,}",
+      "sk-[A-Za-z0-9]{20,}",
+      "AKIA[0-9A-Z]{16}",
+      "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY",
+      "password\\s*[:=]\\s*[\"'][^\"']{4,}[\"']"
+    ]
   },
   "checksDefaults": {
     "timeoutMs": 1200000,
@@ -373,6 +1313,7 @@
     "needsFile": "NEEDS-HUMAN.md",
     "reasonSlice": 500,
     "notifySlice": 500,
+    "escalationSlice": 1900,
     "agentName": "bootstrap"
   },
   "loop": {
@@ -381,5 +1322,8 @@
     "cacheMs": 600000,
     "statusAgeMs": 120000
   },
-  "envFiles": [".env", ".env.local"]
+  "envFiles": [
+    ".env",
+    ".env.local"
+  ]
 }

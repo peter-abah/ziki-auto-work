@@ -467,6 +467,8 @@ export interface OperationPaginationConfig {
 }
 
 export interface OperationConfig {
+  /** Endpoint name in ziki.endpoints (defaults to the operation name). */
+  route?: string;
   /** HTTP method, e.g. "GET", "POST", "PUT", "PATCH", "DELETE". */
   method?: string;
   /** Expected response shape guard: "feed" | "list" | "object". Absent = no guard. */
@@ -587,6 +589,7 @@ export interface BootstrapPolicyConfig {
   needsFile?: string;
   reasonSlice?: number;
   notifySlice?: number;
+  escalationSlice?: number;
   agentName?: string;
 }
 

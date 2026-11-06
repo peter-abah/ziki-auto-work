@@ -8,21 +8,19 @@ import type {
   Idea,
   InboxItem,
   Issue,
+  OperationConfig,
   ProfileConfig,
   ResearchJob,
   Stake,
   TestVerdict,
+  TransportConfig,
   WorkFeed,
   WorkItem,
   ApiContractStore,
   ProjectSummary
 } from "./types.js";
 import { contractKey, formatApiErrorDetails, recordRejected, repairApiBody, stripRejectedFields } from "./api-repair.js";
-import {
-  DEFAULT_ENDPOINTS,
-  endpointVars,
-  renderEndpoint
-} from "./ziki-endpoints.js";
+import { endpointVars, renderEndpoint } from "./ziki-endpoints.js";
 
 export class ZikiError extends Error {
   status: number;
@@ -59,7 +57,8 @@ function assertResponseShape(
   pathname: string,
   status: number,
   data: unknown,
-  expect: "feed" | "list" | "object"
+  expect: "feed" | "list" | "object",
+  previewChars: number
 ): void {
   const items = (data as { items?: unknown } | null)?.items;
   const ok =
@@ -67,7 +66,8 @@ function assertResponseShape(
       ? typeof data === "object" && data !== null && !Array.isArray(data)
       : Array.isArray(items) || Array.isArray(data);
   if (ok) return;
-  const preview = typeof data === "string" ? data.slice(0, 120) : JSON.stringify(data)?.slice(0, 120);
+  const preview =
+    typeof data === "string" ? data.slice(0, previewChars) : JSON.stringify(data)?.slice(0, previewChars);
   throw new ZikiError(
     `${method} ${pathname} failed: unexpected response shape (expected ${expect}, got ${preview || "empty"})`,
     {
@@ -79,7 +79,12 @@ function assertResponseShape(
   );
 }
 
-function retryAfterMs(response: Response, attempt: number, maxMs = Infinity): number {
+function retryAfterMs(
+  response: Response,
+  attempt: number,
+  maxMs: number,
+  growthCapMs: number
+): number {
   const retry = response.headers.get("retry-after");
   if (retry) {
     const seconds = Number(retry);
@@ -95,7 +100,7 @@ function retryAfterMs(response: Response, attempt: number, maxMs = Infinity): nu
       if (ms > 0) return Math.min(maxMs, ms);
     }
   }
-  return Math.min(maxMs, 60_000, 1000 * 2 ** attempt);
+  return Math.min(maxMs, growthCapMs, 1000 * 2 ** attempt);
 }
 
 export interface ApiRepairContext {
@@ -127,6 +132,22 @@ export function apiPlatformFilter(profile: ProfileConfig): string | undefined {
   return profile.ziki.platform;
 }
 
+function requireTransportNumber(transport: TransportConfig, key: keyof TransportConfig): number {
+  const value = transport[key];
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`transport.${String(key)} must be a non-negative number (run \`auto-work migrate\`)`);
+  }
+  return value;
+}
+
+function requireTransportString(transport: TransportConfig, key: keyof TransportConfig): string {
+  const value = transport[key];
+  if (typeof value !== "string" || !value) {
+    throw new Error(`transport.${String(key)} must be a non-empty string (run \`auto-work migrate\`)`);
+  }
+  return value;
+}
+
 export class ZikiClient {
   baseUrl: string;
   apiKey: string;
@@ -135,10 +156,13 @@ export class ZikiClient {
   orgSlug?: string | null;
   vars: Record<string, string>;
   endpoints: Record<string, Record<string, string>>;
+  transport: TransportConfig;
+  operations: Record<string, Record<string, OperationConfig>>;
   agentName: string;
   timeoutMs: number;
   contracts?: ApiContractStore;
   repair?: ApiRepairHandler;
+  apiRepairPolicy?: { deterministicRetries?: number; agentRepairs?: number; statuses?: number[] };
 
   constructor(options: {
     baseUrl?: string;
@@ -148,22 +172,47 @@ export class ZikiClient {
     orgSlug?: string | null;
     vars?: Record<string, string>;
     endpoints?: Record<string, Record<string, string>>;
-    agentName?: string;
+    transport: TransportConfig;
+    operations: Record<string, Record<string, OperationConfig>>;
+    agentName: string;
     timeoutMs?: number;
     contracts?: ApiContractStore;
     repair?: ApiRepairHandler;
+    apiRepairPolicy?: { deterministicRetries?: number; agentRepairs?: number; statuses?: number[] };
   }) {
-    this.baseUrl = (options.baseUrl ?? "https://ziki.dev").replace(/\/$/, "");
+    if (!options.baseUrl) throw new Error("ZikiClient requires baseUrl (run `auto-work migrate`)");
+    if (!options.transport || typeof options.transport !== "object") {
+      throw new Error("ZikiClient requires transport config (run `auto-work migrate`)");
+    }
+    if (!options.operations || typeof options.operations !== "object") {
+      throw new Error("ZikiClient requires operations config (run `auto-work migrate`)");
+    }
+    if (!options.agentName) throw new Error("ZikiClient requires agentName");
+    this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
     this.projectId = options.projectId;
     this.projectSlug = options.projectSlug;
     this.orgSlug = options.orgSlug ?? null;
     this.vars = { ...(options.vars ?? {}) };
-    this.endpoints = options.endpoints ?? DEFAULT_ENDPOINTS;
-    this.agentName = options.agentName ?? "agent";
-    this.timeoutMs = options.timeoutMs ?? 60_000;
+    this.endpoints = options.endpoints ?? {};
+    this.transport = options.transport;
+    this.operations = options.operations;
+    this.agentName = options.agentName;
+    this.timeoutMs = options.timeoutMs ?? requireTransportNumber(options.transport, "defaultTimeoutMs");
     this.contracts = options.contracts;
     this.repair = options.repair;
+    this.apiRepairPolicy = options.apiRepairPolicy;
+  }
+
+  /** Operation contract for group.name — throws unknown_operation when absent. */
+  op(group: string, name: string): OperationConfig {
+    const op = this.operations[group]?.[name];
+    if (!op || typeof op !== "object") {
+      throw new Error(
+        `unknown operation: ${group}.${name} (not in operations config — update config or run migrate)`
+      );
+    }
+    return op;
   }
 
   /**
@@ -171,10 +220,16 @@ export class ZikiClient {
    * `{var}` placeholders from explicit params, configured vars, and identity
    * fields (projectId/projectSlug/orgSlug/platform). Throws on unknown or
    * missing required vars — a wrong but well-formed URL is worse than none.
+   * No built-in fallback: unknown names fail loud so URL-shape changes
+   * surface as repair proposals instead of silent wrong calls.
    */
   route(group: string, name: string, params: Record<string, string | number> = {}): string {
-    const template = this.endpoints[group]?.[name] ?? DEFAULT_ENDPOINTS[group]?.[name];
-    if (!template) throw new Error(`unknown endpoint: ${group}.${name}`);
+    const template = this.endpoints[group]?.[name];
+    if (!template) {
+      throw new Error(
+        `unknown endpoint: ${group}.${name} (not in ziki.endpoints — update config or run migrate)`
+      );
+    }
     const vars: Record<string, string> = {
       ...endpointVars({
         vars: this.vars,
@@ -199,6 +254,21 @@ export class ZikiClient {
     return url;
   }
 
+  /** Policy knobs for the adaptive repair loop (apiRepair config section). */
+  repairPolicy(): { deterministicRetries: number; agentRepairs: number; statuses: number[] } {
+    const policy = this.apiRepairPolicy;
+    const num = (value: unknown, fallback: number): number =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+    const statuses = Array.isArray(policy?.statuses)
+      ? (policy.statuses as unknown[]).filter((entry): entry is number => typeof entry === "number")
+      : [400, 422];
+    return {
+      deterministicRetries: num(policy?.deterministicRetries, 2),
+      agentRepairs: num(policy?.agentRepairs, 1),
+      statuses: statuses.length ? statuses : [400, 422]
+    };
+  }
+
   async request<T = any>(
     method: string,
     pathname: string,
@@ -220,6 +290,7 @@ export class ZikiClient {
     } = {}
   ): Promise<T> {
     const key = contractKey(method, pathname);
+    const policy = this.repairPolicy();
     let body = stripRejectedFields(options.body, this.contracts?.[key]?.rejected ?? []);
     let deterministicRepairs = 0;
     let agentRepairs = 0;
@@ -230,7 +301,7 @@ export class ZikiClient {
       } catch (error) {
         if (!(error instanceof ZikiError)) throw error;
 
-        if (deterministicRepairs < 2) {
+        if (deterministicRepairs < policy.deterministicRetries) {
           const repaired = repairApiBody(body, error.body);
           if (repaired?.changed) {
             body = repaired.body;
@@ -240,7 +311,7 @@ export class ZikiClient {
           }
         }
 
-        if (agentRepairs < 1 && this.repair && body !== undefined && [400, 422].includes(error.status)) {
+        if (agentRepairs < policy.agentRepairs && this.repair && body !== undefined && policy.statuses.includes(error.status)) {
           agentRepairs += 1;
           let repaired: ApiRepairResult | null = null;
           try {
@@ -290,7 +361,13 @@ export class ZikiClient {
     } = {}
   ): Promise<T> {
     const url = this.url(pathname, options.query ?? {});
-    const retries = options.retries ?? 3;
+    const transport = this.transport;
+    const retries = options.retries ?? requireTransportNumber(transport, "defaultRetries");
+    const retryCap = requireTransportNumber(transport, "backoffCapMs");
+    const growthCap = requireTransportNumber(transport, "retryGrowthCapMs");
+    const previewChars = requireTransportNumber(transport, "previewChars");
+    const authScheme = requireTransportString(transport, "authScheme");
+    const userAgent = requireTransportString(transport, "userAgent");
     let attempt = 0;
     let lastError: unknown = null;
 
@@ -299,9 +376,9 @@ export class ZikiClient {
         const response = await fetch(url, {
           method,
           headers: {
-            Authorization: `Bearer ${this.apiKey}`,
+            Authorization: `${authScheme} ${this.apiKey}`,
             Accept: "application/json",
-            "User-Agent": "ziki-auto-work/0.1",
+            "User-Agent": userAgent,
             ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
             ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
             ...(options.headers ?? {})
@@ -315,7 +392,7 @@ export class ZikiClient {
         }
 
         if ((response.status === 429 || response.status >= 500) && attempt < retries) {
-          await sleep(retryAfterMs(response, attempt, options.maxRetryAfterMs ?? Infinity));
+          await sleep(retryAfterMs(response, attempt, options.maxRetryAfterMs ?? retryCap, growthCap));
           attempt += 1;
           continue;
         }
@@ -341,7 +418,9 @@ export class ZikiClient {
           });
         }
 
-        if (options.expect) assertResponseShape(method, pathname, response.status, data, options.expect);
+        if (options.expect) {
+          assertResponseShape(method, pathname, response.status, data, options.expect, previewChars);
+        }
 
         if (options.raw) return { data, response } as T;
         return data as T;
@@ -349,7 +428,7 @@ export class ZikiClient {
         lastError = error;
         if (error instanceof ZikiError) throw error;
         if (attempt >= retries) break;
-        await sleep(Math.min(30_000, 1000 * 2 ** attempt));
+        await sleep(Math.min(growthCap, 1000 * 2 ** attempt));
         attempt += 1;
       }
     }
@@ -380,32 +459,115 @@ export class ZikiClient {
     return this.request<T>("DELETE", pathname, options);
   }
 
+  /**
+   * Config-driven operation call. Method, expected shape, timeout and retry
+   * budget come from `operations.<group>.<name>` — a Ziki method change,
+   * renamed payload or new pagination policy is a config patch, never code.
+   * Thin typed wrappers below supply only field data (the loop's own inputs).
+   */
+  invoke<T = any>(
+    group: string,
+    name: string,
+    options: {
+      params?: Record<string, string | number>;
+      query?: Record<string, unknown>;
+      body?: unknown;
+      headers?: Record<string, string>;
+      raw?: boolean;
+      timeoutMs?: number;
+      retries?: number;
+      maxRetryAfterMs?: number;
+      idempotencyKey?: string;
+    } = {}
+  ): Promise<T> {
+    const op = this.op(group, name);
+    const method = op.method;
+    if (!method) throw new Error(`operation ${group}.${name} has no method (run \`auto-work migrate\`)`);
+    return this.request<T>(method, this.route(group, op.route ?? name, options.params), {
+      query: options.query,
+      body: options.body,
+      headers: options.headers,
+      raw: options.raw,
+      timeoutMs: options.timeoutMs ?? op.timeoutMs,
+      retries: options.retries ?? op.retries,
+      maxRetryAfterMs: options.maxRetryAfterMs,
+      idempotencyKey: options.idempotencyKey,
+      expect: op.expect
+    });
+  }
+
+  /**
+   * Config-driven cursor pagination. Keys, page size and page/item caps come
+   * from `operations.<group>.<name>.pagination`.
+   */
+  async listAllOp<T = any>(
+    group: string,
+    name: string,
+    options: {
+      params?: Record<string, string | number>;
+      query?: Record<string, unknown>;
+      max?: number;
+    } = {}
+  ): Promise<T[]> {
+    const op = this.op(group, name);
+    const pagination = op.pagination;
+    if (!pagination) {
+      throw new Error(`operation ${group}.${name} has no pagination config (add operations.${group}.${name}.pagination)`);
+    }
+    const where = `operations.${group}.${name}.pagination`;
+    for (const key of ["limitKey", "cursorKey", "itemsKey", "nextCursorKey", "defaultLimit", "maxPages", "maxItems"] as const) {
+      if (pagination[key] === undefined) {
+        throw new Error(`operation ${group}.${name} is missing ${where}.${key} (run \`auto-work migrate\`)`);
+      }
+    }
+    const limitKey = pagination.limitKey as string;
+    const cursorKey = pagination.cursorKey as string;
+    const itemsKey = pagination.itemsKey as string;
+    const nextCursorKey = pagination.nextCursorKey as string;
+    const defaultLimit = pagination.defaultLimit as number;
+    const maxPages = pagination.maxPages as number;
+    const maxItems = pagination.maxItems as number;
+    const items: T[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < maxPages; page += 1) {
+      const data = await this.invoke<{ [key: string]: unknown }>(group, name, {
+        params: options.params,
+        query: { ...options.query, [limitKey]: defaultLimit, [cursorKey]: cursor }
+      });
+      const batch = (data as Record<string, unknown>)[itemsKey];
+      if (Array.isArray(batch)) items.push(...(batch as T[]));
+      cursor = (data as Record<string, unknown>)[nextCursorKey] as string | undefined;
+      if (!cursor || items.length >= (options.max ?? maxItems)) break;
+    }
+    return items;
+  }
+
   me(): Promise<AgentMe> {
-    return this.get(this.route("agents", "me"), { expect: "object" });
+    return this.invoke("agents", "me");
   }
 
   updateProfile(input: { username?: string; tagline?: string | null; about?: string | null }): Promise<AgentProfile> {
-    return this.patch(this.route("agents", "me"), { body: input });
+    return this.invoke("agents", "updateMe", { body: input });
   }
 
   listSkills(): Promise<{ skills?: AgentSkillConfig[] }> {
-    return this.get(this.route("agents", "skills"));
+    return this.invoke("agents", "skills");
   }
 
   setSkills(skills: AgentSkillConfig[]): Promise<{ skills?: AgentSkillConfig[] }> {
-    return this.put(this.route("agents", "skills"), { body: { skills } });
+    return this.invoke("agents", "putSkills", { body: { skills } });
   }
 
   setSkill(tag: string, input: { summary: string; description: string }): Promise<{ skills?: AgentSkillConfig[] }> {
-    return this.put(this.route("agents", "skill", { tag: encodeURIComponent(tag) }), { body: input });
+    return this.invoke("agents", "skill", { params: { tag: encodeURIComponent(tag) }, body: input });
   }
 
   removeSkill(tag: string): Promise<any> {
-    return this.del(this.route("agents", "skill", { tag: encodeURIComponent(tag) }));
+    return this.invoke("agents", "deleteSkill", { params: { tag: encodeURIComponent(tag) } });
   }
 
   skillTags(): Promise<{ tags?: Array<{ name: string; slug: string; agents: number }> }> {
-    return this.get(this.route("agents", "skillTags"), { expect: "object" });
+    return this.invoke("agents", "skillTags");
   }
 
   async setPicture(file: string): Promise<{ picture_url?: string }> {
@@ -414,20 +576,25 @@ export class ZikiClient {
     const name = file.split(/[\\/]/).pop() || "picture";
     const form = new FormData();
     form.append("file", new Blob([bytes]), name);
-    const response = await fetch(`${this.baseUrl}${this.route("agents", "picture")}`, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${this.apiKey}`, Accept: "application/json" },
+    const op = this.op("agents", "picture");
+    const picturePath = this.route("agents", "picture");
+    const response = await fetch(`${this.baseUrl}${picturePath}`, {
+      method: op.method ?? "PUT",
+      headers: {
+        Authorization: `${requireTransportString(this.transport, "authScheme")} ${this.apiKey}`,
+        Accept: "application/json",
+        "User-Agent": requireTransportString(this.transport, "userAgent")
+      },
       body: form,
       signal: AbortSignal.timeout(this.timeoutMs)
     });
     const text = await response.text();
     const data = text ? (JSON.parse(text) as { picture_url?: string }) : {};
     if (!response.ok) {
-      const picturePath = this.route("agents", "picture");
-      throw new ZikiError(`PUT ${picturePath} failed: HTTP ${response.status}`, {
+      throw new ZikiError(`${op.method ?? "PUT"} ${picturePath} failed: HTTP ${response.status}`, {
         status: response.status,
         body: data,
-        method: "PUT",
+        method: op.method ?? "PUT",
         path: picturePath
       });
     }
@@ -435,28 +602,28 @@ export class ZikiClient {
   }
 
   removePicture(): Promise<any> {
-    return this.del(this.route("agents", "picture"));
+    return this.invoke("agents", "deletePicture");
   }
 
   listAgents(tag?: string): Promise<{ agents?: AgentProfile[] }> {
-    return this.get(this.route("agents", "list"), { query: { tag } });
+    return this.invoke("agents", "list", { query: { tag } });
   }
 
   getAgent(username: string): Promise<AgentProfile> {
-    return this.get(this.route("agents", "get", { username: encodeURIComponent(username) }));
+    return this.invoke("agents", "get", { params: { username: encodeURIComponent(username) } });
   }
 
   platforms(): Promise<any> {
-    return this.get(this.route("platforms", "list"), { expect: "list" });
+    return this.invoke("platforms", "list");
   }
 
   project(): Promise<any> {
-    return this.get(this.route("projects", "get", { project: this.projectId }), { expect: "object" });
+    return this.invoke("projects", "get", { params: { project: this.projectId } });
   }
 
   /** Read one project by id (used to verify rotation targets and parse workUrl). */
   readProject(projectId: string): Promise<ProjectSummary & { workUrl?: string }> {
-    return this.get(this.route("projects", "get", { project: projectId }), { expect: "object" });
+    return this.invoke("projects", "get", { params: { project: projectId } });
   }
 
   /**
@@ -464,15 +631,20 @@ export class ZikiClient {
    * projectId. Needs no project scope, so it works while project routes 404.
    */
   listProjects(): Promise<{ items: ProjectSummary[] }> {
-    return this.get(this.route("projects", "list"), { expect: "list" });
+    return this.invoke("projects", "list");
   }
 
   async work(options: { etag?: string } = {}): Promise<{ notModified: boolean; data?: WorkFeed; etag?: string }> {
-    const result = await this.request<{ data: WorkFeed | null; response: Response }>("GET", this.route("work", "feed"), {
-      headers: options.etag ? { "If-None-Match": options.etag } : {},
-      raw: true,
-      expect: "feed"
-    });
+    const op = this.op("work", "feed");
+    const result = await this.request<{ data: WorkFeed | null; response: Response }>(
+      op.method ?? "GET",
+      this.route("work", "feed"),
+      {
+        headers: options.etag ? { "If-None-Match": options.etag } : {},
+        raw: true,
+        expect: op.expect
+      }
+    );
     if (result.response.status === 304) {
       return { notModified: true, etag: result.response.headers.get("etag") || options.etag };
     }
@@ -484,53 +656,54 @@ export class ZikiClient {
   }
 
   listIssues(options: { platform?: string; status?: string; limit?: number; cursor?: string } = {}): Promise<any> {
-    return this.get(this.route("issues", "list"), {
+    const limit = options.limit ?? this.op("issues", "list").pagination?.defaultLimit;
+    return this.invoke("issues", "list", {
       query: {
         projectId: this.projectId,
         platform: options.platform,
         status: options.status,
-        limit: options.limit ?? 100,
+        limit,
         cursor: options.cursor
-      },
-      expect: "list"
+      }
     });
   }
 
   async listAllIssues(options: { platform?: string; status?: string; max?: number } = {}): Promise<Issue[]> {
-    const items: Issue[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < 20; page += 1) {
-      const data = await this.listIssues({ ...options, limit: 100, cursor });
-      items.push(...(data.items ?? []));
-      cursor = data.nextCursor ?? undefined;
-      if (!cursor || items.length >= (options.max ?? 600)) break;
-    }
-    return items;
+    return this.listAllOp<Issue>("issues", "list", {
+      query: { projectId: this.projectId, platform: options.platform, status: options.status },
+      max: options.max
+    });
   }
 
   counts(): Promise<any> {
-    return this.get(this.route("issues", "counts"), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "counts", { query: { projectId: this.projectId } });
   }
 
   getIssue(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("issues", "get", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "get", { params: { issue: idOrNumber }, query: { projectId: this.projectId } });
   }
 
   comments(idOrNumber: string | number, options: { limit?: number; cursor?: string } = {}): Promise<any> {
-    return this.get(this.route("issues", "comments", { issue: idOrNumber }), {
-      query: { projectId: this.projectId, limit: options.limit ?? 100, cursor: options.cursor }
+    const limit = options.limit ?? this.op("issues", "comments").pagination?.defaultLimit;
+    return this.invoke("issues", "comments", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId, limit, cursor: options.cursor }
     });
   }
 
   comment(idOrNumber: string | number, body: Record<string, unknown>): Promise<any> {
-    return this.post(this.route("issues", "comments", { issue: idOrNumber }), {
+    return this.invoke("issues", "postComment", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body
     });
   }
 
   upvoteComment(commentId: string): Promise<any> {
-    return this.post(this.route("comments", "votes", { comment: commentId }), { query: { projectId: this.projectId } });
+    return this.invoke("comments", "votes", {
+      params: { comment: commentId },
+      query: { projectId: this.projectId }
+    });
   }
 
   createIdea(input: {
@@ -546,7 +719,7 @@ export class ZikiClient {
     vettedNote?: string;
     idempotencyKey?: string;
   }): Promise<any> {
-    return this.post(this.route("ideas", "list"), {
+    return this.invoke("ideas", "create", {
       query: { projectId: this.projectId },
       idempotencyKey: input.idempotencyKey ?? randomUUID(),
       body: {
@@ -565,63 +738,75 @@ export class ZikiClient {
   }
 
   listIdeas(options: { status?: string; convertible?: boolean; platform?: string; limit?: number; cursor?: string } = {}): Promise<any> {
-    return this.get(this.route("ideas", "list"), {
+    const limit = options.limit ?? this.op("ideas", "list").pagination?.defaultLimit;
+    return this.invoke("ideas", "list", {
       query: {
         projectId: this.projectId,
         status: options.status,
         convertible: options.convertible,
         platform: options.platform,
-        limit: options.limit ?? 100,
+        limit,
         cursor: options.cursor
-      },
-      expect: "list"
+      }
     });
   }
 
   async listAllIdeas(options: { platform?: string; status?: string; max?: number } = {}): Promise<Idea[]> {
-    const items: Idea[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < 20; page += 1) {
-      const data = await this.listIdeas({ ...options, limit: 100, cursor });
-      items.push(...(data.items ?? []));
-      cursor = data.nextCursor ?? undefined;
-      if (!cursor || items.length >= (options.max ?? 600)) break;
-    }
-    return items;
+    return this.listAllOp<Idea>("ideas", "list", {
+      query: { projectId: this.projectId, platform: options.platform, status: options.status },
+      max: options.max
+    });
   }
 
   getIdea(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("ideas", "get", { idea: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("ideas", "get", { params: { idea: idOrNumber }, query: { projectId: this.projectId } });
   }
 
   ideaVerdicts(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("ideas", "verdicts", { idea: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("ideas", "listVerdicts", {
+      params: { idea: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   giveIdeaVerdict(
     idOrNumber: string | number,
     input: { opinion: "good" | "bad" | "neutral"; votes?: number; summary: string; description: string }
   ): Promise<any> {
-    return this.post(this.route("ideas", "verdicts", { idea: idOrNumber }), {
+    return this.invoke("ideas", "verdicts", {
+      params: { idea: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   convertIdea(idOrNumber: string | number): Promise<any> {
-    return this.post(this.route("ideas", "convert", { idea: idOrNumber }), { query: { projectId: this.projectId }, body: {} });
+    return this.invoke("ideas", "convert", {
+      params: { idea: idOrNumber },
+      query: { projectId: this.projectId },
+      body: {}
+    });
   }
 
   rejectIdea(idOrNumber: string | number, body: Record<string, unknown> = {}): Promise<any> {
-    return this.post(this.route("ideas", "reject", { idea: idOrNumber }), { query: { projectId: this.projectId }, body });
+    return this.invoke("ideas", "reject", {
+      params: { idea: idOrNumber },
+      query: { projectId: this.projectId },
+      body
+    });
   }
 
   archiveIdea(idOrNumber: string | number, body: Record<string, unknown> = {}): Promise<any> {
-    return this.post(this.route("ideas", "archive", { idea: idOrNumber }), { query: { projectId: this.projectId }, body });
+    return this.invoke("ideas", "archive", {
+      params: { idea: idOrNumber },
+      query: { projectId: this.projectId },
+      body
+    });
   }
 
   categorizeIdea(idOrNumber: string | number, input: { platform: string; reason?: string }): Promise<any> {
-    return this.put(this.route("ideas", "platform", { idea: idOrNumber }), {
+    return this.invoke("ideas", "platform", {
+      params: { idea: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
@@ -638,81 +823,102 @@ export class ZikiClient {
       attachmentIds?: string[];
     }
   ): Promise<any> {
-    return this.post(this.route("issues", "confirmations", { issue: idOrNumber }), {
+    return this.invoke("issues", "confirmations", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   openIssue(idOrNumber: string | number): Promise<any> {
-    return this.post(this.route("issues", "open", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "open", { params: { issue: idOrNumber }, query: { projectId: this.projectId } });
   }
 
   bid(idOrNumber: string | number, input: { summary: string; description: string }): Promise<any> {
-    return this.post(this.route("issues", "bid", { issue: idOrNumber }), {
+    return this.invoke("issues", "bid", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   withdrawBid(idOrNumber: string | number): Promise<any> {
-    return this.del(this.route("issues", "bid", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "withdrawBid", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   listBids(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("issues", "bid", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "listBids", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   awardBid(bidId: string): Promise<any> {
-    return this.post(this.route("bids", "award", { bid: bidId }), { query: { projectId: this.projectId } });
+    return this.invoke("bids", "award", { params: { bid: bidId }, query: { projectId: this.projectId } });
   }
 
   voteBid(bidId: string): Promise<any> {
-    return this.post(this.route("bids", "votes", { bid: bidId }), { query: { projectId: this.projectId } });
+    return this.invoke("bids", "votes", { params: { bid: bidId }, query: { projectId: this.projectId } });
   }
 
   stake(idOrNumber: string | number, input: { summary: string; description: string }): Promise<any> {
-    return this.post(this.route("issues", "stake", { issue: idOrNumber }), {
+    return this.invoke("issues", "stake", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   acceptOffer(offerId: string): Promise<any> {
-    return this.post(this.route("offers", "accept", { offer: offerId }), { query: { projectId: this.projectId } });
+    return this.invoke("offers", "accept", { params: { offer: offerId }, query: { projectId: this.projectId } });
   }
 
   heartbeat(
     idOrNumber: string | number,
     options: { timeoutMs?: number; retries?: number; maxRetryAfterMs?: number } = {}
   ): Promise<any> {
-    return this.post(this.route("issues", "heartbeat", { issue: idOrNumber }), {
+    return this.invoke("issues", "heartbeat", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       ...options
     });
   }
 
   extend(idOrNumber: string | number, reason: string): Promise<any> {
-    return this.post(this.route("issues", "extend", { issue: idOrNumber }), {
+    return this.invoke("issues", "extend", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: { reason }
     });
   }
 
   release(idOrNumber: string | number): Promise<any> {
-    return this.post(this.route("issues", "release", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "release", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   reclaim(idOrNumber: string | number): Promise<any> {
-    return this.post(this.route("issues", "reclaim", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "reclaim", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   markImportant(idOrNumber: string | number): Promise<any> {
-    return this.post(this.route("issues", "importance", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "importance", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   abandonVote(idOrNumber: string | number, summary: string): Promise<any> {
-    return this.post(this.route("issues", "abandonVotes", { issue: idOrNumber }), {
+    return this.invoke("issues", "abandonVotes", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: { summary }
     });
@@ -728,7 +934,8 @@ export class ZikiClient {
       duplicateOf?: number | string;
     }
   ): Promise<any> {
-    return this.post(this.route("issues", "closeSuggestions", { issue: idOrNumber }), {
+    return this.invoke("issues", "closeSuggestions", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
@@ -738,45 +945,60 @@ export class ZikiClient {
     idOrNumber: string | number,
     input: { reason: string; evidence: string; duplicateOf?: number | string }
   ): Promise<any> {
-    return this.post(this.route("issues", "close", { issue: idOrNumber }), {
+    return this.invoke("issues", "close", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   stakeIssue(idOrNumber: string | number, input: { summary: string; description: string }): Promise<{ stake?: Stake }> {
-    return this.post(this.route("issues", "stake", { issue: idOrNumber }), {
+    return this.invoke("issues", "stake", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   listStakes(idOrNumber: string | number): Promise<{ stakes?: Stake[] }> {
-    return this.get(this.route("issues", "stake", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "listStakes", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   refreshStake(stakeId: string): Promise<{ stake?: Stake }> {
-    return this.post(this.route("stakes", "refresh", { stake: stakeId }), { query: { projectId: this.projectId } });
+    return this.invoke("stakes", "refresh", {
+      params: { stake: stakeId },
+      query: { projectId: this.projectId }
+    });
   }
 
   voteStake(stakeId: string): Promise<any> {
-    return this.post(this.route("stakes", "votes", { stake: stakeId }), { query: { projectId: this.projectId } });
+    return this.invoke("stakes", "votes", {
+      params: { stake: stakeId },
+      query: { projectId: this.projectId }
+    });
   }
 
   acceptReviewOffer(offerId: string): Promise<any> {
-    return this.post(this.route("reviews", "accept", { offer: offerId }), { query: { projectId: this.projectId } });
+    return this.invoke("reviews", "accept", { params: { offer: offerId }, query: { projectId: this.projectId } });
   }
 
   acceptJobReview(offerId: string): Promise<any> {
-    return this.post(this.route("jobs", "acceptReview", { offer: offerId }), { query: { projectId: this.projectId } });
+    return this.invoke("jobs", "acceptReview", {
+      params: { offer: offerId },
+      query: { projectId: this.projectId }
+    });
   }
 
   getJob(jobId: string): Promise<ResearchJob> {
-    return this.get(this.route("jobs", "get", { job: jobId }), { query: { projectId: this.projectId } });
+    return this.invoke("jobs", "get", { params: { job: jobId }, query: { projectId: this.projectId } });
   }
 
   submitJob(jobId: string, data: unknown): Promise<any> {
-    return this.post(this.route("jobs", "submissions", { job: jobId }), {
+    return this.invoke("jobs", "submissions", {
+      params: { job: jobId },
       query: { projectId: this.projectId },
       body: { data }
     });
@@ -786,14 +1008,16 @@ export class ZikiClient {
     submissionId: string,
     input: { verdict: "accept" | "reject"; notes?: string }
   ): Promise<any> {
-    return this.post(this.route("jobs", "submitReview", { submission: submissionId }), {
+    return this.invoke("jobs", "submitReview", {
+      params: { submission: submissionId },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   repairPullRequest(idOrNumber: string | number, pullRequestUrl?: string): Promise<any> {
-    return this.post(this.route("issues", "pullRequest", { issue: idOrNumber }), {
+    return this.invoke("issues", "pullRequest", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: pullRequestUrl ? { pullRequestUrl } : {}
     });
@@ -810,18 +1034,23 @@ export class ZikiClient {
       headSha?: string;
     }
   ): Promise<any> {
-    return this.post(this.route("issues", "delivery", { issue: idOrNumber }), {
+    return this.invoke("issues", "delivery", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   delivery(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("issues", "delivery", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "getDelivery", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   reportPrStatus(idOrNumber: string | number, report: Record<string, unknown>): Promise<any> {
-    return this.post(this.route("issues", "pullRequestStatus", { issue: idOrNumber }), {
+    return this.invoke("issues", "pullRequestStatus", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: report
     });
@@ -837,149 +1066,184 @@ export class ZikiClient {
       headSha?: string;
     }
   ): Promise<any> {
-    return this.post(this.route("issues", "testResults", { issue: idOrNumber }), {
+    return this.invoke("issues", "testResults", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   listTestResults(idOrNumber: string | number): Promise<{ verdicts?: TestVerdict[] }> {
-    return this.get(this.route("issues", "testResults", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "getTestResults", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   mergeReview(
     idOrNumber: string | number,
     input: { verdict: "accept" | "reject"; summary: string; description: string }
   ): Promise<any> {
-    return this.post(this.route("issues", "merge", { issue: idOrNumber }), {
+    return this.invoke("issues", "merge", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   listMergeReviews(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("issues", "mergeReviews", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "mergeReviews", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   reportDeployment(idOrNumber: string | number, input: { environment: "dev" | "staging" | "prod"; note: string }): Promise<any> {
-    return this.post(this.route("issues", "deployment", { issue: idOrNumber }), {
+    return this.invoke("issues", "deployment", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   resolveIssue(idOrNumber: string | number, pullRequestUrl?: string): Promise<any> {
-    return this.post(this.route("issues", "resolve", { issue: idOrNumber }), {
+    return this.invoke("issues", "resolve", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: pullRequestUrl ? { pullRequestUrl } : {}
     });
   }
 
   estimateReward(idOrNumber: string | number, input: { value: number; reason: string }): Promise<any> {
-    return this.post(this.route("issues", "reward", { issue: idOrNumber }), {
+    return this.invoke("issues", "reward", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   getReward(idOrNumber: string | number): Promise<any> {
-    return this.get(this.route("issues", "reward", { issue: idOrNumber }), { query: { projectId: this.projectId } });
+    return this.invoke("issues", "getReward", {
+      params: { issue: idOrNumber },
+      query: { projectId: this.projectId }
+    });
   }
 
   categorizeIssue(idOrNumber: string | number, input: { platform: string; reason?: string }): Promise<any> {
-    return this.put(this.route("issues", "platform", { issue: idOrNumber }), {
+    return this.invoke("issues", "platform", {
+      params: { issue: idOrNumber },
       query: { projectId: this.projectId },
       body: input
     });
   }
 
   escalate(input: { body: string; type?: string; bugId?: string }): Promise<{ escalation?: Escalation }> {
-    return this.post(this.route("escalations", "create"), { body: input });
+    return this.invoke("escalations", "create", { body: input });
   }
 
   getEscalation(id: string): Promise<{ escalation?: Escalation }> {
-    return this.get(this.route("escalations", "get", { id }));
+    return this.invoke("escalations", "get", { params: { id } });
   }
 
   askQuestion(input: { body: string; bugId?: string }): Promise<any> {
-    return this.post(this.route("questions", "create"), { body: input });
+    return this.invoke("questions", "create", { body: input });
   }
 
   getQuestion(id: string): Promise<any> {
-    return this.get(this.route("questions", "get", { id }));
+    return this.invoke("questions", "get", { params: { id } });
   }
 
   inbox(options: { unread?: boolean; cursor?: string; wait?: number } = {}): Promise<{ items?: InboxItem[] }> {
-    return this.get(this.route("inbox", "list"), {
-      query: { unread: options.unread === false ? undefined : 1, cursor: options.cursor, wait: options.wait },
-      expect: "list"
+    return this.invoke("inbox", "list", {
+      query: { unread: options.unread === false ? undefined : 1, cursor: options.cursor, wait: options.wait }
     });
   }
 
   markInboxRead(ids: string[]): Promise<any> {
-    return this.post(this.route("inbox", "read"), { body: { ids } });
+    return this.invoke("inbox", "read", { body: { ids } });
   }
 
   completeOwnerRequest(id: string): Promise<any> {
-    return this.post(this.route("agents", "dismissRequest", { id }));
+    return this.invoke("agents", "dismissRequest", { params: { id } });
   }
 
   projectNotes(): Promise<any> {
-    return this.get(this.route("projects", "notes", { project: this.projectId }), { expect: "object" });
+    return this.invoke("projects", "notes", { params: { project: this.projectId } });
   }
 
   projectNotesComments(options: { status?: string } = {}): Promise<any> {
-    return this.get(this.route("projects", "notesComments", { project: this.projectId }), {
+    return this.invoke("projects", "notesComments", {
+      params: { project: this.projectId },
       query: { status: options.status }
     });
   }
 
   addProjectNoteComment(input: { body: string; parentId?: string }): Promise<any> {
-    return this.post(this.route("projects", "notesComments", { project: this.projectId }), { body: input });
+    return this.invoke("projects", "postNotesComment", {
+      params: { project: this.projectId },
+      body: input
+    });
   }
 
   voteNoteComment(commentId: string, direction = 1): Promise<any> {
     const suffix = direction >= 0 ? "upvote" : "downvote";
-    return this.put(this.route("projects", "noteComment", { project: this.projectId, comment: commentId, action: suffix }));
+    return this.invoke("projects", "noteComment", {
+      params: { project: this.projectId, comment: commentId, action: suffix }
+    });
   }
 
   agentNotes(): Promise<{ items?: Array<{ id: string; body: string; createdAt: string }> }> {
-    return this.get(this.route("projects", "myNotes", { project: this.projectId }), { expect: "list" });
+    return this.invoke("projects", "myNotes", { params: { project: this.projectId } });
   }
 
   addAgentNote(body: string): Promise<any> {
-    return this.post(this.route("projects", "myNotes", { project: this.projectId }), { body: { body } });
+    return this.invoke("projects", "postMyNote", {
+      params: { project: this.projectId },
+      body: { body }
+    });
   }
 
   editAgentNote(noteId: string, body: string): Promise<any> {
-    return this.patch(this.route("projects", "myNote", { project: this.projectId, note: noteId }), { body: { body } });
+    return this.invoke("projects", "myNote", {
+      params: { project: this.projectId, note: noteId },
+      body: { body }
+    });
   }
 
   deleteAgentNote(noteId: string): Promise<any> {
-    return this.del(this.route("projects", "myNote", { project: this.projectId, note: noteId }));
+    return this.invoke("projects", "deleteMyNote", {
+      params: { project: this.projectId, note: noteId }
+    });
   }
 
   mistakes(options: { limit?: number } = {}): Promise<{ mistakes?: unknown[] }> {
-    return this.get(this.route("projects", "mistakes", { project: this.projectId }), {
-      query: { limit: options.limit ?? 100 }
+    const limit = options.limit ?? this.op("projects", "mistakes").pagination?.defaultLimit;
+    return this.invoke("projects", "mistakes", {
+      params: { project: this.projectId },
+      query: { limit }
     });
   }
 
   history(options: { kind?: string; limit?: number; cursor?: string } = {}): Promise<any> {
-    return this.get(this.route("agents", "history"), {
-      query: { kind: options.kind, limit: options.limit ?? 50, cursor: options.cursor }
+    const limit = options.limit ?? this.op("agents", "history").pagination?.defaultLimit;
+    return this.invoke("agents", "history", {
+      query: { kind: options.kind, limit, cursor: options.cursor }
     });
   }
 
   points(): Promise<any> {
-    return this.get(this.route("agents", "points"));
+    return this.invoke("agents", "points");
   }
 }
 
 export function clientForAgent(
   agent: AgentKey,
   profile: ProfileConfig,
-  options: { contracts?: ApiContractStore; repair?: ApiRepairHandler } = {}
+  options: {
+    contracts?: ApiContractStore;
+    repair?: ApiRepairHandler;
+    apiRepairPolicy?: { deterministicRetries?: number; agentRepairs?: number; statuses?: number[] };
+  } = {}
 ): ZikiClient {
   return new ZikiClient({
     baseUrl: profile.ziki.baseUrl,
@@ -989,9 +1253,12 @@ export function clientForAgent(
     orgSlug: profile.ziki.orgSlug ?? null,
     vars: profile.ziki.vars,
     endpoints: profile.ziki.endpoints,
+    transport: profile.transport ?? {},
+    operations: profile.operations ?? {},
     agentName: agent.name,
     contracts: options.contracts,
-    repair: options.repair
+    repair: options.repair,
+    apiRepairPolicy: options.apiRepairPolicy ?? profile.apiRepair
   });
 }
 

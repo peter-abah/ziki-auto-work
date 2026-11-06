@@ -5,8 +5,27 @@ import { inspectKeys } from "./keys.js";
 import { loadEnv } from "./config.js";
 import { paths, safeName } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
-export const BOOTSTRAP_BASE_URL = "https://ziki.dev";
 const QUALIFYING_LEVELS = new Set(["working", "manager", "merger"]);
+async function bootstrapTemplate() {
+    const { loadInitTemplates } = await import("./config-templates.js");
+    const templates = await loadInitTemplates();
+    const record = templates;
+    const bootstrap = (templates.bootstrap ?? {});
+    const baseUrl = record.defaultBaseUrl;
+    if (typeof baseUrl !== "string" || !baseUrl)
+        throw new Error("init templates missing defaultBaseUrl");
+    const num = (value, fallback) => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+    return {
+        baseUrl,
+        transport: (templates.transport ?? {}),
+        operations: (templates.operations ?? {}),
+        endpoints: (templates.endpoints ?? {}),
+        agentName: typeof bootstrap.agentName === "string" && bootstrap.agentName ? bootstrap.agentName : "bootstrap",
+        reasonSlice: num(bootstrap.reasonSlice, 500),
+        notifySlice: num(bootstrap.notifySlice, 500),
+        escalationSlice: num(bootstrap.escalationSlice, 1900)
+    };
+}
 export function bootstrapDir(profileName) {
     return path.join(paths().profilesDir, safeName(profileName || "unknown"));
 }
@@ -44,11 +63,11 @@ function pickWorkingKey(inspections) {
         usable[0] ??
         null);
 }
-export function buildEscalationBody(reason, profileName) {
+export function buildEscalationBody(reason, profileName, options = {}) {
     return [
         "[config bootstrap] auto-work could not start: the local config is missing or invalid.",
         "",
-        `Reason: ${reason}`.slice(0, 500),
+        `Reason: ${reason}`.slice(0, options.reasonSlice ?? 500),
         `Profile: ${profileName ?? "(unknown)"}`,
         "",
         "The loop did not start, so no agent ran and nothing was changed. " +
@@ -89,10 +108,10 @@ export function buildNeedsHumanBody(options) {
     lines.push("- Then `auto-work start` (or bare `auto-work`) to run");
     return `${lines.join("\n")}\n`;
 }
-async function notifyDesktop(title, body) {
+async function notifyDesktop(title, body, notifySlice = 500) {
     if (process.platform !== "linux")
         return;
-    await runCommand("notify-send", ["auto-work", `${title}\n${body}`.slice(0, 500)], {
+    await runCommand("notify-send", ["auto-work", `${title}\n${body}`.slice(0, notifySlice)], {
         timeoutMs: 10_000
     }).catch(() => { });
 }
@@ -113,11 +132,12 @@ export async function bootstrapOnConfigFailure(options) {
     await mkdir(dir, { recursive: true }).catch(() => { });
     const needsFile = bootstrapNeedsFile(profileName);
     const previous = await readBootstrapState(profileName);
+    const tpl = await bootstrapTemplate();
     let keyEnvName = null;
     let inspection = null;
     try {
         const env = await loadEnv().catch(() => ({}));
-        const inspections = await inspectKeys(env, BOOTSTRAP_BASE_URL).catch(() => []);
+        const inspections = await inspectKeys(env, tpl.baseUrl).catch(() => []);
         inspection = pickWorkingKey(inspections);
         keyEnvName = inspection?.envName ?? null;
     }
@@ -128,11 +148,14 @@ export async function bootstrapOnConfigFailure(options) {
     let escalationAnswer = previous?.escalationAnswer ?? null;
     let escalated = false;
     const clientFor = (key) => new ZikiClient({
-        baseUrl: BOOTSTRAP_BASE_URL,
+        baseUrl: tpl.baseUrl,
         apiKey: key.key,
         projectId: "",
         projectSlug: "",
-        agentName: key.agent ?? "bootstrap"
+        endpoints: tpl.endpoints,
+        transport: tpl.transport,
+        operations: tpl.operations,
+        agentName: key.agent ?? tpl.agentName
     });
     // Reap a previously filed escalation first — a human may already have answered.
     if (escalationId && inspection) {
@@ -155,7 +178,7 @@ export async function bootstrapOnConfigFailure(options) {
     if (!escalationId && inspection) {
         try {
             const response = await clientFor(inspection).escalate({
-                body: buildEscalationBody(reason, profileName).slice(0, 1900),
+                body: buildEscalationBody(reason, profileName, { reasonSlice: tpl.reasonSlice }).slice(0, tpl.escalationSlice),
                 type: "blocker"
             });
             if (response?.escalation?.id) {
@@ -172,7 +195,7 @@ export async function bootstrapOnConfigFailure(options) {
         version: 1,
         at: new Date().toISOString(),
         profile: profileName,
-        reason: reason.slice(0, 500),
+        reason: reason.slice(0, tpl.reasonSlice),
         keyEnvName,
         escalationId,
         escalationAnswer,
@@ -187,7 +210,7 @@ export async function bootstrapOnConfigFailure(options) {
         escalationAnswer
     });
     await writeFile(needsFile, body, "utf8").catch(() => { });
-    await notifyDesktop("auto-work cannot start", escalationId ? `Escalation ${escalationId} filed on Ziki. See NEEDS-HUMAN.md.` : reason.slice(0, 200));
+    await notifyDesktop("auto-work cannot start", escalationId ? `Escalation ${escalationId} filed on Ziki. See NEEDS-HUMAN.md.` : reason.slice(0, tpl.notifySlice), tpl.notifySlice);
     return { escalated, escalationId, keyEnvName, needsHumanFile: needsFile };
 }
 //# sourceMappingURL=bootstrap.js.map

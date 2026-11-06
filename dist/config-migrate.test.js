@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { explainProfile, fillProfileFromTemplates, loadInitTemplates, migrateV3toV4, templateVersion } from "./config-templates.js";
 import { validateConfig, validateV4Sections } from "./config.js";
-import { validateEndpoints } from "./ziki-endpoints.js";
+import { DEFAULT_ENDPOINTS, validateEndpoints } from "./ziki-endpoints.js";
 function v3Profile() {
     return {
         ziki: {
@@ -98,6 +98,21 @@ test("validateV4Sections requires transport and operations in v4", () => {
         operations: { issues: { bid: { method: "" } } }
     };
     assert.ok(validateV4Sections(bad, "profiles.demo").some((error) => error.includes("method must be a non-empty string")));
+});
+test("template endpoints match the built-in registry (drift guard)", async () => {
+    const templates = await loadInitTemplates();
+    assert.deepEqual(templates.endpoints, DEFAULT_ENDPOINTS);
+});
+test("template operations reference real endpoints", async () => {
+    const templates = await loadInitTemplates();
+    const endpoints = templates.endpoints;
+    const operations = templates.operations;
+    for (const [group, names] of Object.entries(operations)) {
+        for (const [name, op] of Object.entries(names)) {
+            const endpoint = op.route ?? name;
+            assert.ok(endpoints[group]?.[endpoint], `operations.${group}.${name} routes to missing endpoint ${group}.${endpoint}`);
+        }
+    }
 });
 test("migrated v3 config validates clean", async () => {
     const templates = await loadInitTemplates();

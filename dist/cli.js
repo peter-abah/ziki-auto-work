@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, readdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, PROVIDERS, deepMerge, defaultConfig, inferPushMode, loadConfig, loadEnv, loadProfile, parseEnvFile, resolveModel, resolveRunLimits, sampleConfigPath, saveConfig, saveEnv, validateConfig } from "./config.js";
+import { PROVIDERS, deepMerge, defaultConfig, inferPushMode, loadConfig, loadEnv, loadProfile, parseEnvFile, resolveModel, resolveRunLimits, sampleConfigPath, saveConfig, saveEnv, validateConfig } from "./config.js";
 import { PACKAGE_ROOT, paths, profilePaths, safeName } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
 import { runDoctor, formatDoctor } from "./doctor.js";
@@ -351,23 +351,20 @@ function discoveryConfig(flags, existing, profileName, parity) {
 }
 function baseProfile(overrides) {
     const defaults = defaultConfig().defaults ?? {};
+    // Structural placeholders only — every behavioral value (limits, workflow,
+    // prTracking, discovery, poll cadence, hitl, transport, operations, …) is
+    // filled from config/init-templates.json by stampV4, never from literals.
     return deepMerge({
-        ziki: { baseUrl: "https://ziki.dev", projectId: "", projectSlug: "", platform: "" },
+        ziki: { baseUrl: "", projectId: "", projectSlug: "", platform: "" },
         repo: { url: "", upstream: "", base: "main", githubRepo: "", forkOwner: "", defaultBranch: "main" },
         agents: { workers: [], managers: [] },
-        executor: { provider: "opencode", model: null, timeoutMs: 2_700_000, permissionMode: "auto" },
+        executor: { provider: "opencode", model: null },
         toolchain: {},
         checks: [],
         platformMatch: {},
         prompts: { dir: "prompts/generic" },
         pr: { templateFile: "prompts/generic/pr.md" },
-        prTracking: { enabled: true, pollMinutes: 10, maxFollowUps: 10, fixFailingChecks: true, fixReviewComments: true },
-        discovery: { enabled: false, maxIdeasPerRun: 3 },
-        limits: { ...DEFAULT_LIMITS },
-        workflow: { ...DEFAULT_WORKFLOW },
-        pollSeconds: 120,
-        memoryRefreshMinutes: 30,
-        hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null }
+        discovery: { enabled: false }
     }, { ...defaults, ...overrides });
 }
 async function initFromExample(name) {
@@ -380,6 +377,17 @@ async function initFromExample(name) {
         throw new Error(`Example is invalid: ${validation.errors.join("; ")}`);
     await saveConfig(example);
     return example;
+}
+async function templateBaseUrl() {
+    const { loadInitTemplates } = await import("./config-templates.js");
+    const templates = (await loadInitTemplates());
+    if (typeof templates.defaultBaseUrl !== "string" || !templates.defaultBaseUrl) {
+        throw new Error("init templates missing defaultBaseUrl");
+    }
+    return templates.defaultBaseUrl;
+}
+async function flagBaseUrl(flags) {
+    return str(flags, "base-url") || (await templateBaseUrl());
 }
 async function stampV4(config) {
     if (Number(config.version) === 4)
@@ -424,7 +432,7 @@ async function ask(question, fallback) {
 }
 async function initWizard(flags) {
     const yes = Boolean(flags.yes);
-    const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+    const baseUrl = await flagBaseUrl(flags);
     let existing;
     try {
         existing = await loadConfig();
@@ -580,7 +588,7 @@ async function initWizard(flags) {
 async function initDiscover(flags) {
     const yes = Boolean(flags.yes);
     const dryRun = Boolean(flags["dry-run"]);
-    const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+    const baseUrl = await flagBaseUrl(flags);
     const gh = str(flags, "gh") || "gh";
     let existing;
     try {
@@ -1476,7 +1484,7 @@ async function memory(flags) {
 }
 async function keysCommand(flags, positionals) {
     const sub = positionals[0] || "check";
-    const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+    const baseUrl = await flagBaseUrl(flags);
     if (sub === "import") {
         const file = positionals[1] || str(flags, "file") || str(flags, "keys-file");
         if (!file)

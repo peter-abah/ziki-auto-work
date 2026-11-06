@@ -1,5 +1,4 @@
 import type { Logger } from "./log.js";
-export declare const BOOTSTRAP_BASE_URL = "https://ziki.dev";
 /** Minimal durable record so a later start can pick up where bootstrap left off. */
 export interface BootstrapState {
     version: 1;
@@ -14,7 +13,9 @@ export interface BootstrapState {
 export declare function bootstrapDir(profileName?: string | null): string;
 export declare function bootstrapFile(profileName?: string | null): string;
 export declare function bootstrapNeedsFile(profileName?: string | null): string;
-export declare function buildEscalationBody(reason: string, profileName: string | null): string;
+export declare function buildEscalationBody(reason: string, profileName: string | null, options?: {
+    reasonSlice?: number;
+}): string;
 export declare function buildNeedsHumanBody(options: {
     reason: string;
     profileName: string | null;

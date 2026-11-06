@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ZikiClient } from "./ziki.js";
+import { loadInitTemplates } from "./config-templates.js";
+const templates = await loadInitTemplates();
+const testTransport = templates.transport;
+const testOperations = templates.operations;
+const testEndpoints = templates.endpoints;
 function fakeClient() {
     const calls = [];
     globalThis.fetch = (async (input, init) => {
@@ -18,6 +23,9 @@ function fakeClient() {
             apiKey: "key",
             projectId: "project_1",
             projectSlug: "demo",
+            endpoints: testEndpoints,
+            transport: testTransport,
+            operations: testOperations,
             agentName: "agent"
         }),
         calls
@@ -128,6 +136,9 @@ test("unknown validation fields are dropped, recorded and retried", async () => 
         apiKey: "key",
         projectId: "project_1",
         projectSlug: "demo",
+        endpoints: testEndpoints,
+        transport: testTransport,
+        operations: testOperations,
         agentName: "agent",
         contracts
     });
@@ -159,6 +170,9 @@ test("an agent repair callback can correct an otherwise rejected payload", async
         apiKey: "key",
         projectId: "project_1",
         projectSlug: "demo",
+        endpoints: testEndpoints,
+        transport: testTransport,
+        operations: testOperations,
         agentName: "agent",
         repair: async () => ({ body: { title: "x", summary: "A sufficiently detailed summary for the API." } })
     });
@@ -177,6 +191,9 @@ test("a login page instead of a work feed fails loudly, not silently", async () 
         apiKey: "key",
         projectId: "project_1",
         projectSlug: "demo",
+        endpoints: testEndpoints,
+        transport: testTransport,
+        operations: testOperations,
         agentName: "agent"
     });
     await assert.rejects(client.work(), /unexpected response shape/);
@@ -194,6 +211,9 @@ test("a valid work feed passes shape validation", async () => {
         apiKey: "key",
         projectId: "project_1",
         projectSlug: "demo",
+        endpoints: testEndpoints,
+        transport: testTransport,
+        operations: testOperations,
         agentName: "agent"
     });
     const result = await client.work();
