@@ -98,7 +98,8 @@ Usage:
   auto-work reject <escalation-id> [--note <text>] [--profile <name>]
   auto-work escalations [--profile <name>]
   auto-work memory [--profile <name>]
-  auto-work config [--show] [--validate]
+  auto-work migrate [--dry-run]
+  auto-work config [--show] [--validate] [--explain]
   auto-work prompts [--profile <name>]
   auto-work doctor [--profile <name>] [--json]
 
@@ -446,6 +447,16 @@ async function initFromExample(name: string): Promise<Config> {
   return example;
 }
 
+async function stampV4(config: Config): Promise<Config> {
+  if (Number(config.version) === 4) return config;
+  const { loadInitTemplates, migrateV3toV4 } = await import("./config-templates.js");
+  const templates = await loadInitTemplates();
+  const { config: next, filled } = migrateV3toV4(config, templates);
+  const total = Object.values(filled).reduce((n, list) => n + list.length, 0);
+  if (total) console.log(`Filled ${total} sections from init templates (v4).`);
+  return next;
+}
+
 async function initFromFile(file: string): Promise<Config> {
   const raw = JSON.parse(await readFile(file, "utf8")) as Config | ProfileConfig;
   let config: Config;
@@ -458,6 +469,7 @@ async function initFromFile(file: string): Promise<Config> {
       profiles: { default: raw as ProfileConfig }
     };
   }
+  config = await stampV4(config);
   const validation = validateConfig(config);
   if (!validation.ok) throw new Error(`Config is invalid: ${validation.errors.join("; ")}`);
   await saveConfig(config);
@@ -627,12 +639,13 @@ async function initWizard(flags: Flags): Promise<Config | null> {
     discovery: discoveryConfig(flags, existing, profileName, parity)
   });
 
-  const config: Config = {
+  let config: Config = {
     version: 3,
     activeProfile: profileName,
     defaults: existing.defaults,
     profiles: { ...existing.profiles, [profileName]: profile }
   };
+  config = await stampV4(config);
   const validation = validateConfig(config);
   if (!validation.ok) throw new Error(`Config is invalid:\n${validation.errors.join("\n")}`);
   await saveConfig(config);
@@ -830,13 +843,14 @@ async function initDiscover(flags: Flags): Promise<void> {
     discovery: discoveryConfig(flags, existing, profileName, parity)
   });
 
-  const config: Config = {
+  let config: Config = {
     version: 3,
     activeProfile: profileName,
     defaults: existing.defaults,
     profiles: { ...existing.profiles, [profileName]: profile },
     ...(existing.doctor ? { doctor: existing.doctor } : {})
   };
+  config = await stampV4(config);
   const validation = validateConfig(config);
   if (!validation.ok) throw new Error(`Config is invalid:\n${validation.errors.join("\n")}`);
 
@@ -1607,8 +1621,46 @@ async function keysCommand(flags: Flags, positionals: string[]): Promise<void> {
   if (inspections.some((item) => !item.ok)) process.exitCode = 1;
 }
 
+async function migrateCommand(flags: Flags): Promise<void> {
+  const { loadInitTemplates, migrateV3toV4 } = await import("./config-templates.js");
+  const p = paths();
+  const config = await loadConfig();
+  if (Number(config.version) === 4 && !flags.force) {
+    console.log("Config is already v4. Use --force to re-fill missing sections from init templates.");
+    return;
+  }
+  const templates = await loadInitTemplates();
+  const { config: next, filled } = migrateV3toV4(config, templates);
+  const total = Object.values(filled).reduce((n, list) => n + list.length, 0);
+  if (flags["dry-run"]) {
+    console.log(`Would migrate v${config.version} → v4 (${total} sections filled):`);
+    for (const [scope, list] of Object.entries(filled)) console.log(`  ${scope}: ${list.join(", ")}`);
+    return;
+  }
+  const backup = `${p.configFile}.v3.bak`;
+  await mkdir(p.configDir, { recursive: true });
+  const raw = await readFile(p.configFile, "utf8").catch(() => null);
+  if (raw !== null) await writeFile(backup, raw, "utf8");
+  await saveConfig(next);
+  console.log(`Migrated v${config.version} → v4 (${total} sections filled). Backup: ${backup}`);
+  for (const [scope, list] of Object.entries(filled)) console.log(`  ${scope}: ${list.join(", ")}`);
+}
+
 async function configCommand(flags: Flags): Promise<void> {
   const config = await loadConfig();
+  if (flags.explain) {
+    const { loadInitTemplates, explainProfile, templateVersion } = await import("./config-templates.js");
+    const templates = await loadInitTemplates();
+    console.log(`init-templates version: v${templateVersion(templates)} (config/init-templates.json)`);
+    console.log(`config version: v${config.version}`);
+    for (const [name, rawProfile] of Object.entries(config.profiles ?? {})) {
+      console.log(`profile ${name}:`);
+      for (const entry of explainProfile(name, (rawProfile ?? {}) as unknown as Record<string, unknown>, templates)) {
+        console.log(`  [${entry.source}] ${entry.path}${entry.detail ? ` — ${entry.detail}` : ""}`);
+      }
+    }
+    return;
+  }
   if (flags.validate) {
     const result = validateConfig(config);
     for (const warning of result.warnings) console.log(`warn: ${warning}`);
@@ -1748,6 +1800,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break;
     case "config":
       await configCommand(flags);
+      break;
+    case "migrate":
+      await migrateCommand(flags);
       break;
     case "prompts":
       await prompts(flags);

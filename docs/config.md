@@ -1,6 +1,27 @@
 # Configuration reference
 
-The config is a **workspace** with one or more **profiles** (config version 3).
+The config is a **workspace** with one or more **profiles** (config version 4;
+v3 configs migrate with `auto-work migrate`).
+
+## v4 — zero runtime defaults
+
+Every behavioral value lives in the profile. The runtime never substitutes a
+built-in: a missing key fails loud (`config:missing_key` blocker → repair
+proposal → `NEEDS-HUMAN.md`).
+
+- `config/init-templates.json` is the only place defaults exist (versioned
+  snapshot of last-known-good values, not truth). `init`/`init --discover`
+  writes them explicitly into `config.json`; `migrate` fills v3 configs the
+  same way (backup `.v3.bak`).
+- `auto-work migrate [--dry-run]` — v3 → v4, reports filled sections.
+- `auto-work config --explain` — per-section provenance: `explicit` (you
+  wrote it), `template` (would fill from init templates), `missing`.
+- v4 requires `transport` + `operations`; all other new sections
+  (`queue`, `reviewGate`, `heartbeatPolicy`, `decisions`, `noop`, `votes`,
+  `idea`, `apiRepair`, `capacity`, `urls`, `discover`, `github`, `safety`,
+  `checksDefaults`, `outbox`, `bootstrap`, `loop`) warn when absent until
+  their P2 phase flips them to required. See
+  [`CONFIG-REGISTRY.md`](./CONFIG-REGISTRY.md) for the literal → section map.
 
 ```json
 {

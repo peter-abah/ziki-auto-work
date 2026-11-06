@@ -379,9 +379,9 @@ export async function loadConfig() {
     }
     const raw = JSON.parse(await readFile(p.configFile, "utf8"));
     const version = Number(raw.version);
-    if (version !== 3) {
-        throw new Error(`Config ${p.configFile} is version ${Number.isFinite(version) ? version : "unknown"}; this release uses version 3 (profiles/activeProfile). ` +
-            "Run `auto-work init` to write a new config.");
+    if (version !== 3 && version !== 4) {
+        throw new Error(`Config ${p.configFile} is version ${Number.isFinite(version) ? version : "unknown"}; this release uses version 3 or 4. ` +
+            "Run `auto-work migrate` to move a v3 config to v4, or `auto-work init` to write a new config.");
     }
     return raw;
 }
@@ -425,8 +425,8 @@ export function inferPushMode(forkOwner, upstreamOwner, user) {
 export function validateConfig(config) {
     const errors = [];
     const warnings = [];
-    if (Number(config.version) !== 3)
-        errors.push("version must be 3");
+    if (Number(config.version) !== 3 && Number(config.version) !== 4)
+        errors.push("version must be 3 or 4");
     if (!config.profiles || typeof config.profiles !== "object" || !Object.keys(config.profiles).length) {
         errors.push("at least one profile is required");
     }
@@ -624,6 +624,7 @@ export function validateConfig(config) {
         errors.push(...validateTiming(profile?.timing, `${prefix}.timing`));
         errors.push(...validateHealthRetry(profile?.health?.retryMs, `${prefix}.health.retryMs`));
         validateRepairConfig(prefix, profile?.repair, errors);
+        errors.push(...validateV4Sections(profile, `${prefix}`));
     }
     return { ok: errors.length === 0, errors, warnings };
 }
@@ -761,6 +762,86 @@ function validateRepairConfig(prefix, repair, errors) {
             errors.push(`${sprefix}.match must be an object of strategy hints`);
         }
     }
+}
+const V4_OBJECT_SECTIONS = [
+    "transport",
+    "queue",
+    "reviewGate",
+    "heartbeatPolicy",
+    "decisions",
+    "noop",
+    "votes",
+    "idea",
+    "apiRepair",
+    "capacity",
+    "urls",
+    "discover",
+    "github",
+    "safety",
+    "checksDefaults",
+    "outbox",
+    "bootstrap",
+    "loop"
+];
+const V4_REQUIRED_IN_V4 = ["transport", "operations"];
+/**
+ * v4 section validation (light in P1 — presence + shape; per-section
+ * strictness lands with the P2 phase that consumes each section).
+ * v3 configs skip this entirely. v4 configs must carry transport +
+ * operations; all other new sections warn when absent until their P2
+ * phase flips them to required.
+ */
+export function validateV4Sections(profile, prefix) {
+    if (!profile)
+        return [];
+    const errors = [];
+    const record = profile;
+    // Detect v4 intent: transport or operations present means v4 rules apply.
+    const isV4 = record.transport !== undefined || record.operations !== undefined;
+    for (const section of V4_OBJECT_SECTIONS) {
+        const value = record[section];
+        if (value === undefined) {
+            if (isV4 && V4_REQUIRED_IN_V4.includes(section)) {
+                errors.push(`${prefix}.${section} is required in v4 (run \`auto-work migrate\`)`);
+            }
+            continue;
+        }
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            errors.push(`${prefix}.${section} must be an object`);
+        }
+    }
+    const operations = record.operations;
+    if (operations === undefined) {
+        if (isV4)
+            errors.push(`${prefix}.operations is required in v4 (run \`auto-work migrate\`)`);
+    }
+    else if (typeof operations !== "object" || operations === null || Array.isArray(operations)) {
+        errors.push(`${prefix}.operations must be an object of group -> name -> operation`);
+    }
+    else {
+        for (const [group, names] of Object.entries(operations)) {
+            if (typeof names !== "object" || names === null || Array.isArray(names)) {
+                errors.push(`${prefix}.operations.${group} must be an object of name -> operation`);
+                continue;
+            }
+            for (const [name, op] of Object.entries(names)) {
+                const where = `${prefix}.operations.${group}.${name}`;
+                if (typeof op !== "object" || op === null || Array.isArray(op)) {
+                    errors.push(`${where} must be an object`);
+                    continue;
+                }
+                const method = op.method;
+                if (method !== undefined && (typeof method !== "string" || !method.trim())) {
+                    errors.push(`${where}.method must be a non-empty string`);
+                }
+                const expect = op.expect;
+                if (expect !== undefined && !["feed", "list", "object"].includes(expect)) {
+                    errors.push(`${where}.expect must be "feed", "list" or "object"`);
+                }
+            }
+        }
+    }
+    return errors;
 }
 export function resolveRunLimits(profile, override) {
     const base = {
