@@ -71,4 +71,9 @@ Rules:
 - If you cannot verify a candidate value against the evidence above, say so
   in `notes` and either propose nothing (`"configPatch": []`) or mark the
   op uncertain — never invent IDs, URLs, or slugs.
-- Do not edit any files. Do not call any APIs. Return only the JSON object.
+- Do not edit any files. You may fetch unauthenticated public URLs (GET only —
+  e.g. the project's public pages or API docs) to investigate a moved route or
+  renamed value. Never send writes, never use credentials, never put secrets in
+  the patch. The orchestrator re-verifies every proposed endpoint live before
+  anything is escalated, so prefer values you can point at over guesses.
+- Return only the JSON object.

@@ -63,6 +63,14 @@ New strategies: `config:missing_key`, `config:unknown_endpoint`,
 `*:unknown_kind`, `*:unknown_vocabulary`. New kind names are creatable under
 `queue.priorities.*` (numbers only); new endpoint names are never invented.
 
+No deterministic bypasses: every non-hard failure (anything except
+provider/model errors and missing keys) reaches the config-doctor agent —
+there is no code path that concludes "unfixable" on its own. The doctor may
+fetch unauthenticated public URLs (GET only) to investigate moved routes;
+the orchestrator live-verifies proposed endpoint ops (only a proven 404 +
+"no such API route" drops an op) before escalation. The human APPROVE gate
+is the only stop.
+
 ## Drift review (P4)
 
 - `auto-work doctor --drift` — morning/evening check: tenant project list

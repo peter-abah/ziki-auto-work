@@ -57,7 +57,8 @@ import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
 import type { TaskKind } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
-import { apiPlatformFilter } from "./ziki.js";
+import { apiPlatformFilter, ZikiError } from "./ziki.js";
+import { endpointVars, renderEndpoint } from "./ziki-endpoints.js";
 import type { ApiRepairContext, ApiRepairHandler, ApiRepairResult, ZikiClient } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import type { PrComment } from "./github.js";
@@ -120,7 +121,6 @@ import {
   diagnoseUnknownVocabulary,
   parseUnknownEndpoint,
   formatRepairEscalationBody,
-  isProjectNotFoundBlocker,
   latestStrategyEscalation,
   maxRoundsFor,
   repairConfigFor,
@@ -1297,14 +1297,9 @@ async function repairBlockedLoop(
 ): Promise<"wait" | "continue"> {
   const strategy = strategyFor(ctx.profile, code);
   if (!strategy) return "wait";
-  if (code === "platform:not_found" && !isProjectNotFoundBlocker(code, blocker.message)) {
-    // A 404 with any other body (renamed route, moved endpoint) is not a
-    // retired project — stay parked and let a human look.
-    ctx.logger.warn(`Blocked on ${code} with an unrecognized message; skipping config repair`, {
-      message: blocker.message
-    });
-    return "wait";
-  }
+  // No deterministic gatekeeping here: even an unrecognized 404 body goes to
+  // the state machine, where deterministic evidence plus the config-doctor
+  // agent investigate. Only the APPROVE gate (human) or maxRounds stops it.
   setPhase(ctx, "repair", code);
   return runRepairStateMachine(ctx, code, blocker, strategy);
 }
@@ -1522,7 +1517,7 @@ async function applyApprovedRepair(
  * Returns ops to propose plus a done flag when the diagnosis itself resolves
  * the cycle (repair applied inline) or finds nothing actionable.
  */
-async function diagnoseForCode(
+export async function diagnoseForCode(
   ctx: Context,
   code: string,
   blocker: HealthBlocker
@@ -1550,20 +1545,19 @@ async function diagnoseForCode(
       evidence.push(
         `tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`
       );
-      if (!diagnosis.ops.length) {
-        ctx.logger.warn(
-          `Feed shape check failed but project identity matches; leaving the warning up for investigation: ${code}`
-        );
-        history(ctx, {
-          type: "health",
-          detail: `feed shape failure with matching identity (no automatic fix): ${code}`,
-          data: {}
-        });
-        await save(ctx).catch(() => {});
-        return { evidence, ops, summary, done: "wait" };
+      const details = (blocker as { details?: Record<string, unknown> }).details ?? {};
+      if (typeof details.preview === "string" && details.preview) {
+        evidence.push(`response preview (first chars of what Ziki actually returned): ${details.preview.slice(0, 500)}`);
+      }
+      if (typeof details.expected === "string" && details.expected) {
+        evidence.push(`expected shape: ${details.expected}`);
       }
       ops = diagnosis.ops;
-      summary = `Work feed is unreachable in its expected shape; ${diagnosis.detail}`;
+      summary = diagnosis.ops.length
+        ? `Work feed is unreachable in its expected shape; ${diagnosis.detail}`
+        : "Project identity matches the tenant, so this is not a retired project — " +
+          "the feed route itself may have moved or the response format changed. " +
+          "Agent investigation required (see evidence).";
     } catch (error) {
       summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
     }
@@ -1655,6 +1649,63 @@ async function diagnoseForCode(
   return { evidence, ops, summary, done: null };
 }
 
+/**
+ * Live verification for proposed endpoint ops: render the candidate template
+ * with identity vars and GET it through the primary client. Only a proven
+ * miss (404 + "no such API route") drops the op; anything else is kept —
+ * absence of proof is not proof of absence, and the human decides via APPROVE.
+ * Parameterized templates ({issue}, …) cannot render without an id and are
+ * kept as unverifiable. Read-only; never writes.
+ */
+export async function verifyEndpointOps(
+  ctx: Context,
+  ops: ConfigPatchOp[]
+): Promise<{ ops: ConfigPatchOp[]; notes: string[] }> {
+  const kept: ConfigPatchOp[] = [];
+  const notes: string[] = [];
+  for (const op of ops) {
+    const match = op.path.match(/^ziki\.endpoints\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)$/);
+    if (!match || typeof op.value !== "string") {
+      kept.push(op);
+      continue;
+    }
+    const [, group, name] = match as [string, string, string];
+    let rendered: string;
+    try {
+      rendered = renderEndpoint(op.value, {
+        ...endpointVars({
+          vars: ctx.profile.ziki.vars,
+          projectId: ctx.profile.ziki.projectId,
+          projectSlug: ctx.profile.ziki.projectSlug,
+          orgSlug: ctx.profile.ziki.orgSlug ?? undefined,
+          platform: undefined
+        })
+      });
+    } catch {
+      notes.push(`${group}.${name}: template needs call-site params, kept as unverifiable`);
+      kept.push(op);
+      continue;
+    }
+    try {
+      await ctx.primary.client.request("GET", rendered);
+      notes.push(`${group}.${name}: live GET ${rendered} responded — route exists`);
+      kept.push(op);
+    } catch (error) {
+      const body = error instanceof ZikiError ? error.body : null;
+      const message = String(
+        (body as Record<string, unknown> | null)?.message ?? (error instanceof Error ? error.message : String(error))
+      );
+      if (error instanceof ZikiError && error.status === 404 && /no such api route/i.test(message)) {
+        notes.push(`${group}.${name}: live GET ${rendered} → 404 no such API route — op dropped`);
+        continue;
+      }
+      notes.push(`${group}.${name}: live GET ${rendered} failed inconclusively (${message.slice(0, 120)}) — kept for human review`);
+      kept.push(op);
+    }
+  }
+  return { ops: kept, notes };
+}
+
 /** One proposal round: deterministic diagnosis as evidence + agent proposal + escalation. */
 async function startRepairRound(
   ctx: Context,
@@ -1711,12 +1762,22 @@ async function startRepairRound(
     return "wait";
   }
 
+  // Live verification: a proposed endpoint that provably does not exist
+  // (404 + "no such API route") is dropped with a note instead of escalated.
+  // Anything else (2xx, 422, 405, other 404s, unrenderable templates) is kept:
+  // absence of proof is not proof of absence — the human decides via APPROVE.
+  const verified = await verifyEndpointOps(ctx, ops).catch((error) => ({
+    ops,
+    notes: [`endpoint verification skipped: ${error instanceof Error ? error.message : String(error)}`]
+  }));
+  ops = verified.ops;
+
   const body = formatRepairEscalationBody({
     strategy: code,
     failureMessage: blocker.message,
     summary,
     ops,
-    evidence: [...evidence, ...(agentNotes ? [`agent notes: ${agentNotes}`] : [])],
+    evidence: [...evidence, ...(agentNotes ? [`agent notes: ${agentNotes}`] : []), ...verified.notes.map((note) => `verification: ${note}`)],
     round,
     previousAnswer: previous?.answer ?? null
   });
