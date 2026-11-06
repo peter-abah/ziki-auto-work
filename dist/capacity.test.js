@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { resolveCapacity, underCap } from "./capacity.js";
 import { DEFAULT_LIMITS } from "./config.js";
 function profile(limits = {}) {
-    return { limits: { ...DEFAULT_LIMITS, ...limits } };
+    return {
+        limits: { ...DEFAULT_LIMITS, ...limits },
+        capacity: { floor: 1, discoverySlots: 1, ownerSlots: 1 }
+    };
 }
 test("auto capacity follows the number of agents", () => {
     const capacity = resolveCapacity(profile(), { workers: [1], managers: [2, 3] });
@@ -15,6 +18,8 @@ test("auto capacity follows the number of agents", () => {
     assert.equal(capacity.aux, 3);
     assert.equal(capacity.followup, 1);
     assert.equal(capacity.activeClaims, 1);
+    assert.equal(capacity.discovery, 1);
+    assert.equal(capacity.owner, 1);
 });
 test("a four-worker profile gets four deliveries and reviews by default", () => {
     const capacity = resolveCapacity(profile(), { workers: [1, 2, 3, 4], managers: [] });
@@ -42,5 +47,16 @@ test("null work caps are unbounded but numeric caps bind", () => {
     assert.equal(underCap(100, "auto"), true);
     assert.equal(underCap(3, 3), false);
     assert.equal(underCap(2, 3), true);
+});
+test("capacity slots and floor come from policy", () => {
+    const custom = {
+        limits: { ...DEFAULT_LIMITS, maxConcurrentDiscovery: "auto" },
+        capacity: { floor: 2, discoverySlots: 3, ownerSlots: 4 }
+    };
+    const capacity = resolveCapacity(custom, { workers: [1], managers: [] });
+    assert.equal(capacity.discovery, 3);
+    assert.equal(capacity.owner, 4);
+    assert.equal(capacity.delivery, 1);
+    assert.throws(() => resolveCapacity({ limits: { ...DEFAULT_LIMITS } }, { workers: [1], managers: [] }), /capacity\.floor/);
 });
 //# sourceMappingURL=capacity.test.js.map

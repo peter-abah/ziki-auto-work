@@ -20,6 +20,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: npm run lint:prompts
       - run: npm test
       - run: npm run build
       - run: git diff --exit-code -- dist

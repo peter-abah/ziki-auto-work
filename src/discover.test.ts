@@ -10,8 +10,15 @@ import {
   parseRepoRef,
   pickCloneUrl,
   rankCandidates,
-  repoName
+  repoName,
+  resolveDiscoverPolicy,
+  stackPlatform
 } from "./discover.js";
+import { loadInitTemplates } from "./config-templates.js";
+
+const templates = await loadInitTemplates();
+const policy = templates.discover as Parameters<typeof resolveDiscoverPolicy>[0];
+const resolved = resolveDiscoverPolicy(policy);
 
 test("parseRepoRef accepts owner/name, HTTPS and SSH", () => {
   assert.deepEqual(parseRepoRef("owner/name"), { owner: "owner", name: "name" });
@@ -20,11 +27,23 @@ test("parseRepoRef accepts owner/name, HTTPS and SSH", () => {
   assert.equal(parseRepoRef("not a repo"), null);
 });
 
-test("inferPlatform reads common repo suffixes", () => {
-  assert.equal(inferPlatform("zedu-desktop"), "desktop");
-  assert.equal(inferPlatform("zedu-mobile"), "mobile");
-  assert.equal(inferPlatform("zedu-fe"), "web");
-  assert.equal(inferPlatform("random"), null);
+test("template discover policy resolves", () => {
+  assert.ok(resolved.scores.exact! > 0);
+  assert.ok(resolved.timeouts.searchMs > 0);
+  assert.ok(Object.keys(resolved.platformSuffixes).length >= 3);
+});
+
+test("inferPlatform reads common repo suffixes from policy", () => {
+  assert.equal(inferPlatform("zedu-desktop", policy), "desktop");
+  assert.equal(inferPlatform("zedu-mobile", policy), "mobile");
+  assert.equal(inferPlatform("zedu-fe", policy), "web");
+  assert.equal(inferPlatform("random", policy), null);
+});
+
+test("inferPlatform patterns are policy, not code", () => {
+  const custom = { ...policy, platformPatterns: { ios: ["-ios$"] } };
+  assert.equal(inferPlatform("app-ios", custom), "ios");
+  assert.equal(inferPlatform("app-ios", policy), "mobile");
 });
 
 test("rankCandidates prefers the exact slug-platform repo", () => {
@@ -38,7 +57,8 @@ test("rankCandidates prefers the exact slug-platform repo", () => {
       { ...base, fullName: "someone/zedu" }
     ],
     "zedu",
-    "desktop"
+    "desktop",
+    policy
   );
   assert.equal(ranked[0]!.fullName, "zeduchat/zedu-desktop");
   assert.equal(repoName(ranked[0]!.fullName), "zedu-desktop");
@@ -51,7 +71,8 @@ test("rankCandidates drops archived repos", () => {
       { fullName: "owner/zedu", url: "", isFork: false, isArchived: false, stars: 1 }
     ],
     "zedu",
-    "desktop"
+    "desktop",
+    policy
   );
   assert.deepEqual(ranked.map((candidate) => candidate.fullName), ["owner/zedu"]);
 });
@@ -62,14 +83,21 @@ test("pickCloneUrl prefers SSH only when requested", () => {
   assert.equal(pickCloneUrl(info, "https"), "https://github.com/o/n.git");
 });
 
-test("detectedStackAt detects common project files", async () => {
+test("detectedStackAt detects common project files from policy", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "auto-work-stack-"));
   try {
     await writeFile(path.join(dir, "pubspec.yaml"), "");
-    assert.equal(detectedStackAt(dir), "flutter");
+    assert.equal(detectedStackAt(dir, resolved.stackMap), "flutter");
+    assert.equal(stackPlatform("flutter", policy), "desktop");
+    assert.equal(stackPlatform("node", policy), "web");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("discover policy is required", () => {
+  assert.throws(() => rankCandidates([], "x", null, null), /discover policy is required/);
+  assert.throws(() => detectedStackAt("/tmp", {}), /discover\.stackMap is required/);
 });
 
 test("gitProtocol reads the github.com host setting before the global value", async () => {
@@ -79,7 +107,7 @@ test("gitProtocol reads the github.com host setting before the global value", as
     if (args.includes("-h")) return { ok: true, code: 0, stdout: "ssh\n", stderr: "", command: "" };
     return { ok: true, code: 0, stdout: "https\n", stderr: "", command: "" };
   };
-  assert.equal(await gitProtocol("gh", runner as any), "ssh");
+  assert.equal(await gitProtocol("gh", runner as any, 1000), "ssh");
   assert.ok(calls[0]!.includes("github.com"));
 });
 
@@ -88,5 +116,5 @@ test("gitProtocol falls back to the global value", async () => {
     if (args.includes("-h")) return { ok: false, code: 1, stdout: "", stderr: "no host", command: "" };
     return { ok: true, code: 0, stdout: "ssh\n", stderr: "", command: "" };
   };
-  assert.equal(await gitProtocol("gh", runner as any), "ssh");
+  assert.equal(await gitProtocol("gh", runner as any, 1000), "ssh");
 });

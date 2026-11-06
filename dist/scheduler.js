@@ -74,13 +74,19 @@ export class TaskPool {
             await sleep(waitMs, signal);
         }
     }
-    async drain(timeoutMs = 60_000) {
+    async drain(timeoutMs, sliceMs) {
+        if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+            throw new Error("drain requires an explicit timeoutMs from loop policy (no default)");
+        }
+        if (typeof sliceMs !== "number" || !Number.isFinite(sliceMs) || sliceMs <= 0) {
+            throw new Error("drain requires an explicit sliceMs from loop policy (no default)");
+        }
         const deadline = Date.now() + timeoutMs;
         while (this.tasks.size && Date.now() < deadline) {
             const remaining = Math.max(1, deadline - Date.now());
             await Promise.race([
                 this.waitForAny(),
-                new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 1000)))
+                new Promise((resolve) => setTimeout(resolve, Math.min(remaining, sliceMs)))
             ]);
         }
     }

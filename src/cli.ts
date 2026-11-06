@@ -4,8 +4,6 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { CheckSpec, Config, ProfileConfig, ProviderName, RunLimitConfig } from "./types.js";
 import {
-  DEFAULT_LIMITS,
-  DEFAULT_WORKFLOW,
   PROVIDERS,
   deepMerge,
   defaultConfig,
@@ -98,9 +96,10 @@ Usage:
   auto-work reject <escalation-id> [--note <text>] [--profile <name>]
   auto-work escalations [--profile <name>]
   auto-work memory [--profile <name>]
-  auto-work config [--show] [--validate]
+  auto-work migrate [--dry-run]
+  auto-work config [--show] [--validate] [--explain]
   auto-work prompts [--profile <name>]
-  auto-work doctor [--profile <name>] [--json]
+  auto-work doctor [--profile <name>] [--json] [--drift]
 
 Environment overrides:
   AUTO_WORK_HOME, AUTO_WORK_CONFIG_DIR, AUTO_WORK_STATE_DIR, AUTO_WORK_CACHE_DIR
@@ -299,58 +298,55 @@ async function install(flags: Flags): Promise<void> {
   console.log("  auto-work start");
 }
 
-function checkPreset(name: string): CheckSpec[] {
-  if (name === "flutter") {
-    return [
-      { name: "deps", command: "flutter", args: ["pub", "get"], timeoutMs: 600_000 },
-      {
-        name: "format",
-        command: "dart",
-        args: ["format", "--output=none", "--set-exit-if-changed"],
-        filesOnly: true,
-        include: [".dart"]
-      },
-      { name: "analyze", command: "flutter", args: ["analyze", "--fatal-infos", "--fatal-warnings"] },
-      {
-        name: "test",
-        command: "flutter",
-        args: ["test", "--reporter", "json"],
-        reporter: "json",
-        timeoutMs: 1_800_000
-      }
-    ];
+/**
+ * Stack check presets come from init templates (init-time data, never code).
+ * Unknown stacks yield no checks rather than a guessed command.
+ */
+async function checkPreset(name: string): Promise<CheckSpec[]> {
+  const presets = await loadCheckPresets();
+  const preset = presets[name];
+  if (preset === undefined) return [];
+  if (!Array.isArray(preset)) {
+    throw new Error(`check preset "${name}" must be an array (run \`auto-work migrate\`)`);
   }
-  if (name === "node") {
-    return [
-      { name: "deps", command: "npm", args: ["ci"], timeoutMs: 600_000 },
-      { name: "lint", command: "npm", args: ["run", "lint"], required: false },
-      { name: "test", command: "npm", args: ["test"], timeoutMs: 1_800_000 }
-    ];
-  }
-  if (name === "python") {
-    return [
-      { name: "deps", command: "python", args: ["-m", "pip", "install", "-e", "."], timeoutMs: 600_000 },
-      { name: "lint", command: "ruff", args: ["check", "."], required: false },
-      { name: "test", command: "pytest", args: ["-q"], timeoutMs: 1_800_000 }
-    ];
-  }
-  if (name === "go") {
-    return [
-      { name: "build", command: "go", args: ["build", "./..."], timeoutMs: 900_000 },
-      { name: "test", command: "go", args: ["test", "./..."], timeoutMs: 1_800_000 }
-    ];
-  }
-  if (name === "rust") {
-    return [
-      { name: "build", command: "cargo", args: ["build"], timeoutMs: 1_800_000 },
-      { name: "test", command: "cargo", args: ["test"], timeoutMs: 1_800_000 }
-    ];
-  }
-  return [];
+  return JSON.parse(JSON.stringify(preset)) as CheckSpec[];
 }
 
-function detectedStack(): string {
-  return detectedStackAt(process.cwd());
+async function loadCheckPresets(): Promise<Record<string, CheckSpec[]>> {
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = (await loadInitTemplates()) as unknown as Record<string, unknown>;
+  const presets = templates.checkPresets;
+  if (!presets || typeof presets !== "object" || Array.isArray(presets)) {
+    throw new Error("init templates missing checkPresets");
+  }
+  return presets as Record<string, CheckSpec[]>;
+}
+
+async function loadExecutorDefaults(): Promise<{ timeoutMs: number; permissionMode: "auto" | "safe" }> {
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = (await loadInitTemplates()) as unknown as Record<string, unknown>;
+  const executor = templates.executor as Record<string, unknown> | undefined;
+  if (typeof executor?.timeoutMs !== "number" || (executor?.permissionMode !== "auto" && executor?.permissionMode !== "safe")) {
+    throw new Error("init templates missing executor.timeoutMs/permissionMode");
+  }
+  return { timeoutMs: executor.timeoutMs, permissionMode: executor.permissionMode };
+}
+
+async function loadDiscoverPolicy(): Promise<import("./types.js").DiscoverPolicyConfig> {
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = (await loadInitTemplates()) as unknown as Record<string, unknown>;
+  const policy = templates.discover;
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("init templates missing discover policy");
+  }
+  return policy as import("./types.js").DiscoverPolicyConfig;
+}
+
+async function detectedStack(): Promise<string> {
+  const policy = await loadDiscoverPolicy();
+  const { resolveDiscoverPolicy } = await import("./discover.js");
+  const resolved = resolveDiscoverPolicy(policy);
+  return detectedStackAt(process.cwd(), resolved.stackMap);
 }
 
 async function detectedProviders(): Promise<ProviderName[]> {
@@ -385,26 +381,29 @@ async function copyPromptSet(profileName: string): Promise<string> {
   return target;
 }
 
-function discoveryConfig(
+async function discoveryConfig(
   flags: Flags,
   existing: Config,
   profileName: string,
   parity: string
-): ProfileConfig["discovery"] {
+): Promise<ProfileConfig["discovery"]> {
   const previous = existing.profiles?.[profileName]?.discovery;
   const contextFiles = (str(flags, "context-file") ?? "")
     .split(",")
     .map((file) => file.trim())
     .filter(Boolean);
   const focus = str(flags, "discovery-focus");
-  const enabled = flags["no-discovery"]
-    ? false
-    : flags.discovery === true
-      ? true
-      : previous?.enabled ?? true;
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templateDiscovery = ((await loadInitTemplates()) as unknown as Record<string, unknown>).discovery as
+    | { enabled?: boolean; maxIdeasPerRun?: number }
+    | undefined;
+  if (typeof templateDiscovery?.enabled !== "boolean" || typeof templateDiscovery?.maxIdeasPerRun !== "number") {
+    throw new Error("init templates missing discovery.enabled/maxIdeasPerRun");
+  }
+  const enabled = flags["no-discovery"] ? false : flags.discovery === true ? true : (previous?.enabled ?? templateDiscovery.enabled);
   return {
     enabled,
-    maxIdeasPerRun: previous?.maxIdeasPerRun ?? 3,
+    maxIdeasPerRun: previous?.maxIdeasPerRun ?? templateDiscovery.maxIdeasPerRun,
     ...(parity ? { parityFile: parity } : previous?.parityFile ? { parityFile: previous.parityFile } : {}),
     ...(contextFiles.length ? { contextFiles } : previous?.contextFiles ? { contextFiles: previous.contextFiles } : {}),
     ...(focus ? { focus } : previous?.focus ? { focus: previous.focus } : {})
@@ -413,25 +412,22 @@ function discoveryConfig(
 
 function baseProfile(overrides: Partial<ProfileConfig>): ProfileConfig {
   const defaults = defaultConfig().defaults ?? {};
+  // Structural placeholders only — every behavioral value (limits, workflow,
+  // prTracking, discovery, poll cadence, hitl, transport, operations, …) is
+  // filled from config/init-templates.json by stampV4, never from literals.
   return deepMerge(
     {
-      ziki: { baseUrl: "https://ziki.dev", projectId: "", projectSlug: "", platform: "" },
+      ziki: { baseUrl: "", projectId: "", projectSlug: "", platform: "" },
       repo: { url: "", upstream: "", base: "main", githubRepo: "", forkOwner: "", defaultBranch: "main" },
       agents: { workers: [], managers: [] },
-      executor: { provider: "opencode", model: null, timeoutMs: 2_700_000, permissionMode: "auto" },
+      executor: { provider: "opencode", model: null },
       toolchain: {},
       checks: [],
       platformMatch: {},
       prompts: { dir: "prompts/generic" },
       pr: { templateFile: "prompts/generic/pr.md" },
-      prTracking: { enabled: true, pollMinutes: 10, maxFollowUps: 10, fixFailingChecks: true, fixReviewComments: true },
-      discovery: { enabled: false, maxIdeasPerRun: 3 },
-      limits: { ...DEFAULT_LIMITS },
-      workflow: { ...DEFAULT_WORKFLOW },
-      pollSeconds: 120,
-      memoryRefreshMinutes: 30,
-      hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null }
-    } as ProfileConfig,
+      discovery: { enabled: false }
+    } as unknown as ProfileConfig,
     { ...defaults, ...overrides }
   ) as ProfileConfig;
 }
@@ -446,6 +442,29 @@ async function initFromExample(name: string): Promise<Config> {
   return example;
 }
 
+async function templateBaseUrl(): Promise<string> {
+  const { loadInitTemplates } = await import("./config-templates.js");
+  const templates = (await loadInitTemplates()) as unknown as Record<string, unknown>;
+  if (typeof templates.defaultBaseUrl !== "string" || !templates.defaultBaseUrl) {
+    throw new Error("init templates missing defaultBaseUrl");
+  }
+  return templates.defaultBaseUrl;
+}
+
+async function flagBaseUrl(flags: Flags): Promise<string> {
+  return str(flags, "base-url") || (await templateBaseUrl());
+}
+
+async function stampV4(config: Config): Promise<Config> {
+  if (Number(config.version) === 4) return config;
+  const { loadInitTemplates, migrateV3toV4 } = await import("./config-templates.js");
+  const templates = await loadInitTemplates();
+  const { config: next, filled } = migrateV3toV4(config, templates);
+  const total = Object.values(filled).reduce((n, list) => n + list.length, 0);
+  if (total) console.log(`Filled ${total} sections from init templates (v4).`);
+  return next;
+}
+
 async function initFromFile(file: string): Promise<Config> {
   const raw = JSON.parse(await readFile(file, "utf8")) as Config | ProfileConfig;
   let config: Config;
@@ -458,6 +477,7 @@ async function initFromFile(file: string): Promise<Config> {
       profiles: { default: raw as ProfileConfig }
     };
   }
+  config = await stampV4(config);
   const validation = validateConfig(config);
   if (!validation.ok) throw new Error(`Config is invalid: ${validation.errors.join("; ")}`);
   await saveConfig(config);
@@ -476,7 +496,7 @@ async function ask(question: string, fallback: string): Promise<string> {
 
 async function initWizard(flags: Flags): Promise<Config | null> {
   const yes = Boolean(flags.yes);
-  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const baseUrl = await flagBaseUrl(flags);
 
   let existing: Config;
   try {
@@ -556,8 +576,10 @@ async function initWizard(flags: Flags): Promise<Config | null> {
     console.log("Ziki platforms:");
     for (const platform of platforms) console.log(`  ${platform.slug}  ${platform.name}`);
   }
-  const stack = detectedStack();
-  const stackPlatform = stack === "flutter" ? "desktop" : "web";
+  const stack = await detectedStack();
+  const discoverPolicy = await loadDiscoverPolicy();
+  const { stackPlatform: stackPlatformFromPolicy } = await import("./discover.js");
+  const stackPlatform = stackPlatformFromPolicy(stack, discoverPolicy);
   const platformDefault =
     platforms.find((platform) => platform.slug === stackPlatform)?.slug ?? platforms[0]?.slug ?? stackPlatform;
   let platform = str(flags, "platform") || (yes ? platformDefault : "");
@@ -619,20 +641,21 @@ async function initWizard(flags: Flags): Promise<Config | null> {
       ...(teamLead ? { teamLead } : {})
     },
     agents: { workers, managers },
-    executor: { provider, model: model || null, timeoutMs: 2_700_000, permissionMode: "auto" },
-    checks: checkPreset(checksName),
+    executor: { provider, model: model || null, ...(await loadExecutorDefaults()) },
+    checks: await checkPreset(checksName),
     platformMatch: { keywords: [platform] },
     prompts: { dir: promptsDir },
     pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
-    discovery: discoveryConfig(flags, existing, profileName, parity)
+    discovery: await discoveryConfig(flags, existing, profileName, parity)
   });
 
-  const config: Config = {
+  let config: Config = {
     version: 3,
     activeProfile: profileName,
     defaults: existing.defaults,
     profiles: { ...existing.profiles, [profileName]: profile }
   };
+  config = await stampV4(config);
   const validation = validateConfig(config);
   if (!validation.ok) throw new Error(`Config is invalid:\n${validation.errors.join("\n")}`);
   await saveConfig(config);
@@ -643,8 +666,11 @@ async function initWizard(flags: Flags): Promise<Config | null> {
 async function initDiscover(flags: Flags): Promise<void> {
   const yes = Boolean(flags.yes);
   const dryRun = Boolean(flags["dry-run"]);
-  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const baseUrl = await flagBaseUrl(flags);
   const gh = str(flags, "gh") || "gh";
+  const discoverPolicy = await loadDiscoverPolicy();
+  const { resolveDiscoverPolicy } = await import("./discover.js");
+  const discoverTimeouts = resolveDiscoverPolicy(discoverPolicy).timeouts;
 
   let existing: Config;
   try {
@@ -712,10 +738,10 @@ async function initDiscover(flags: Flags): Promise<void> {
   const forkOwnerFlag = str(flags, "fork-owner");
   if (!repoRef) {
     if (!githubRepo) {
-      const login = await githubLogin(gh);
-      let candidates = await searchRepos(projectSlug, { gh, limit: 30 });
+      const login = await githubLogin(gh, runCommand, discoverTimeouts.apiMs);
+      let candidates = await searchRepos(projectSlug, { gh, policy: discoverPolicy });
       const requestedPlatform = str(flags, "platform") || null;
-      candidates = rankCandidates(candidates, projectSlug, requestedPlatform);
+      candidates = rankCandidates(candidates, projectSlug, requestedPlatform, discoverPolicy);
       if (!candidates.length) {
         if (yes) throw new Error(`No GitHub repository found for "${projectSlug}". Pass --github-repo owner/name.`);
         githubRepo = await ask("Upstream GitHub repo (owner/name)", "");
@@ -743,13 +769,13 @@ async function initDiscover(flags: Flags): Promise<void> {
   if (!repoRef) throw new Error("A repository is required.");
 
   const upstream = `${repoRef.owner}/${repoRef.name}`;
-  const info = await repoInfo(upstream, gh);
+  const info = await repoInfo(upstream, gh, runCommand, discoverTimeouts.apiMs);
   if (!info) throw new Error(`Cannot read ${upstream}. Check gh auth and the repository name.`);
   const defaultBranch = info.defaultBranch;
-  const branches = await listBranches(upstream, gh);
+  const branches = await listBranches(upstream, gh, runCommand, discoverTimeouts.apiMs);
   const base = str(flags, "base") || (branches.includes("staging") ? "staging" : defaultBranch);
 
-  const user = await githubLogin(gh);
+  const user = await githubLogin(gh, runCommand, discoverTimeouts.apiMs);
   const repoUrlOwner = repoUrlOverride ? parseRepoRef(repoUrlOverride)?.owner : null;
   const noFork = Boolean(flags["no-fork"]);
   const personalFork = Boolean(flags["personal-fork"]);
@@ -772,18 +798,18 @@ async function initDiscover(flags: Flags): Promise<void> {
   if (pushMode === "upstream") forkOwner = repoRef.owner;
   const org = forkOwner !== user && pushMode !== "upstream" ? forkOwner : undefined;
   const createFork = Boolean(flags.fork) && !dryRun && pushMode !== "upstream";
-  let fork = await ensureFork({ upstream, user: forkOwner, org, createFork, gh });
+  let fork = await ensureFork({ upstream, user: forkOwner, org, createFork, gh, policy: discoverPolicy });
   if (fork.needsFork && !dryRun) {
     if (yes) throw new Error(`Fork ${fork.forkRepo} does not exist. Pass --fork to create it.`);
     const answer = await ask(`Create fork ${fork.forkRepo} from ${upstream}? (y/N)`, "n");
-    if (/^y/i.test(answer)) fork = await ensureFork({ upstream, user: forkOwner, org, createFork: true, gh });
+    if (/^y/i.test(answer)) fork = await ensureFork({ upstream, user: forkOwner, org, createFork: true, gh, policy: discoverPolicy });
     else throw new Error(`A fork is required. Create ${fork.forkRepo} or pass --repo-url with an existing fork.`);
   }
   if (repoUrlOverride) {
     fork = { ...fork, forkGitUrl: repoUrlOverride, exists: true, needsFork: false };
   }
 
-  let platform = str(flags, "platform") || inferPlatform(repoName(upstream)) || "";
+  let platform = str(flags, "platform") || inferPlatform(repoName(upstream), discoverPolicy) || "";
   const platformDefault = platforms.find((entry) => entry.slug === platform)?.slug ?? platforms[0]?.slug ?? platform ?? "desktop";
   if (!platform) {
     if (yes) throw new Error("Could not infer the Ziki platform. Pass --platform desktop/mobile/web.");
@@ -803,7 +829,7 @@ async function initDiscover(flags: Flags): Promise<void> {
   const teamLead = str(flags, "team-lead") || "";
   const profileName = str(flags, "profile") || `${projectSlug}-${platform}`;
   const promptsDir = path.join(paths().configDir, "prompts", safeName(profileName));
-  const checks = checkPreset(checksFlag || stack);
+  const checks = await checkPreset(checksFlag || stack);
   const parity = str(flags, "parity") || "";
   const envFile = str(flags, "env-file");
 
@@ -818,25 +844,25 @@ async function initDiscover(flags: Flags): Promise<void> {
       forkOwner: fork.forkOwner,
       pushMode,
       defaultBranch,
-      envFiles: [".env", ".env.local"],
       ...(teamLead ? { teamLead } : {})
     },
     agents: { workers: roles.workers, managers: roles.managers },
-    executor: { provider, model: model || null, timeoutMs: 2_700_000, permissionMode: "auto" },
+    executor: { provider, model: model || null, ...(await loadExecutorDefaults()) },
     checks,
     platformMatch: { keywords: [platform] },
     prompts: { dir: promptsDir },
     pr: { templateFile: path.join(promptsDir, "pr.md"), ...(teamLead ? { teamLead } : {}) },
-    discovery: discoveryConfig(flags, existing, profileName, parity)
+    discovery: await discoveryConfig(flags, existing, profileName, parity)
   });
 
-  const config: Config = {
+  let config: Config = {
     version: 3,
     activeProfile: profileName,
     defaults: existing.defaults,
     profiles: { ...existing.profiles, [profileName]: profile },
     ...(existing.doctor ? { doctor: existing.doctor } : {})
   };
+  config = await stampV4(config);
   const validation = validateConfig(config);
   if (!validation.ok) throw new Error(`Config is invalid:\n${validation.errors.join("\n")}`);
 
@@ -871,10 +897,11 @@ async function initDiscover(flags: Flags): Promise<void> {
   }
 
   if (repoDir && !stackFlag) {
-    const detected = detectedStackAt(repoDir);
+    const { resolveDiscoverPolicy: resolveStackPolicy } = await import("./discover.js");
+    const detected = detectedStackAt(repoDir, resolveStackPolicy(await loadDiscoverPolicy()).stackMap);
     if (detected !== "generic") {
       profile.stack = detected;
-      if (!checksFlag) profile.checks = checkPreset(detected);
+      if (!checksFlag) profile.checks = await checkPreset(detected);
       await saveConfig(config);
       console.log(`Detected stack: ${detected}`);
     }
@@ -955,7 +982,7 @@ async function init(flags: Flags): Promise<void> {
 }
 
 async function detect(flags: Flags): Promise<void> {
-  const stack = detectedStack();
+  const stack = await detectedStack();
   const providers = await detectedProviders();
   const config = await loadConfig();
   const profileName = config.activeProfile || Object.keys(config.profiles)[0] || null;
@@ -966,7 +993,7 @@ async function detect(flags: Flags): Promise<void> {
     node: process.versions.node,
     cwd: process.cwd(),
     stack,
-    stackFiles: ["pubspec.yaml", "package.json", "pyproject.toml", "go.mod", "Cargo.toml"].filter((file) =>
+    stackFiles: Object.keys((await loadDiscoverPolicy()).stackMap ?? {}).filter((file) =>
       existsSync(path.join(process.cwd(), file))
     ),
     providers,
@@ -1043,6 +1070,25 @@ async function providersCommand(flags: Flags): Promise<void> {
   }
 }
 
+/**
+ * Startup fallback when the config is missing or invalid: try the zero-config
+ * bootstrap (reap or file a Ziki escalation, always write NEEDS-HUMAN.md),
+ * then exit non-zero with actionable guidance instead of a bare stack trace.
+ */
+async function bootstrapAndExit(profileName: string | null, error: unknown, step: string): Promise<void> {
+  const { bootstrapOnConfigFailure } = await import("./bootstrap.js");
+  const result = await bootstrapOnConfigFailure({ profileName, reason: error }).catch(() => null);
+  console.error(`auto-work cannot start: failed to ${step}.`);
+  console.error(error instanceof Error ? error.message : String(error));
+  if (result?.escalationId) {
+    console.error(`An escalation was filed on Ziki (${result.escalationId}); answer there or fix the config and retry.`);
+  } else if (result) {
+    console.error(`Details written to ${result.needsHumanFile}.`);
+  }
+  console.error("Next: `auto-work init` (interactive setup) or `auto-work init --discover` (key-first auto setup).");
+  process.exitCode = 1;
+}
+
 async function profiles(): Promise<void> {
   const config = await loadConfig();
   if (!Object.keys(config.profiles).length) {
@@ -1058,7 +1104,13 @@ async function profiles(): Promise<void> {
 }
 
 async function start(flags: Flags): Promise<void> {
-  const config = await loadConfig();
+  let config: Config;
+  try {
+    config = await loadConfig();
+  } catch (error) {
+    await bootstrapAndExit(null, error, "load the auto-work config");
+    return;
+  }
   const overrides = parseRunLimits(flags);
   if (flags.all) {
     const results = [];
@@ -1078,8 +1130,17 @@ async function start(flags: Flags): Promise<void> {
     return;
   }
   const profileName = await resolveProfileName(flags);
-  if (!profileName) throw new Error("No profile configured. Run `auto-work init`.");
-  const loaded = await loadProfile(profileName);
+  if (!profileName) {
+    await bootstrapAndExit(null, new Error("No profile configured."), "choose or create a profile");
+    return;
+  }
+  let loaded: Awaited<ReturnType<typeof loadProfile>>;
+  try {
+    loaded = await loadProfile(profileName);
+  } catch (error) {
+    await bootstrapAndExit(profileName, error, `load profile "${profileName}"`);
+    return;
+  }
   const limits = resolveRunLimits(loaded.profile, overrides);
   const once = Boolean(flags.once);
   const dryRun = Boolean(flags["dry-run"]);
@@ -1548,7 +1609,7 @@ async function memory(flags: Flags): Promise<void> {
 
 async function keysCommand(flags: Flags, positionals: string[]): Promise<void> {
   const sub = positionals[0] || "check";
-  const baseUrl = str(flags, "base-url") || "https://ziki.dev";
+  const baseUrl = await flagBaseUrl(flags);
   if (sub === "import") {
     const file = positionals[1] || str(flags, "file") || str(flags, "keys-file");
     if (!file) throw new Error("Usage: auto-work keys import <file>");
@@ -1573,8 +1634,46 @@ async function keysCommand(flags: Flags, positionals: string[]): Promise<void> {
   if (inspections.some((item) => !item.ok)) process.exitCode = 1;
 }
 
+async function migrateCommand(flags: Flags): Promise<void> {
+  const { loadInitTemplates, migrateV3toV4 } = await import("./config-templates.js");
+  const p = paths();
+  const config = await loadConfig();
+  if (Number(config.version) === 4 && !flags.force) {
+    console.log("Config is already v4. Use --force to re-fill missing sections from init templates.");
+    return;
+  }
+  const templates = await loadInitTemplates();
+  const { config: next, filled } = migrateV3toV4(config, templates);
+  const total = Object.values(filled).reduce((n, list) => n + list.length, 0);
+  if (flags["dry-run"]) {
+    console.log(`Would migrate v${config.version} → v4 (${total} sections filled):`);
+    for (const [scope, list] of Object.entries(filled)) console.log(`  ${scope}: ${list.join(", ")}`);
+    return;
+  }
+  const backup = `${p.configFile}.v3.bak`;
+  await mkdir(p.configDir, { recursive: true });
+  const raw = await readFile(p.configFile, "utf8").catch(() => null);
+  if (raw !== null) await writeFile(backup, raw, "utf8");
+  await saveConfig(next);
+  console.log(`Migrated v${config.version} → v4 (${total} sections filled). Backup: ${backup}`);
+  for (const [scope, list] of Object.entries(filled)) console.log(`  ${scope}: ${list.join(", ")}`);
+}
+
 async function configCommand(flags: Flags): Promise<void> {
   const config = await loadConfig();
+  if (flags.explain) {
+    const { loadInitTemplates, explainProfile, templateVersion } = await import("./config-templates.js");
+    const templates = await loadInitTemplates();
+    console.log(`init-templates version: v${templateVersion(templates)} (config/init-templates.json)`);
+    console.log(`config version: v${config.version}`);
+    for (const [name, rawProfile] of Object.entries(config.profiles ?? {})) {
+      console.log(`profile ${name}:`);
+      for (const entry of explainProfile(name, (rawProfile ?? {}) as unknown as Record<string, unknown>, templates)) {
+        console.log(`  [${entry.source}] ${entry.path}${entry.detail ? ` — ${entry.detail}` : ""}`);
+      }
+    }
+    return;
+  }
   if (flags.validate) {
     const result = validateConfig(config);
     for (const warning of result.warnings) console.log(`warn: ${warning}`);
@@ -1605,6 +1704,13 @@ async function prompts(flags: Flags): Promise<void> {
 }
 
 async function doctor(flags: Flags): Promise<void> {
+  if (flags.drift) {
+    const { runDriftCheck, formatDrift } = await import("./drift.js");
+    const result = await runDriftCheck(str(flags, "profile"));
+    console.log(flags.json ? JSON.stringify(result, null, 2) : formatDrift(result));
+    process.exitCode = result.ok ? 0 : 1;
+    return;
+  }
   const result = await runDoctor({ profileName: str(flags, "profile") });
   console.log(flags.json ? JSON.stringify(result, null, 2) : formatDoctor(result));
   process.exitCode = result.ok ? 0 : 1;
@@ -1714,6 +1820,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       break;
     case "config":
       await configCommand(flags);
+      break;
+    case "migrate":
+      await migrateCommand(flags);
       break;
     case "prompts":
       await prompts(flags);

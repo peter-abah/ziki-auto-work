@@ -21,7 +21,14 @@ function profile(templateFile) {
         checks: [],
         platformMatch: { keywords: ["desktop"] },
         prompts: { dir: "prompts/generic" },
-        pr: { templateFile, teamLead: "@lead" },
+        pr: { templateFile, teamLead: "@lead", maxBodyChars: 60000 },
+        safety: { protectedFiles: [".env"], secretPatterns: ["ZIKI_KEY"] },
+        urls: {
+            envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
+            issuePath: "/{org?}/{project}/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        },
         discovery: { enabled: false },
         workflow: { maxFiles: 5, maxLines: 400, branchPrefix: "fix", commitTypes: ["fix"], requireTests: true },
         limits: {

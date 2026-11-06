@@ -7,6 +7,92 @@ import { runCommand } from "./platform/spawn.js";
 import { envFilesFor } from "./env.js";
 import { isTransientNetworkText } from "./network.js";
 
+import type { GithubPolicyConfig } from "./types.js";
+
+export interface GithubCheckStates {
+  passing: string;
+  failing: string;
+  pending: string;
+  none: string;
+}
+
+export interface ResolvedGithubPolicy {
+  stateMap: { merged: string[]; closed: string[] };
+  mergeableMap: { mergeable: string; conflicting: string };
+  mergeFlags: Record<string, string>;
+  defaultMergeMethod: string;
+  timeouts: { fetch: number; view: number; create: number; merge: number };
+}
+
+function requireStringList(value: unknown, path: string): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new Error(`${path} must be an array of strings (run \`auto-work migrate\`)`);
+  }
+  return value as string[];
+}
+
+function requireTimeouts(value: unknown): ResolvedGithubPolicy["timeouts"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("profile.github.timeouts is required (run `auto-work migrate`)");
+  }
+  const out: Record<string, number> = {};
+  for (const key of ["fetch", "view", "create", "merge"]) {
+    const entry = (value as Record<string, unknown>)[key];
+    if (typeof entry !== "number" || !Number.isFinite(entry) || entry <= 0) {
+      throw new Error(`profile.github.timeouts.${key} must be a positive number (run \`auto-work migrate\`)`);
+    }
+    out[key] = entry;
+  }
+  return out as ResolvedGithubPolicy["timeouts"];
+}
+
+function requireGithubPolicy(profile: ProfileConfig): ResolvedGithubPolicy {
+  const github = profile.github;
+  if (!github || typeof github !== "object") {
+    throw new Error("profile.github is required (run `auto-work migrate`)");
+  }
+  const stateMap = github.stateMap;
+  const mergeableMap = github.mergeableMap;
+  if (!stateMap || typeof stateMap !== "object") {
+    throw new Error("profile.github.stateMap is required (run `auto-work migrate`)");
+  }
+  if (!mergeableMap || typeof mergeableMap !== "object") {
+    throw new Error("profile.github.mergeableMap is required (run `auto-work migrate`)");
+  }
+  const mergeFlags = github.mergeFlags;
+  if (!mergeFlags || typeof mergeFlags !== "object" || Array.isArray(mergeFlags)) {
+    throw new Error("profile.github.mergeFlags must be an object of method -> flag (run `auto-work migrate`)");
+  }
+  for (const [key, value] of Object.entries(mergeFlags)) {
+    if (typeof value !== "string" || !value) {
+      throw new Error(`profile.github.mergeFlags.${key} must be a non-empty string (run \`auto-work migrate\`)`);
+    }
+  }
+  if (typeof github.defaultMergeMethod !== "string" || !github.defaultMergeMethod) {
+    throw new Error("profile.github.defaultMergeMethod must be a non-empty string (run `auto-work migrate`)");
+  }
+  return {
+    stateMap: {
+      merged: requireStringList(stateMap.merged, "profile.github.stateMap.merged"),
+      closed: requireStringList(stateMap.closed, "profile.github.stateMap.closed")
+    },
+    mergeableMap: {
+      mergeable: requireGithubString(mergeableMap.mergeable, "profile.github.mergeableMap.mergeable"),
+      conflicting: requireGithubString(mergeableMap.conflicting, "profile.github.mergeableMap.conflicting")
+    },
+    mergeFlags: mergeFlags as Record<string, string>,
+    defaultMergeMethod: github.defaultMergeMethod,
+    timeouts: requireTimeouts(github.timeouts)
+  };
+}
+
+function requireGithubString(value: unknown, path: string): string {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`${path} must be a non-empty string (run \`auto-work migrate\`)`);
+  }
+  return value;
+}
+
 export function slugify(text: string, max = 40): string {
   const slug = String(text || "")
     .toLowerCase()
@@ -17,26 +103,38 @@ export function slugify(text: string, max = 40): string {
   return slug || "task";
 }
 
-export function branchName(issue: { number: number | string }, title: string, prefix = "fix"): string {
-  const clean = String(prefix || "fix").replace(/\/+$/, "");
+export function branchName(issue: { number: number | string }, title: string, prefix: string): string {
+  if (typeof prefix !== "string" || !prefix) {
+    throw new Error("branch prefix is required (workflow.branchPrefix, run `auto-work migrate`)");
+  }
+  const clean = prefix.replace(/\/+$/, "");
   return `${clean}/${issue.number}-${slugify(title)}`;
 }
 
-export function summarizeChecks(rollup: Array<Record<string, unknown>>): "passing" | "failing" | "pending" | "none" {
-  if (!rollup.length) return "none";
-  let pending = 0;
-  let failing = 0;
+export function summarizeChecks(
+  rollup: Array<Record<string, unknown>>,
+  states: GithubCheckStates
+): string {
+  for (const key of ["passing", "failing", "pending", "none"] as const) {
+    if (typeof states?.[key] !== "string" || !states[key]) {
+      throw new Error(`check states.${key} must be a non-empty string (run \`auto-work migrate\`)`);
+    }
+  }
+  const { passing, failing, pending, none } = states;
+  if (!rollup.length) return none;
+  let pendingCount = 0;
+  let failingCount = 0;
   for (const check of rollup) {
     const status = String(check.status ?? check.state ?? "");
     const conclusion = String(check.conclusion ?? "");
-    if (["QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"].includes(status)) pending += 1;
+    if (["QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"].includes(status)) pendingCount += 1;
     if (["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"].includes(conclusion)) {
-      failing += 1;
+      failingCount += 1;
     }
   }
-  if (failing) return "failing";
-  if (pending) return "pending";
-  return "passing";
+  if (failingCount) return failing;
+  if (pendingCount) return pending;
+  return passing;
 }
 
 export interface PrComment {
@@ -74,7 +172,7 @@ export interface GitHubPrStatus {
   headSha: string | null;
   headRefName: string | null;
   baseRefName: string | null;
-  checks: "passing" | "failing" | "pending" | "none";
+  checks: string;
   mergeable: boolean | null;
   reviewDecision: string | null;
   comments: PrComment[];
@@ -292,7 +390,7 @@ export class GitHub {
     const args = ["push", "-u", "origin", branch, ...(options.force ? ["--force-with-lease"] : [])];
     const result = await this.git(args, {
       cwd: worktree,
-      timeoutMs: 300_000,
+      timeoutMs: requireGithubPolicy(this.profile).timeouts.fetch,
       retry: true
     });
     if (!result.ok) throw new Error(result.stderr || result.stdout || "git push failed");
@@ -310,7 +408,7 @@ export class GitHub {
       "open",
       "--json",
       "number,url,title,state,headRefName"
-    ], { retry: true });
+    ], { retry: true, timeoutMs: requireGithubPolicy(this.profile).timeouts.view });
     if (!result.ok) return null;
     const list = JSON.parse(result.stdout || "[]") as any[];
     return list[0] ?? null;
@@ -334,7 +432,7 @@ export class GitHub {
         "--body",
         body
       ],
-      { timeoutMs: 180_000 }
+      { timeoutMs: requireGithubPolicy(this.profile).timeouts.create }
     );
     if (!result.ok) throw new Error(result.stderr || result.stdout || "gh pr create failed");
     const url = result.stdout.split("\n").find((line) => line.startsWith("http")) || result.stdout.trim();
@@ -342,15 +440,22 @@ export class GitHub {
   }
 
   async prStatus(url: string): Promise<GitHubPrStatus> {
+    const policy = requireGithubPolicy(this.profile);
+    const reviewGate = this.profile.reviewGate;
+    if (!reviewGate || typeof reviewGate !== "object") {
+      throw new Error("profile.reviewGate is required (run `auto-work migrate`)");
+    }
     const result = await this.gh([
       "pr",
       "view",
       url,
       "--json",
       "number,url,state,mergedAt,mergeCommit,headRefOid,headRefName,baseRefName,mergeable,isDraft,statusCheckRollup,comments,reviews,reviewDecision"
-    ], { retry: true });
+    ], { retry: true, timeoutMs: policy.timeouts.view });
     if (!result.ok) throw new Error(result.stderr || result.stdout || "gh pr view failed");
     const data = JSON.parse(result.stdout) as any;
+    const mergedStates = policy.stateMap.merged ?? [];
+    const closedStates = policy.stateMap.closed ?? [];
     const comments = (Array.isArray(data.comments) ? data.comments : []).map((comment: any) => ({
       id: String(comment.id ?? comment.url ?? ""),
       author: String(comment.author?.login ?? comment.author?.name ?? "unknown"),
@@ -375,14 +480,14 @@ export class GitHub {
       number: data.number,
       url: data.url,
       state: data.state,
-      merged: data.state === "MERGED" || Boolean(data.mergedAt),
+      merged: mergedStates.includes(data.state) || Boolean(data.mergedAt),
       mergedInto: data.baseRefName ?? null,
       mergeCommitSha: data.mergeCommit?.oid ?? null,
       headSha: data.headRefOid ?? null,
       headRefName: data.headRefName ?? null,
       baseRefName: data.baseRefName ?? null,
-      checks: summarizeChecks(data.statusCheckRollup ?? []),
-      mergeable: data.mergeable === "MERGEABLE" ? true : data.mergeable === "CONFLICTING" ? false : null,
+      checks: summarizeChecks(data.statusCheckRollup ?? [], reviewGate.checkStates as GithubCheckStates),
+      mergeable: data.mergeable === policy.mergeableMap.mergeable ? true : data.mergeable === policy.mergeableMap.conflicting ? false : null,
       reviewDecision: data.reviewDecision ?? null,
       comments,
       reviews,
@@ -403,7 +508,7 @@ export class GitHub {
       "api",
       `repos/${this.profile.repo.githubRepo}/pulls/${number}/comments`,
       "--paginate"
-    ], { timeoutMs: 120_000, retry: true });
+    ], { timeoutMs: requireGithubPolicy(this.profile).timeouts.view, retry: true });
     if (!result.ok) return [];
     try {
       const data = JSON.parse(result.stdout) as any[];
@@ -434,7 +539,7 @@ export class GitHub {
     ].join("");
     const result = await this.gh(
       ["api", "graphql", "-f", `query=${query}`, "-F", `owner=${owner}`, "-F", `repo=${repo}`, "-F", `number=${number}`],
-      { retry: true, timeoutMs: 120_000 }
+      { retry: true, timeoutMs: requireGithubPolicy(this.profile).timeouts.view }
     );
     if (!result.ok) return [];
     try {
@@ -468,7 +573,7 @@ export class GitHub {
       if (!runId) continue;
       const result = await this.gh(
         ["run", "view", runId, "--repo", this.profile.repo.githubRepo, "--log-failed"],
-        { timeoutMs: 120_000 }
+        { timeoutMs: requireGithubPolicy(this.profile).timeouts.view }
       ).catch(() => null);
       if (!result?.ok || !result.stdout.trim()) continue;
       const lines = result.stdout.split("\n");
@@ -478,13 +583,18 @@ export class GitHub {
   }
 
   async updatePrBody(url: string, body: string): Promise<void> {
-    const result = await this.gh(["pr", "edit", url, "--body", body], { timeoutMs: 120_000 });
+    const result = await this.gh(["pr", "edit", url, "--body", body], { timeoutMs: requireGithubPolicy(this.profile).timeouts.create });
     if (!result.ok) throw new Error(result.stderr || result.stdout || "gh pr edit failed");
   }
 
-  async mergePr(url: string, method: "merge" | "squash" | "rebase" = "squash"): Promise<void> {
-    const flag = method === "merge" ? "--merge" : method === "rebase" ? "--rebase" : "--squash";
-    const result = await this.gh(["pr", "merge", url, flag], { timeoutMs: 300_000, retry: true });
+  async mergePr(url: string, method?: "merge" | "squash" | "rebase" | string): Promise<void> {
+    const policy = requireGithubPolicy(this.profile);
+    const resolved = method ?? policy.defaultMergeMethod;
+    const flag = policy.mergeFlags[resolved];
+    if (!flag) {
+      throw new Error(`unknown merge method "${resolved}" (configure github.mergeFlags, run \`auto-work migrate\`)`);
+    }
+    const result = await this.gh(["pr", "merge", url, flag], { timeoutMs: policy.timeouts.merge, retry: true });
     if (!result.ok) throw new Error(result.stderr || result.stdout || "gh pr merge failed");
   }
 

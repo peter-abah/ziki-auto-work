@@ -3,6 +3,12 @@ import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
 import path from "node:path";
 import { PACKAGE_ROOT, expandHome, profilePaths, paths } from "./platform/paths.js";
 import { PROVIDER_IDS } from "./providers/index.js";
+import { BUILTIN_IDENTITY_VARS, validateEndpointVars, validateEndpoints } from "./ziki-endpoints.js";
+import { loadInitTemplatesSync } from "./config-templates.js";
+function templateEndpoints() {
+    const templates = loadInitTemplatesSync();
+    return (templates.endpoints ?? {});
+}
 export const PROVIDERS = PROVIDER_IDS;
 export const DEFAULT_LIMITS = {
     maxActiveClaims: "auto",
@@ -61,18 +67,119 @@ export const DEFAULT_ENV_FILES = [".env", ".env.local"];
 export const DEFAULT_REPAIR_MUTABLE_PATHS = [
     "ziki.projectId",
     "ziki.projectSlug",
+    "ziki.orgSlug",
     "ziki.platform",
     "ziki.platformCategoryId",
     "ziki.platformFilter",
+    "ziki.vars.*",
+    "ziki.endpoints.*",
+    "operations.*",
+    "transport.*",
+    "queue.*",
+    "reviewGate.*",
+    "heartbeatPolicy.*",
+    "decisions.*",
+    "noop.patterns",
+    "votes.*",
+    "idea.*",
+    "apiRepair.*",
+    "capacity.*",
+    "urls.*",
+    "discover.*",
+    "github.*",
+    "safety.*",
+    "checksDefaults.*",
+    "outbox.*",
+    "loop.*",
+    "offline.*",
+    "discovery.*",
+    // Observation cadences only: safe for agents to tune (bounded below).
+    // Action-affecting timing (heartbeats, timeouts, review windows) stays
+    // human-only: wrong values here lose claims or burn budget silently.
+    // Exception: heartbeatMs is NEVER agent-mutable (claim pacing).
+    "timing.markRecentMs",
+    "timing.offlineWatchMs",
+    "timing.offlineFreshMs",
+    "timing.repoHealthMs",
+    "timing.agentDefaultMs",
+    "timing.triageMs",
+    "timing.ownerMs",
+    "timing.discoveryMs",
+    "timing.repairMs",
+    "timing.doctorMs",
+    "timing.heartbeatDefaultMs",
+    "timing.reviewTransientMs",
+    "timing.reviewTerminalMs",
+    "timing.rateLimitChunkMs",
+    "limits.*",
+    "workflow.*",
+    "prTracking.*",
+    "discovery.*",
+    "pollSeconds",
+    "memoryRefreshMinutes",
     "pollSeconds",
     "memoryRefreshMinutes",
     "discovery.enabled",
-    "discovery.maxIdeasPerRun"
+    "discovery.maxIdeasPerRun",
+    // statuses.* is deliberately absent: redefining what counts as done can
+    // silently skip paid work. Only statuses.known (drift vocabulary) is
+    // agent-proposable, via deterministic diagnosis, never redefinition.
+    "statuses.known",
+    "health.retryMs.*"
 ];
-export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = ["ziki.platformFilter"];
+export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = [
+    "ziki.platformFilter",
+    "ziki.orgSlug",
+    // New Ziki work kinds arrive as new priority keys; values must be numbers
+    // (enforced in validateConfigPatch). Endpoint names stay closed: unknown
+    // API routes are never invented, only remapped.
+    "queue.priorities.*"
+];
+export const DEFAULT_ZIKI_STATUSES = {
+    workable: ["requires_confirmation", "open", "in_progress"],
+    terminal: ["resolved", "closed", "done", "merge", "accepted"],
+    terminalSubstatus: ["done", "merge"],
+    confirmation: ["requires_confirmation"],
+    known: [
+        // statuses
+        "open", "requires_confirmation", "in_progress", "resolved", "closed",
+        "done", "merge", "accepted", "archived", "converted", "rejected",
+        // substatuses
+        "on_dev", "on_staging", "on_prod",
+        // feed kinds the loop knows how to handle
+        "ready_issue", "test_fix", "award_bid", "review_bid", "review_comment",
+        "reclaim_issue", "investigate_issue", "report_deployment", "report_pr_status",
+        "categorize", "sense_check", "active_claim", "offer", "review_offer",
+        "job_review_offer", "open_issue", "confirm_issue", "vote_importance",
+        "estimate_reward", "refresh_stake", "vote_stake", "merge_review",
+        "close_issue", "research_job", "review_idle", "join_request", "idea"
+    ]
+};
+export const DEFAULT_TIMING = {
+    agentDefaultMs: 45 * 60_000,
+    triageMs: 20 * 60_000,
+    ownerMs: 30 * 60_000,
+    discoveryMs: 45 * 60_000,
+    repairMs: 5 * 60_000,
+    doctorMs: 5 * 60_000,
+    markRecentMs: 30 * 60_000,
+    offlineWatchMs: 15 * 60_000,
+    offlineFreshMs: 30 * 60_000,
+    repoHealthMs: 6 * 60 * 60_000,
+    heartbeatMs: null,
+    heartbeatDefaultMs: 10 * 60_000,
+    reviewTransientMs: 5 * 60_000,
+    reviewTerminalMs: 30 * 60_000,
+    rateLimitChunkMs: 5 * 60_000
+};
 export const DEFAULT_REPAIR_STRATEGIES = {
     "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
-    "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 }
+    "feed:unexpected_response_shape": { enabled: true, role: "configDoctor", maxRounds: 3 },
+    "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 },
+    "config:missing_key": { enabled: true, role: "configDoctor", maxRounds: 2 },
+    "config:unknown_endpoint": { enabled: true, role: "configDoctor", maxRounds: 2 },
+    "*:unknown_kind": { enabled: true, role: "configDoctor", maxRounds: 2 },
+    "*:unknown_vocabulary": { enabled: true, role: "configDoctor", maxRounds: 2 }
 };
 const NEVER_MUTABLE_PATTERNS = [
     /^repo\./,
@@ -96,6 +203,15 @@ function pathMatchesAllowlist(path, allowlist) {
             return path === entry.slice(0, -2) || path.startsWith(`${entry.slice(0, -2)}.`);
         return path === entry;
     });
+}
+/**
+ * allowNewKeys supports trailing-wildcard entries (`queue.priorities.*`):
+ * exact match wins, otherwise a `prefix.*` entry covers `prefix.<anything>`.
+ */
+function allowNewKey(opPath, allowNewKeys) {
+    if (allowNewKeys.includes(opPath))
+        return true;
+    return allowNewKeys.some((entry) => entry.endsWith(".*") && opPath.startsWith(`${entry.slice(0, -2)}.`));
 }
 /** Read a dot-path (`ziki.projectId`) from a profile object. */
 export function getConfigPath(obj, path) {
@@ -134,6 +250,12 @@ export function validateConfigPatch(profile, ops, repair) {
     }
     const mutablePaths = repair?.mutablePaths ?? DEFAULT_REPAIR_MUTABLE_PATHS;
     const allowNewKeys = repair?.allowNewKeys ?? DEFAULT_REPAIR_ALLOW_NEW_KEYS;
+    const knownVars = [
+        ...BUILTIN_IDENTITY_VARS,
+        "project",
+        "org",
+        ...Object.keys(profile.ziki?.vars ?? {})
+    ];
     for (const [index, op] of ops.entries()) {
         const label = `ops[${index}]`;
         if (!op || typeof op !== "object" || typeof op.path !== "string" || !op.path.trim()) {
@@ -150,9 +272,30 @@ export function validateConfigPatch(profile, ops, repair) {
             continue;
         }
         const existing = getConfigPath(profile, opPath);
-        if (existing === undefined && !allowNewKeys.includes(opPath)) {
+        // Overriding a known registry endpoint needs no new-key permission: the
+        // default registry is the source of truth and the fallback is identical.
+        let isKnownEndpoint = false;
+        if (opPath === "ziki.endpoints" || opPath.startsWith("ziki.endpoints.")) {
+            const parts = opPath === "ziki.endpoints" ? [] : opPath.slice("ziki.endpoints.".length).split(".");
+            const group = templateEndpoints()[parts[0]];
+            isKnownEndpoint = parts.length === 0 || (!!group && (parts.length === 1 || parts.slice(1).join(".") in group));
+        }
+        const isNewVarsKey = opPath.startsWith("ziki.vars.") && existing === undefined;
+        // Known timing knobs always exist after defaults merge, so proposals
+        // against them need no new-key permission either.
+        const timingKey = opPath === "timing" ? "" : opPath.startsWith("timing.") ? opPath.slice("timing.".length) : null;
+        const isKnownTiming = timingKey !== null && (timingKey === "" || timingKey in TIMING_MIN_MS || timingKey === "heartbeatMs");
+        if (existing === undefined && !allowNewKey(opPath, allowNewKeys) && !isNewVarsKey && !isKnownEndpoint && !isKnownTiming) {
             errors.push(`${label} creates a new key not in repair.allowNewKeys: ${opPath}`);
             continue;
+        }
+        // New queue priorities must be numbers: a string priority would silently
+        // mis-sort the new kind instead of failing loud.
+        if (existing === undefined && opPath.startsWith("queue.priorities.")) {
+            if (typeof op.value !== "number" || !Number.isFinite(op.value)) {
+                errors.push(`${label} queue priority values must be numbers: ${opPath}`);
+                continue;
+            }
         }
         if (existing !== undefined && existing !== null && op.value !== undefined && op.value !== null) {
             const expected = Array.isArray(existing) ? "array" : typeof existing;
@@ -160,6 +303,34 @@ export function validateConfigPatch(profile, ops, repair) {
             if (expected !== actual) {
                 errors.push(`${label} changes the type of ${opPath} from ${expected} to ${actual}`);
             }
+        }
+        if (opPath === "ziki.vars" || opPath.startsWith("ziki.vars.")) {
+            const varsErrors = validateEndpointVars(opPath === "ziki.vars" ? op.value : { [opPath.slice("ziki.vars.".length)]: op.value }, label);
+            errors.push(...varsErrors);
+        }
+        if (opPath === "ziki.endpoints" || opPath.startsWith("ziki.endpoints.")) {
+            const single = opPath === "ziki.endpoints" ? op.value : nestEndpointPath(opPath, op.value);
+            errors.push(...validateEndpoints(single, knownVars, label));
+            continue;
+        }
+        if (opPath === "timing" || opPath.startsWith("timing.")) {
+            const entries = opPath === "timing" && isPlainObject(op.value)
+                ? Object.entries(op.value)
+                : [[opPath.slice("timing.".length), op.value]];
+            for (const [key, value] of entries) {
+                if (key === "heartbeatMs" && value === null)
+                    continue;
+                const floor = TIMING_MIN_MS[key];
+                if (floor === undefined) {
+                    errors.push(`${label} targets unknown timing knob: ${key}`);
+                }
+                else {
+                    const problem = checkTimingValue(key, value, floor);
+                    if (problem)
+                        errors.push(`${label}.${problem}`);
+                }
+            }
+            continue;
         }
         try {
             JSON.stringify(op.value);
@@ -170,35 +341,31 @@ export function validateConfigPatch(profile, ops, repair) {
     }
     return { ok: errors.length === 0, errors };
 }
+/** Nest a dotted endpoints op (`ziki.endpoints.issues.list`) back into object form for validation. */
+function nestEndpointPath(opPath, value) {
+    const parts = opPath.slice("ziki.endpoints.".length).split(".");
+    const root = {};
+    let current = root;
+    for (let index = 0; index < parts.length - 1; index += 1) {
+        const next = {};
+        current[parts[index]] = next;
+        current = next;
+    }
+    current[parts[parts.length - 1]] = value;
+    return root;
+}
+/**
+ * Fresh-install skeleton: version 4 with no profiles and no behavioural
+ * defaults. Every behavioural value comes from config/init-templates.json
+ * via stampV4/migrate (init) or the in-memory fill (loadProfile) — never
+ * from literals here. `doctor.minFreeGb` is the only knob: a local disk
+ * safety floor, not Ziki behaviour.
+ */
 export function defaultConfig() {
     return {
-        version: 3,
+        version: 4,
         activeProfile: "",
-        defaults: {
-            executor: {
-                provider: "opencode",
-                model: null,
-                timeoutMs: 2_700_000,
-                permissionMode: "auto"
-            },
-            limits: { ...DEFAULT_LIMITS },
-            workflow: { ...DEFAULT_WORKFLOW },
-            pollSeconds: 120,
-            memoryRefreshMinutes: 30,
-            hitl: { enabled: true, defaultType: "question", notify: "auto", notifyCommand: null },
-            platformMatch: {},
-            discovery: { enabled: false, maxIdeasPerRun: 3 },
-            checks: [],
-            prompts: { dir: "prompts/generic" },
-            pr: { templateFile: "prompts/generic/pr.md" },
-            prTracking: { ...DEFAULT_PR_TRACKING },
-            repair: {
-                enabled: true,
-                mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS],
-                allowNewKeys: [...DEFAULT_REPAIR_ALLOW_NEW_KEYS],
-                strategies: JSON.parse(JSON.stringify(DEFAULT_REPAIR_STRATEGIES))
-            }
-        },
+        defaults: {},
         profiles: {},
         doctor: { minFreeGb: 3 }
     };
@@ -263,9 +430,9 @@ export async function loadConfig() {
     }
     const raw = JSON.parse(await readFile(p.configFile, "utf8"));
     const version = Number(raw.version);
-    if (version !== 3) {
-        throw new Error(`Config ${p.configFile} is version ${Number.isFinite(version) ? version : "unknown"}; this release uses version 3 (profiles/activeProfile). ` +
-            "Run `auto-work init` to write a new config.");
+    if (version !== 3 && version !== 4) {
+        throw new Error(`Config ${p.configFile} is version ${Number.isFinite(version) ? version : "unknown"}; this release uses version 3 or 4. ` +
+            "Run `auto-work migrate` to move a v3 config to v4, or `auto-work init` to write a new config.");
     }
     return raw;
 }
@@ -309,8 +476,8 @@ export function inferPushMode(forkOwner, upstreamOwner, user) {
 export function validateConfig(config) {
     const errors = [];
     const warnings = [];
-    if (Number(config.version) !== 3)
-        errors.push("version must be 3");
+    if (Number(config.version) !== 3 && Number(config.version) !== 4)
+        errors.push("version must be 3 or 4");
     if (!config.profiles || typeof config.profiles !== "object" || !Object.keys(config.profiles).length) {
         errors.push("at least one profile is required");
     }
@@ -340,6 +507,16 @@ export function validateConfig(config) {
         requireString(profile?.ziki?.projectId, `${prefix}.ziki.projectId`, errors);
         requireString(profile?.ziki?.projectSlug, `${prefix}.ziki.projectSlug`, errors);
         requireString(profile?.ziki?.platform, `${prefix}.ziki.platform`, errors);
+        if (profile?.ziki?.orgSlug !== undefined && (typeof profile.ziki.orgSlug !== "string" || !profile.ziki.orgSlug.trim())) {
+            errors.push(`${prefix}.ziki.orgSlug must be a non-empty string when set`);
+        }
+        errors.push(...validateZikiStatuses(profile?.statuses, `${prefix}.statuses`));
+        errors.push(...validateEndpointVars(profile?.ziki?.vars, `${prefix}.ziki.vars`), ...validateEndpoints(profile?.ziki?.endpoints, [
+            ...BUILTIN_IDENTITY_VARS,
+            "project",
+            "org",
+            ...Object.keys(profile?.ziki?.vars ?? {})
+        ], `${prefix}.ziki.endpoints`));
         requireString(profile?.repo?.url, `${prefix}.repo.url`, errors);
         requireString(profile?.repo?.upstream, `${prefix}.repo.upstream`, errors);
         requireString(profile?.repo?.base, `${prefix}.repo.base`, errors);
@@ -495,9 +672,97 @@ export function validateConfig(config) {
         if (typeof profile?.pollSeconds !== "number" || profile.pollSeconds < 10) {
             errors.push(`${prefix}.pollSeconds must be at least 10`);
         }
+        errors.push(...validateTiming(profile?.timing, `${prefix}.timing`));
+        errors.push(...validateHealthRetry(profile?.health?.retryMs, `${prefix}.health.retryMs`));
         validateRepairConfig(prefix, profile?.repair, errors);
+        errors.push(...validateV4Sections(profile, `${prefix}`));
+        if (Number(config.version) === 4) {
+            errors.push(...validateV4Required(profile, `${prefix}`));
+        }
     }
     return { ok: errors.length === 0, errors, warnings };
+}
+function stringList(value) {
+    return Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.length > 0);
+}
+export function validateZikiStatuses(value, label) {
+    if (value === undefined)
+        return [];
+    const errors = [];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return [`${label} must be an object with workable/terminal lists`];
+    }
+    const record = value;
+    for (const key of ["workable", "terminal", "terminalSubstatus", "confirmation", "known"]) {
+        if (record[key] === undefined)
+            continue;
+        if (!stringList(record[key]))
+            errors.push(`${label}.${key} must be an array of non-empty strings`);
+    }
+    return errors;
+}
+const TIMING_MIN_MS = {
+    agentDefaultMs: 60_000,
+    triageMs: 60_000,
+    ownerMs: 60_000,
+    discoveryMs: 60_000,
+    repairMs: 30_000,
+    doctorMs: 30_000,
+    markRecentMs: 60_000,
+    offlineWatchMs: 60_000,
+    offlineFreshMs: 60_000,
+    repoHealthMs: 3_600_000,
+    heartbeatDefaultMs: 60_000,
+    reviewTransientMs: 60_000,
+    reviewTerminalMs: 60_000,
+    rateLimitChunkMs: 1000
+};
+export function validateTiming(value, label) {
+    if (value === undefined)
+        return [];
+    const errors = [];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return [`${label} must be an object of millisecond durations`];
+    }
+    const record = value;
+    if (record.heartbeatMs !== undefined && record.heartbeatMs !== null &&
+        (typeof record.heartbeatMs !== "number" || !Number.isFinite(record.heartbeatMs) || record.heartbeatMs <= 0)) {
+        errors.push(`${label}.heartbeatMs must be a positive number of ms, or null to derive from Ziki`);
+    }
+    for (const [key, min] of Object.entries(TIMING_MIN_MS)) {
+        const entry = record[key];
+        if (entry === undefined)
+            continue;
+        const problem = checkTimingValue(key, entry, min);
+        if (problem)
+            errors.push(`${label}.${problem}`);
+    }
+    for (const key of Object.keys(record)) {
+        if (!(key in TIMING_MIN_MS) && key !== "heartbeatMs") {
+            errors.push(`${label}.${key} is not a known timing knob`);
+        }
+    }
+    return errors;
+}
+function checkTimingValue(key, value, min) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min) {
+        return `${key} must be a number >= ${min}ms`;
+    }
+    return null;
+}
+export function validateHealthRetry(value, label) {
+    if (value === undefined)
+        return [];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return [`${label} must be an object of blocker code -> ms (or null for built-in)`];
+    }
+    const errors = [];
+    for (const [code, ms] of Object.entries(value)) {
+        if (ms !== null && (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0)) {
+            errors.push(`${label}[${JSON.stringify(code)}] must be a non-negative number of ms or null`);
+        }
+    }
+    return errors;
 }
 function validateRepairConfig(prefix, repair, errors) {
     if (repair === undefined)
@@ -552,6 +817,136 @@ function validateRepairConfig(prefix, repair, errors) {
         }
     }
 }
+const V4_OBJECT_SECTIONS = [
+    "transport",
+    "queue",
+    "reviewGate",
+    "heartbeatPolicy",
+    "decisions",
+    "noop",
+    "votes",
+    "idea",
+    "apiRepair",
+    "capacity",
+    "urls",
+    "discover",
+    "github",
+    "safety",
+    "checksDefaults",
+    "outbox",
+    "bootstrap",
+    "loop"
+];
+const V4_REQUIRED_IN_V4 = ["transport", "operations"];
+/**
+ * v4 section validation (light in P1 — presence + shape; per-section
+ * strictness lands with the P2 phase that consumes each section).
+ * v3 configs skip this entirely. v4 configs must carry transport +
+ * operations; all other new sections warn when absent until their P2
+ * phase flips them to required.
+ */
+const V4_REQUIRED_SECTIONS = [
+    "transport",
+    "queue",
+    "reviewGate",
+    "heartbeatPolicy",
+    "decisions",
+    "noop",
+    "votes",
+    "idea",
+    "apiRepair",
+    "capacity",
+    "urls",
+    "discover",
+    "github",
+    "safety",
+    "checksDefaults",
+    "outbox",
+    "bootstrap",
+    "offline",
+    "loop",
+    "pr",
+    "repo",
+    "discovery"
+];
+export function validateV4Required(profile, prefix) {
+    const errors = [];
+    const record = profile;
+    for (const section of V4_REQUIRED_SECTIONS) {
+        const value = record[section];
+        if (value === undefined) {
+            errors.push(`${prefix}.${section} is required in v4 (run \`auto-work migrate\`)`);
+        }
+        else if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            errors.push(`${prefix}.${section} must be an object (run \`auto-work migrate\`)`);
+        }
+    }
+    if (profile.ziki?.endpoints === undefined) {
+        errors.push(`${prefix}.ziki.endpoints is required in v4 (run \`auto-work migrate\`)`);
+    }
+    if (typeof profile.pr?.maxBodyChars !== "number") {
+        errors.push(`${prefix}.pr.maxBodyChars must be a number (run \`auto-work migrate\`)`);
+    }
+    if (profile.repo?.mergeMode !== undefined && !["handoff", "never", "auto"].includes(profile.repo.mergeMode)) {
+        errors.push(`${prefix}.repo.mergeMode must be "handoff", "never" or "auto"`);
+    }
+    if (profile.repo?.mergeMethod !== undefined && !["merge", "squash", "rebase"].includes(profile.repo.mergeMethod)) {
+        errors.push(`${prefix}.repo.mergeMethod must be "merge", "squash" or "rebase"`);
+    }
+    return errors;
+}
+export function validateV4Sections(profile, prefix) {
+    if (!profile)
+        return [];
+    const errors = [];
+    const record = profile;
+    // Detect v4 intent: transport or operations present means v4 rules apply.
+    const isV4 = record.transport !== undefined || record.operations !== undefined;
+    for (const section of V4_OBJECT_SECTIONS) {
+        const value = record[section];
+        if (value === undefined) {
+            if (isV4 && V4_REQUIRED_IN_V4.includes(section)) {
+                errors.push(`${prefix}.${section} is required in v4 (run \`auto-work migrate\`)`);
+            }
+            continue;
+        }
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+            errors.push(`${prefix}.${section} must be an object`);
+        }
+    }
+    const operations = record.operations;
+    if (operations === undefined) {
+        if (isV4)
+            errors.push(`${prefix}.operations is required in v4 (run \`auto-work migrate\`)`);
+    }
+    else if (typeof operations !== "object" || operations === null || Array.isArray(operations)) {
+        errors.push(`${prefix}.operations must be an object of group -> name -> operation`);
+    }
+    else {
+        for (const [group, names] of Object.entries(operations)) {
+            if (typeof names !== "object" || names === null || Array.isArray(names)) {
+                errors.push(`${prefix}.operations.${group} must be an object of name -> operation`);
+                continue;
+            }
+            for (const [name, op] of Object.entries(names)) {
+                const where = `${prefix}.operations.${group}.${name}`;
+                if (typeof op !== "object" || op === null || Array.isArray(op)) {
+                    errors.push(`${where} must be an object`);
+                    continue;
+                }
+                const method = op.method;
+                if (method !== undefined && (typeof method !== "string" || !method.trim())) {
+                    errors.push(`${where}.method must be a non-empty string`);
+                }
+                const expect = op.expect;
+                if (expect !== undefined && !["feed", "list", "object"].includes(expect)) {
+                    errors.push(`${where}.expect must be "feed", "list" or "object"`);
+                }
+            }
+        }
+    }
+    return errors;
+}
 export function resolveRunLimits(profile, override) {
     const base = {
         maxRuntimeMinutes: profile.limits.maxRuntimeMinutes ?? null,
@@ -575,10 +970,18 @@ export function resolveModel(profile, role) {
     return models[role] ?? profile.executor.model ?? null;
 }
 export function resolveMergeMode(profile) {
-    return profile.repo.mergeMode ?? "handoff";
+    const mode = profile.repo.mergeMode;
+    if (mode !== "handoff" && mode !== "never" && mode !== "auto") {
+        throw new Error('profile.repo.mergeMode must be "handoff", "never" or "auto" (run `auto-work migrate`)');
+    }
+    return mode;
 }
 export function resolveMergeMethod(profile) {
-    return profile.repo.mergeMethod ?? "squash";
+    const method = profile.repo.mergeMethod;
+    if (method !== "merge" && method !== "squash" && method !== "rebase") {
+        throw new Error('profile.repo.mergeMethod must be "merge", "squash" or "rebase" (run `auto-work migrate`)');
+    }
+    return method;
 }
 export function resolvePromptDir(profile) {
     const dir = profile.prompts.dir;
@@ -610,12 +1013,15 @@ export async function loadProfile(profileName) {
     if (!rawProfile) {
         throw new Error(`Unknown profile "${name || "(none)"}". Available: ${Object.keys(config.profiles ?? {}).join(", ") || "none"}. Run \`auto-work init\`.`);
     }
-    const profile = deepMerge(config.defaults ?? {}, rawProfile);
-    profile.limits = { ...DEFAULT_LIMITS, ...(profile.limits ?? {}) };
-    profile.workflow = { ...DEFAULT_WORKFLOW, ...(profile.workflow ?? {}) };
-    profile.providers = { ...(config.providers ?? {}), ...(profile.providers ?? {}) };
-    profile.repo = { ...profile.repo, envFiles: profile.repo?.envFiles ?? DEFAULT_ENV_FILES };
-    profile.executor = { ...profile.executor, timeoutMs: profile.executor?.timeoutMs ?? 2_700_000, permissionMode: profile.executor?.permissionMode ?? "auto" };
+    const merged = deepMerge(config.defaults ?? {}, rawProfile);
+    merged.providers = { ...(config.providers ?? {}), ...(merged.providers ?? {}) };
+    // Behavioural values are data-filled from init templates (never code
+    // literals), so unmigrated profiles keep working with template-sourced
+    // values. `config --explain` reports this provenance; `migrate` persists
+    // it to disk.
+    const { loadInitTemplates, fillProfileFromTemplates } = await import("./config-templates.js");
+    const templates = await loadInitTemplates();
+    const { profile } = fillProfileFromTemplates(merged, templates);
     const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });
     if (!validation.ok) {
         throw new Error(`Invalid profile "${name}":\n${validation.errors.join("\n")}`);

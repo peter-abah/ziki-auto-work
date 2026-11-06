@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, deepMerge, defaultConfig, resolveModel, validateConfig } from "./config.js";
+import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, deepMerge, defaultConfig, resolveModel, validateConfig, validateConfigPatch } from "./config.js";
+import { repairConfigFor } from "./config-repair.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { parseTestFailures, protectedFiles, scanSecrets } from "./checks.js";
@@ -41,6 +42,20 @@ function fixtureProfile(overrides = {}) {
         pollSeconds: 120,
         memoryRefreshMinutes: 30,
         hitl: { enabled: true, defaultType: "question", notifyCommand: null },
+        urls: {
+            envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
+            issuePath: "/{org?}/{project}/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        },
+        queue: {
+            priorities: { ready_issue: 6 },
+            buckets: { owner: [], work: ["ready_issue"], review: [], aux: [] },
+            noIssueKinds: [],
+            blockedStatuses: ["done"],
+            activeStatuses: ["working", "claimed"],
+            recentMs: 1800000
+        },
         ...overrides
     };
 }
@@ -49,9 +64,9 @@ test("deepMerge merges objects and replaces arrays", () => {
     const merged = deepMerge(base, { a: { c: 3 }, list: [9] });
     assert.deepEqual(merged, { a: { b: 1, c: 3 }, list: [9] });
 });
-test("defaultConfig is version 3 with profiles", () => {
+test("defaultConfig is a version 4 skeleton", () => {
     const config = defaultConfig();
-    assert.equal(config.version, 3);
+    assert.equal(config.version, 4);
     assert.equal(config.activeProfile, "");
     assert.deepEqual(config.profiles, {});
 });
@@ -204,14 +219,17 @@ test("protectedFiles matches patterns", () => {
     assert.deepEqual(protectedFiles([".env", ".env.example"], [".env"]), [".env"]);
 });
 test("scanSecrets finds keys in added lines", () => {
-    assert.equal(scanSecrets("+ZIKI_KEY1=secret\n+const ok = 1;").length, 1);
-    assert.equal(scanSecrets("+const ok = 1;").length, 0);
+    const patterns = ["ZIKI_KEY[A-Z0-9_]*\\s*=\\s*\\S+"];
+    assert.equal(scanSecrets("+ZIKI_KEY1=secret\n+const ok = 1;", patterns).length, 1);
+    assert.equal(scanSecrets("+const ok = 1;", patterns).length, 0);
 });
 test("branchName and summarizeChecks", () => {
-    assert.equal(branchName({ number: 12 }, "Fix the thing"), "fix/12-fix-the-thing");
-    assert.equal(summarizeChecks([]), "none");
-    assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "SUCCESS" }]), "passing");
-    assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "FAILURE" }]), "failing");
+    assert.equal(branchName({ number: 12 }, "Fix the thing", "fix"), "fix/12-fix-the-thing");
+    const states = { passing: "passing", failing: "failing", pending: "pending", none: "none" };
+    assert.equal(summarizeChecks([], states), "none");
+    assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "SUCCESS" }], states), "passing");
+    assert.equal(summarizeChecks([{ status: "COMPLETED", conclusion: "FAILURE" }], states), "failing");
+    assert.throws(() => summarizeChecks([], null), /check states/);
 });
 test("buildPrBody renders the profile template", async () => {
     const body = await buildPrBody(fixtureProfile(), {
@@ -290,8 +308,7 @@ test("deepMerge keeps limit defaults when a profile overrides one field", () => 
     assert.equal(merged.limits.maxCycles, 3);
     assert.equal(merged.limits.maxRuntimeMinutes, null);
 });
-test("workflow defaults are present and validated", () => {
-    assert.deepEqual(defaultConfig().defaults?.workflow, DEFAULT_WORKFLOW);
+test("workflow values are validated", () => {
     const profile = fixtureProfile({ workflow: { ...DEFAULT_WORKFLOW, maxFiles: 0 } });
     const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
     assert.equal(result.ok, false);
@@ -361,5 +378,66 @@ test("validateConfig rejects malformed repair strategies", () => {
     const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
     assert.equal(result.ok, false);
     assert.ok(result.errors.length >= 3, result.errors.join("; "));
+});
+test("defaultConfig is a literal-free v4 skeleton", () => {
+    const config = defaultConfig();
+    assert.equal(config.version, 4);
+    assert.deepEqual(config.defaults, {});
+    assert.deepEqual(config.profiles, {});
+    assert.equal(config.doctor?.minFreeGb, 3);
+});
+test("validateConfig rejects absolute endpoint URLs", () => {
+    const profile = fixtureProfile({
+        ziki: { ...fixtureProfile().ziki, endpoints: { issues: { list: "https://evil.test/x" } } }
+    });
+    const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((error) => error.includes("scheme or host")));
+});
+test("validateConfigPatch accepts endpoint, vars and orgSlug ops", () => {
+    const profile = fixtureProfile();
+    const repair = repairConfigFor(profile);
+    const check = validateConfigPatch(profile, [
+        { path: "ziki.endpoints.issues.list", value: "/api/v2/issues", reason: "v2" },
+        { path: "ziki.vars.team", value: "t1", reason: "new var" },
+        { path: "ziki.orgSlug", value: "zedu", reason: "org" }
+    ], repair);
+    assert.deepEqual(check.errors, []);
+    assert.equal(check.ok, true);
+});
+test("validateConfigPatch rejects unknown template vars and protected paths", () => {
+    const profile = fixtureProfile();
+    const repair = repairConfigFor(profile);
+    const bad = validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.list", value: "/api/v1/{nope}/issues" }], repair);
+    assert.equal(bad.ok, false);
+    const secret = validateConfigPatch(profile, [{ path: "ziki.apiKey", value: "x" }], repair);
+    assert.equal(secret.ok, false);
+});
+test("validateConfig accepts timing, statuses and retry overrides", () => {
+    const profile = fixtureProfile({
+        timing: { offlineWatchMs: 120_000 },
+        health: { retryMs: { "platform:not_found": 60_000 } },
+        statuses: { workable: ["open"], terminal: ["closed"] }
+    });
+    const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+    assert.equal(result.ok, true, result.errors.join("; "));
+});
+test("validateConfig rejects bad timing, statuses and retry overrides", () => {
+    const badTiming = fixtureProfile({ timing: { offlineWatchMs: 1 } });
+    assert.equal(validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: badTiming } }).ok, false);
+    const badStatus = fixtureProfile({ statuses: { workable: "open" } });
+    assert.equal(validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: badStatus } }).ok, false);
+    const badRetry = fixtureProfile({ health: { retryMs: { x: -5 } } });
+    assert.equal(validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: badRetry } }).ok, false);
+});
+test("validateConfigPatch enforces timing floors for agent proposals", () => {
+    const profile = fixtureProfile();
+    const repair = repairConfigFor(profile);
+    const tooFast = validateConfigPatch(profile, [{ path: "timing.offlineWatchMs", value: 1000 }], repair);
+    assert.equal(tooFast.ok, false);
+    const ok = validateConfigPatch(profile, [{ path: "timing.offlineWatchMs", value: 300_000 }], repair);
+    assert.equal(ok.ok, true, ok.errors.join("; "));
+    const forbidden = validateConfigPatch(profile, [{ path: "ziki.heartbeatMs", value: 1000 }], repair);
+    assert.equal(forbidden.ok, false);
 });
 //# sourceMappingURL=config.test.js.map

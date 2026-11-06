@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildQueue, KNOWN_KINDS } from "./queue.js";
+import { buildQueue, knownKinds, queueSets } from "./queue.js";
 import { DEFAULT_LIMITS, DEFAULT_WORKFLOW } from "./config.js";
+import { loadInitTemplates } from "./config-templates.js";
+const templates = await loadInitTemplates();
+const templateQueue = templates.queue;
 const KINDS = [
     "owner_request",
     "offer",
@@ -55,11 +58,19 @@ function profile() {
         limits: { ...DEFAULT_LIMITS },
         pollSeconds: 120,
         memoryRefreshMinutes: 30,
-        hitl: { enabled: true, defaultType: "question" }
+        hitl: { enabled: true, defaultType: "question" },
+        queue: JSON.parse(JSON.stringify(templateQueue))
     };
 }
+test("template queue covers every known kind and bucket", () => {
+    const sets = queueSets(profile());
+    for (const kind of KINDS) {
+        assert.ok(sets.known.has(kind), `${kind} missing from template queue buckets`);
+        assert.ok(typeof sets.priorities[kind] === "number", `${kind} missing a priority`);
+    }
+    assert.equal(knownKinds(profile()).size, KINDS.length);
+});
 test("every latest Ziki work kind is known and queued", () => {
-    assert.equal(KNOWN_KINDS.size, KINDS.length);
     const items = KINDS.map((kind, index) => {
         const issue = NO_ISSUE.has(kind)
             ? undefined
@@ -98,10 +109,10 @@ test("every latest Ziki work kind is known and queued", () => {
     }
     assert.equal(queue.other.length, 0);
 });
-test("unknown kinds are kept in the other bucket instead of being dropped", () => {
+test("unknown kinds sort last in the other bucket instead of being dropped", () => {
     const feed = {
         project: { id: "p", slug: "demo", name: "Demo" },
-        agent: { id: "a", name: "agent", level: "working" },
+        agent: { id: "a", name: "a", level: "working" },
         workUrl: "https://ziki.dev/demo/work",
         pollAfterSeconds: 30,
         ask: [],
@@ -124,6 +135,8 @@ test("unknown kinds are kept in the other bucket instead of being dropped", () =
     assert.equal(queue.all.length, 1);
     assert.equal(queue.other.length, 1);
     assert.equal(queue.other[0].kind, "brand_new_kind");
+    const maxKnown = Math.max(...Object.values(templateQueue.priorities));
+    assert.equal(queue.other[0].priority, maxKnown + 1);
 });
 test("canAct false work is not dispatched", () => {
     const feed = {
@@ -149,5 +162,9 @@ test("canAct false work is not dispatched", () => {
     };
     const queue = buildQueue({ feed, profile: profile() });
     assert.equal(queue.all.length, 0);
+});
+test("queue without policy fails loud", () => {
+    const { queue: _dropped, ...rest } = profile();
+    assert.throws(() => queueSets(rest), /profile.queue is required/);
 });
 //# sourceMappingURL=queue.test.js.map

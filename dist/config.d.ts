@@ -29,6 +29,30 @@ export declare const DEFAULT_ENV_FILES: string[];
  */
 export declare const DEFAULT_REPAIR_MUTABLE_PATHS: string[];
 export declare const DEFAULT_REPAIR_ALLOW_NEW_KEYS: string[];
+export declare const DEFAULT_ZIKI_STATUSES: {
+    workable: string[];
+    terminal: string[];
+    terminalSubstatus: string[];
+    confirmation: string[];
+    known: string[];
+};
+export declare const DEFAULT_TIMING: {
+    agentDefaultMs: number;
+    triageMs: number;
+    ownerMs: number;
+    discoveryMs: number;
+    repairMs: number;
+    doctorMs: number;
+    markRecentMs: number;
+    offlineWatchMs: number;
+    offlineFreshMs: number;
+    repoHealthMs: number;
+    heartbeatMs: number | null;
+    heartbeatDefaultMs: number;
+    reviewTransientMs: number;
+    reviewTerminalMs: number;
+    rateLimitChunkMs: number;
+};
 export declare const DEFAULT_REPAIR_STRATEGIES: Record<string, RepairStrategyConfig>;
 export declare function isNeverMutablePath(path: string): boolean;
 /** Read a dot-path (`ziki.projectId`) from a profile object. */
@@ -45,6 +69,13 @@ export interface PatchValidation {
  * type changes are all rejected.
  */
 export declare function validateConfigPatch(profile: ProfileConfig, ops: ConfigPatchOp[] | null | undefined, repair?: RepairConfig): PatchValidation;
+/**
+ * Fresh-install skeleton: version 4 with no profiles and no behavioural
+ * defaults. Every behavioural value comes from config/init-templates.json
+ * via stampV4/migrate (init) or the in-memory fill (loadProfile) — never
+ * from literals here. `doctor.minFreeGb` is the only knob: a local disk
+ * safety floor, not Ziki behaviour.
+ */
 export declare function defaultConfig(): Config;
 export declare function deepMerge<T>(base: T, override: unknown): T;
 export declare function parseEnvFile(text: string): Record<string, string>;
@@ -60,6 +91,11 @@ export interface ValidationResult {
 }
 export declare function inferPushMode(forkOwner: string, upstreamOwner: string, user?: string | null): PushMode;
 export declare function validateConfig(config: Config): ValidationResult;
+export declare function validateZikiStatuses(value: unknown, label: string): string[];
+export declare function validateTiming(value: unknown, label: string): string[];
+export declare function validateHealthRetry(value: unknown, label: string): string[];
+export declare function validateV4Required(profile: ProfileConfig, prefix: string): string[];
+export declare function validateV4Sections(profile: ProfileConfig, prefix: string): string[];
 export declare function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig;
 export declare function resolveModel(profile: ProfileConfig, role: Role): string | null;
 export declare function resolveMergeMode(profile: ProfileConfig): "handoff" | "never" | "auto";

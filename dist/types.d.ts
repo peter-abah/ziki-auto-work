@@ -1,6 +1,7 @@
 export type ProviderName = string;
 export type Role = "worker" | "review" | "followup" | "triage" | "confirm" | "discovery" | "owner" | "estimate" | "investigate" | "importance" | "stakeVote" | "senseCheck" | "close" | "research" | "jobReview" | "bidVote" | "commentVote" | "apiRepair" | "configDoctor";
 export type CapacityLimit = number | "auto" | null;
+export type VotePolicy = "off" | "agent" | "heuristic";
 export type MergeMode = "handoff" | "never" | "auto";
 export type MergeMethod = "merge" | "squash" | "rebase";
 export type EscalationType = "question" | "work_authorization" | "blocker" | "scope_change" | "human_approval";
@@ -15,6 +16,12 @@ export interface ZikiConfig {
     platform: string;
     platformCategoryId?: string;
     /**
+     * Organisation slug for `/{org}/{project}/…` addresses. Absent on tenants
+     * without organisations (legacy single-segment addresses are used then).
+     * Learned from the project's `workUrl` during project re-resolution.
+     */
+    orgSlug?: string | null;
+    /**
      * Value sent as the `platform` query parameter on Ziki list endpoints.
      * - `undefined` (absent): send `ziki.platform` (legacy behavior).
      * - a slug: send that instead (category renames without touching identity).
@@ -22,7 +29,69 @@ export interface ZikiConfig {
      * Agent-mutable via the config-repair flow (see RepairConfig).
      */
     platformFilter?: string | null;
+    /**
+     * Extra interpolation variables for endpoint templates (future Ziki
+     * identifiers like `teamId`). Keys: `[A-Za-z0-9_-]+`, no dots.
+     * Agent-mutable; new keys are always allowed here.
+     */
+    vars?: Record<string, string>;
+    /**
+     * Endpoint path templates, e.g. `{ issues: { list: "/api/v1/issues" } }`.
+     * `{var}` interpolates from vars + identity fields; `{var?}` is optional
+     * (drops out with slash-collapse). Agent-mutable: unknown Ziki URL shapes
+     * are fixed in config, not code.
+     */
+    endpoints?: Record<string, Record<string, string>>;
     projectName?: string;
+}
+/**
+ * Status vocabulary. Ziki renames things; these lists decide what the loop
+ * does with each value instead of hardcoding it. Anything observed that is
+ * not in `known` raises a visible `unknown_vocabulary` warning.
+ * Agent-readable, human-written: redefining finished states can silently
+ * skip paid work, so agents may not propose these paths.
+ */
+export interface ZikiStatusesConfig {
+    /** Issues/ideas the loop may work on. */
+    workable?: string[];
+    /** Done states (checked against status and substatus). */
+    terminal?: string[];
+    /** Done-like substatuses only. */
+    terminalSubstatus?: string[];
+    /** Substatuses that must pass confirmation before work starts. */
+    confirmation?: string[];
+    /** Full known vocabulary (statuses, substatuses, feed kinds) for drift detection. */
+    known?: string[];
+}
+/**
+ * Human-tunable backoff overrides (ms), keyed by blocker code
+ * (e.g. `"platform:not_found"`, `"*:unknown_kind"` also matches).
+ * `null` restores the built-in default for that code.
+ */
+export interface HealthTuningConfig {
+    retryMs?: Record<string, number | null>;
+}
+/**
+ * Timing policy (all ms). Every interval/timeout the loop uses lives here so
+ * pacing is tunable without a release. `heartbeatMs: null` (default) derives
+ * the interval from Ziki's live workflow, capped at `heartbeatDefaultMs`.
+ */
+export interface TimingConfig {
+    agentDefaultMs?: number;
+    triageMs?: number;
+    ownerMs?: number;
+    discoveryMs?: number;
+    repairMs?: number;
+    doctorMs?: number;
+    markRecentMs?: number;
+    offlineWatchMs?: number;
+    offlineFreshMs?: number;
+    repoHealthMs?: number;
+    heartbeatMs?: number | null;
+    heartbeatDefaultMs?: number;
+    reviewTransientMs?: number;
+    reviewTerminalMs?: number;
+    rateLimitChunkMs?: number;
 }
 /** One op in an agent-proposed config patch. Applied only after approval. */
 export interface ConfigPatchOp {
@@ -153,6 +222,7 @@ export interface PromptsConfig {
 export interface PrConfig {
     templateFile: string;
     teamLead?: string;
+    maxBodyChars?: number;
 }
 export interface PrTrackingConfig {
     enabled: boolean;
@@ -170,6 +240,16 @@ export interface DiscoveryConfig {
     maxCyclesBeforeRun?: number;
     alreadyVetted?: boolean;
     vettedNote?: string;
+    /** Issue statuses shown as existing context (informational prompt context). */
+    existingStatuses?: string[];
+    /** Resolved-ish statuses/substatuses shown as recently merged context. */
+    recentMergedStatuses?: string[];
+    recentMergedSubstatuses?: string[];
+    /** Prompt-context caps (counts, not behavior). */
+    contextIssueLimit?: number;
+    contextMergedLimit?: number;
+    contextTaskLimit?: number;
+    ownerCandidateLimit?: number;
 }
 export interface LimitsConfig {
     maxActiveClaims: CapacityLimit;
@@ -294,6 +374,224 @@ export interface HitlConfig {
     notify?: NotifyMode;
     notifyCommand?: string | null;
 }
+export interface TransportConfig {
+    /** Auth scheme prefix, e.g. "Bearer". */
+    authScheme?: string;
+    /** User-Agent header value. */
+    userAgent?: string;
+    /** Default per-request timeout ms. */
+    defaultTimeoutMs?: number;
+    /** Default retry attempts for 429/5xx. */
+    defaultRetries?: number;
+    /** Cap for Retry-After / backoff waits (ms). */
+    backoffCapMs?: number;
+    /** Backoff growth cap for transport-level retries (ms). */
+    retryGrowthCapMs?: number;
+    /** Preview chars kept for unexpected-shape errors. */
+    previewChars?: number;
+}
+export interface OperationPaginationConfig {
+    limitKey?: string;
+    cursorKey?: string;
+    itemsKey?: string;
+    nextCursorKey?: string;
+    defaultLimit?: number;
+    maxPages?: number;
+    maxItems?: number;
+}
+export interface OperationConfig {
+    /** Endpoint name in ziki.endpoints (defaults to the operation name). */
+    route?: string;
+    /** HTTP method, e.g. "GET", "POST", "PUT", "PATCH", "DELETE". */
+    method?: string;
+    /** Expected response shape guard: "feed" | "list" | "object". Absent = no guard. */
+    expect?: "feed" | "list" | "object";
+    /** Query keys sent for this operation. */
+    query?: string[];
+    /** Body keys sent for this operation. */
+    body?: string[];
+    /** Whether an idempotency key is attached. */
+    idempotency?: boolean;
+    /** Pagination behavior for list operations. Absent = single call. */
+    pagination?: OperationPaginationConfig;
+    /** Operation-specific timeout/retry overrides. */
+    timeoutMs?: number;
+    retries?: number;
+}
+export interface QueuePolicyConfig {
+    priorities?: Record<string, number>;
+    buckets?: {
+        owner?: string[];
+        work?: string[];
+        review?: string[];
+        aux?: string[];
+    };
+    noIssueKinds?: string[];
+    blockedStatuses?: string[];
+    activeStatuses?: string[];
+    recentMs?: number;
+}
+export interface ReviewGatePolicyConfig {
+    transientMs?: number;
+    terminalMs?: number;
+    openState?: string;
+    checkStates?: {
+        passing?: string;
+        failing?: string;
+        pending?: string;
+        none?: string;
+    };
+    workflowKeys?: string[];
+    /** Issue states that count as awaiting test review (processTestFix gate). */
+    reviewableStatuses?: string[];
+    reviewableSubstatuses?: string[];
+}
+export interface HeartbeatPolicyConfig {
+    intervalMs?: number;
+    eligibleStates?: string[];
+    lostStatuses?: number[];
+    rateLimitMs?: number;
+    genericMs?: number;
+    workflowKey?: string;
+}
+export interface DecisionsPolicyConfig {
+    marker?: string;
+    kinds?: string[];
+    trueWords?: string[];
+    falseWords?: string[];
+    /** Issue statuses/substatuses scanned for owner decisions. */
+    candidateStatuses?: string[];
+    candidateSubstatuses?: string[];
+    /** Issue states where a merge decision may be acted on. */
+    mergeStatuses?: string[];
+    mergeSubstatuses?: string[];
+    /** Ziki states that count as merge-ready for merge_fix. */
+    mergeReadyStatuses?: string[];
+    mergeReadySubstatuses?: string[];
+    /** Chars of decision text kept in the dedupe key. */
+    keyChars?: number;
+}
+export interface NoopPolicyConfig {
+    statuses?: number[];
+    patterns?: Record<string, string[]>;
+}
+export interface VotesPolicyConfig {
+    defaultPolicy?: VotePolicy;
+    bidMinChars?: number;
+    bidKeywords?: string[];
+    commentKeywords?: string[];
+}
+export interface IdeaPolicyConfig {
+    summaryMin?: number;
+    suffix?: string;
+    summaryMax?: number;
+    titleMax?: number;
+    descriptionMax?: number;
+    fallback?: string;
+}
+export interface ApiRepairPolicyConfig {
+    deterministicRetries?: number;
+    agentRepairs?: number;
+    statuses?: number[];
+}
+export interface CapacityPolicyConfig {
+    floor?: number;
+    discoverySlots?: number;
+    ownerSlots?: number;
+}
+export interface UrlsPolicyConfig {
+    envSuffixes?: Record<string, string>;
+    issuePath?: string;
+    ideaPath?: string;
+    inboxPath?: string;
+}
+export interface DiscoverPolicyConfig {
+    platformSuffixes?: Record<string, string[]>;
+    platformPatterns?: Record<string, string[]>;
+    scores?: Record<string, number>;
+    starDivisor?: number;
+    starCap?: number;
+    skipArchived?: boolean;
+    stackMap?: Record<string, string>;
+    stackPlatform?: Record<string, string>;
+    stackPlatformDefault?: string;
+    searchLimit?: number;
+    timeouts?: {
+        searchMs?: number;
+        apiMs?: number;
+        protocolMs?: number;
+        forkMs?: number;
+        forkAttempts?: number;
+        forkRetryMs?: number;
+    };
+}
+export interface GithubPolicyConfig {
+    stateMap?: {
+        merged?: string[];
+        closed?: string[];
+    };
+    mergeableMap?: {
+        mergeable?: string;
+        conflicting?: string;
+    };
+    mergeFlags?: Record<string, string>;
+    defaultMergeMethod?: string;
+    timeouts?: {
+        fetch?: number;
+        view?: number;
+        create?: number;
+        merge?: number;
+    };
+    reviewDecisions?: {
+        approved?: string;
+        changesRequested?: string;
+    };
+}
+export interface SafetyPolicyConfig {
+    protectedFiles?: string[];
+    secretPatterns?: string[];
+}
+export interface OutboxPolicyConfig {
+    maxAttempts?: number;
+    maxPerFlush?: number;
+    fifo?: boolean;
+}
+export interface BootstrapPolicyConfig {
+    stateFile?: string;
+    needsFile?: string;
+    reasonSlice?: number;
+    notifySlice?: number;
+    escalationSlice?: number;
+    agentName?: string;
+}
+export interface LoopPolicyConfig {
+    drainMs?: number;
+    stopDrainMs?: number;
+    killDrainMs?: number;
+    drainSliceMs?: number;
+    truncLen?: number;
+    cacheMs?: number;
+    statusAgeMs?: number;
+    pollFloorMs?: number;
+    platformCacheMs?: number;
+    platformMaxIssues?: number;
+    platformMaxIdeas?: number;
+}
+export interface OfflinePolicyConfig {
+    /** Max PRs re-read per blocked-loop pass. */
+    maxPrs?: number;
+    /** Timeout for each repo health check. */
+    checkTimeoutMs?: number;
+    /** Case-insensitive pattern; matching checks are skipped as mutating. */
+    mutatingPattern?: string;
+    /** Task states excluded from the blocked-loop PR watch. */
+    excludedStatuses?: string[];
+}
+export interface ChecksDefaultsConfig {
+    timeoutMs?: number;
+    tailLines?: number;
+    requiredDefault?: boolean;
+}
 export interface ProfileConfig {
     ziki: ZikiConfig;
     agentProfile?: AgentProfileConfig;
@@ -303,25 +601,52 @@ export interface ProfileConfig {
     executor: ExecutorConfig;
     toolchain: Record<string, string>;
     checks: CheckSpec[];
+    checksDefaults?: ChecksDefaultsConfig;
     platformMatch: PlatformMatchConfig;
     prompts: PromptsConfig;
     pr: PrConfig;
     prTracking?: PrTrackingConfig;
     providers?: Record<string, ProviderSpec>;
     discovery: DiscoveryConfig;
+    discover?: DiscoverPolicyConfig;
     workflow: WorkflowConfig;
     limits: LimitsConfig;
     pollSeconds: number;
     memoryRefreshMinutes: number;
     hitl: HitlConfig;
-    /** Agent-driven config repair (approval-gated). Absent = defaults apply. */
     repair?: RepairConfig;
+    /** Status vocabulary (see ZikiStatusesConfig). Merged from defaults; human-written. */
+    statuses?: ZikiStatusesConfig;
+    /** Backoff overrides per blocker code (see HealthTuningConfig). */
+    health?: HealthTuningConfig;
+    /** Timing policy for every interval/timeout (see TimingConfig). */
+    timing?: TimingConfig;
+    /** Transport behavior (auth scheme, user agent, timeouts). v4: required. */
+    transport?: TransportConfig;
+    /** Per-operation method/query/body/pagination. v4: required. */
+    operations?: Record<string, Record<string, OperationConfig>>;
+    queue?: QueuePolicyConfig;
+    reviewGate?: ReviewGatePolicyConfig;
+    heartbeatPolicy?: HeartbeatPolicyConfig;
+    decisions?: DecisionsPolicyConfig;
+    noop?: NoopPolicyConfig;
+    votes?: VotesPolicyConfig;
+    idea?: IdeaPolicyConfig;
+    apiRepair?: ApiRepairPolicyConfig;
+    capacity?: CapacityPolicyConfig;
+    urls?: UrlsPolicyConfig;
+    github?: GithubPolicyConfig;
+    safety?: SafetyPolicyConfig;
+    outbox?: OutboxPolicyConfig;
+    bootstrap?: BootstrapPolicyConfig;
+    loop?: LoopPolicyConfig;
+    offline?: OfflinePolicyConfig;
 }
 export interface DoctorConfig {
     minFreeGb?: number;
 }
 export interface Config {
-    version: 3;
+    version: 3 | 4;
     activeProfile: string;
     defaults?: Partial<ProfileConfig>;
     profiles: Record<string, ProfileConfig>;
@@ -517,7 +842,7 @@ export interface ResearchJob {
     [key: string]: unknown;
 }
 export interface OwnerDecision {
-    kind: "confirm" | "merge";
+    kind: string;
     answer: boolean;
     text: string;
     at?: string;
@@ -653,7 +978,7 @@ export interface TaskState {
     lastError?: string | null;
     prNumber?: number;
     prState?: string;
-    prChecks?: "passing" | "failing" | "pending" | "none";
+    prChecks?: string;
     prMergeable?: boolean | null;
     prReviewDecision?: string | null;
     prLastCheckedAt?: string;
@@ -730,10 +1055,37 @@ export interface State {
     lastRun: RunSummary | null;
     activePids: number[];
     health: LoopHealth;
+    /**
+     * Writes that could not reach Ziki (outage/blocked project), queued FIFO
+     * for the flush pass once the loop is healthy again. Tombstoned on success;
+     * dropped with a history note after too many failed attempts. Never holds
+     * secrets — only API payloads the loop would have sent anyway.
+     */
+    outbox?: OutboxQueue;
+    /** Last ISO timestamps for the blocked-loop background passes. */
+    lastOfflineWatchAt?: string | null;
+    lastRepoHealthAt?: string | null;
+}
+export type OutboxKind = "createIdea" | "reportPrStatus" | "reportDeployment";
+export interface OutboxEntry {
+    id: string;
+    kind: OutboxKind;
+    /** Exact body the live call would have sent. */
+    body: Record<string, unknown>;
+    issueId?: string | null;
+    issueNumber?: number | string | null;
+    title?: string | null;
+    addedAt: string;
+    attempts: number;
+    lastError?: string | null;
+}
+export interface OutboxQueue {
+    items: OutboxEntry[];
+    failed: OutboxEntry[];
 }
 export interface HistoryEntry {
     at: string;
-    type: "claim" | "bid" | "award" | "accept" | "delivery" | "review" | "merge_review" | "discovery" | "aux" | "escalation" | "failure" | "decision" | "unsupported" | "health" | "stop";
+    type: "claim" | "bid" | "award" | "accept" | "delivery" | "review" | "merge_review" | "discovery" | "aux" | "escalation" | "failure" | "decision" | "unsupported" | "health" | "outbox" | "stop";
     issue?: number | string | null;
     idea?: number | string | null;
     detail?: string;

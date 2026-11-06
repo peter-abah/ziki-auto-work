@@ -42,6 +42,16 @@ against an allowlist and only persists it after the human approves.
 
 {{resultInstruction}}
 
+Then, regardless of the instruction above, also print exactly one line to stdout:
+
+```
+AW_RESULT_JSON: {"ok": true, "summary": "...", "configPatch": [...], "notes": "..."}
+```
+
+with the same object. The orchestrator parses that marker line first, so print
+it even when you also wrote the file — it is how your answer survives a missed
+file write. The marker line must be a single line (no newlines inside the JSON).
+
 ```json
 {
   "ok": true,

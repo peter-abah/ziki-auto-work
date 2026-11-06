@@ -2,8 +2,9 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULT_PR_TRACKING, loadProfile, resolveMergeMethod, resolveMergeMode, resolveParityFile, resolveRunLimits, validateConfigPatch } from "./config.js";
+import { loadProfile, resolveMergeMethod, resolveMergeMode, resolveParityFile, resolveRunLimits, validateConfigPatch } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
+import { runCommand } from "./platform/spawn.js";
 import { acquireLock, releaseLock, loadState, saveState, writePid, clearPid, isPaused, isStopped, counterFor, setTask, taskKey, pruneState, appendHistory, isAlive } from "./state.js";
 import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
@@ -22,30 +23,175 @@ import { escalate, markEscalationExpired, poll, writeNeedsHuman } from "./hitl.j
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { rotatedKinds } from "./fair-queue.js";
 import { countGoodVerdicts, reviewGate, verdictsNeeded } from "./review-gate.js";
-import { errorMessage, isNoopZikiError, NOOP_PATTERNS } from "./noop.js";
-import { scanSecrets, protectedFiles } from "./checks.js";
+import { errorMessage, isNoopZikiError, noopPatterns } from "./noop.js";
+import { scanSecrets } from "./checks.js";
+import { effectiveProtectedFiles } from "./rules.js";
 import { PACKAGE_ROOT, paths, safeName } from "./platform/paths.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
 import { notifyProfile } from "./notify.js";
 import { isTransientNetworkError } from "./network.js";
+import { flushOutbox, queueOutbox } from "./outbox.js";
 import { formatLiveDuration, formatLiveTask, LiveStatus } from "./live-status.js";
 import { buildRunSummary, formatRunSummary, writeRunSummary } from "./run-report.js";
 import { addUsage, emptyUsage, formatTokens, usagePercent } from "./usage.js";
 import { resolveCapacity } from "./capacity.js";
-import { applyConfigPatch, blockerCode, consumeLocalApprovals, diagnoseProjectMismatch, diagnoseUnknownFilter, formatRepairEscalationBody, isProjectNotFoundBlocker, latestStrategyEscalation, maxRoundsFor, projectRotationPatch, repairConfigFor, strategyFor } from "./config-repair.js";
+import { applyConfigPatch, blockerCode, consumeLocalApprovals, diagnoseMissingKeys, diagnoseProjectMismatch, diagnoseUnknownEndpoint, diagnoseUnknownFilter, diagnoseUnknownKind, diagnoseUnknownVocabulary, parseUnknownEndpoint, formatRepairEscalationBody, isProjectNotFoundBlocker, latestStrategyEscalation, maxRoundsFor, repairConfigFor, strategyFor, supersedingPaths } from "./config-repair.js";
 import { APPROVAL_WORD } from "./hitl.js";
 import { cyclesThisRun, limitReached, remainingCycles } from "./run-limits.js";
 import { mergeWorkItemFeeds } from "./feed.js";
 import { mergeGateReason } from "./merge.js";
 import { deploymentEnvironment, workTargetKey } from "./work-key.js";
-import { applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue } from "./heartbeat.js";
-import { blockerId, classifyError, clearBlocker, healthLabel, nextRetryDelay, reportBlocker, summarizeHealth } from "./health.js";
+import { applyHeartbeatFailure, applyHeartbeatSuccess, heartbeatDue, resolveHeartbeatIntervalMs } from "./heartbeat.js";
+import { blockerId, classifyError, clearBlocker, healthLabel, nextRetryDelay, reportBlocker, retryMsFor, summarizeHealth } from "./health.js";
 import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
 import { formatLoopContext } from "./loop-context.js";
-import { sanitizeIdeaSummary } from "./idea-input.js";
-const WORKABLE = new Set(["requires_confirmation", "open", "in_progress"]);
-const TERMINAL = new Set(["resolved", "closed"]);
+import { ideaPolicyLimits, sanitizeIdeaSummary } from "./idea-input.js";
+function requireStatusList(profile, key) {
+    const value = profile.statuses?.[key];
+    if (!Array.isArray(value) || !value.length || !value.every((entry) => typeof entry === "string")) {
+        throw new Error(`profile.statuses.${key} must be a non-empty string array (run \`auto-work migrate\`)`);
+    }
+    return new Set(value);
+}
+function workableStatuses(profile) {
+    return requireStatusList(profile, "workable");
+}
+function terminalStatuses(profile) {
+    return requireStatusList(profile, "terminal");
+}
+function terminalSubstatuses(profile) {
+    return requireStatusList(profile, "terminalSubstatus");
+}
+function confirmationStatuses(profile) {
+    return requireStatusList(profile, "confirmation");
+}
+function knownVocabulary(profile) {
+    return requireStatusList(profile, "known");
+}
+function requireStringList(value, path) {
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+        throw new Error(`${path} must be an array of strings (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function requirePositiveInt(value, path) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+        throw new Error(`${path} must be a non-negative integer (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function requireString(value, path) {
+    if (typeof value !== "string" || !value) {
+        throw new Error(`${path} must be a non-empty string (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function loopMs(profile, key) {
+    const value = profile.loop?.[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        throw new Error(`profile.loop.${key} must be a non-negative number (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function requireTimingMs(profile, key) {
+    const value = profile.timing?.[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`profile.timing.${key} must be a positive number (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function discoverStrings(profile, key) {
+    return requireStringList(profile.discovery?.[key], `profile.discovery.${key}`);
+}
+function discoverLimit(profile, key) {
+    return requirePositiveInt(profile.discovery?.[key], `profile.discovery.${key}`);
+}
+function decisionsPolicy(profile) {
+    const decisions = profile.decisions;
+    if (!decisions || typeof decisions !== "object") {
+        throw new Error("profile.decisions is required (run `auto-work migrate`)");
+    }
+    return {
+        candidateStatuses: requireStringList(decisions.candidateStatuses, "profile.decisions.candidateStatuses"),
+        candidateSubstatuses: requireStringList(decisions.candidateSubstatuses, "profile.decisions.candidateSubstatuses"),
+        mergeStatuses: requireStringList(decisions.mergeStatuses, "profile.decisions.mergeStatuses"),
+        mergeSubstatuses: requireStringList(decisions.mergeSubstatuses, "profile.decisions.mergeSubstatuses"),
+        mergeReadyStatuses: requireStringList(decisions.mergeReadyStatuses, "profile.decisions.mergeReadyStatuses"),
+        mergeReadySubstatuses: requireStringList(decisions.mergeReadySubstatuses, "profile.decisions.mergeReadySubstatuses"),
+        keyChars: requirePositiveInt(decisions.keyChars, "profile.decisions.keyChars")
+    };
+}
+/**
+ * Surface any Ziki vocabulary we have never seen: statues, substatuses or
+ * feed kinds outside the known set. The loop keeps working on what it knows;
+ * unknown values are reported (NEEDS-HUMAN via a warning blocker) instead of
+ * being silently dropped or blindly acted on.
+ */
+async function detectUnknownVocabulary(ctx) {
+    const known = knownVocabulary(ctx.profile);
+    const unknownKinds = new Set();
+    const unknownVocab = new Set();
+    const considerKind = (value) => {
+        if (typeof value === "string" && value && !known.has(value))
+            unknownKinds.add(value);
+    };
+    const considerValue = (value) => {
+        if (typeof value === "string" && value && !known.has(value))
+            unknownVocab.add(value);
+    };
+    for (const issue of ctx.platform.issues ?? []) {
+        considerValue(issue.status);
+        considerValue(issue.substatus);
+    }
+    for (const idea of ctx.platform.ideas ?? []) {
+        considerValue(idea.status);
+    }
+    for (const entry of ctx.queue?.all ?? []) {
+        if (entry.kind)
+            considerKind(entry.kind);
+    }
+    if (!unknownKinds.size && !unknownVocab.size) {
+        await clearHealth(ctx, "platform", "unknown_kind");
+        await clearHealth(ctx, "platform", "unknown_vocabulary");
+        return;
+    }
+    if (unknownKinds.size) {
+        const values = [...unknownKinds].sort();
+        await applyHealth(ctx, {
+            component: "platform",
+            code: "unknown_kind",
+            severity: "warning",
+            message: `Unknown Ziki work kinds (not bucketed — parked in "other"): ${values.join(", ")}`,
+            details: { values },
+            retryMs: null
+        });
+    }
+    else {
+        await clearHealth(ctx, "platform", "unknown_kind");
+    }
+    if (unknownVocab.size) {
+        const values = [...unknownVocab].sort();
+        await applyHealth(ctx, {
+            component: "platform",
+            code: "unknown_vocabulary",
+            severity: "warning",
+            message: `Unknown Ziki vocabulary (not in statuses.known): ${values.join(", ")}`,
+            details: { values },
+            retryMs: null
+        });
+    }
+    else {
+        await clearHealth(ctx, "platform", "unknown_vocabulary");
+    }
+    const all = [...unknownKinds, ...unknownVocab].sort();
+    ctx.logger.warn(`Unknown Ziki vocabulary (working around it): ${all.join(", ")}`);
+    history(ctx, {
+        type: "health",
+        detail: `unknown Ziki vocabulary: ${all.join(", ")}`,
+        data: { values: all }
+    });
+}
 function setPhase(ctx, phase, activity = null) {
     if (ctx.phase === phase && ctx.activity === activity)
         return;
@@ -80,7 +226,23 @@ function trackingEnabled(profile) {
     return prTracking(profile).fixReviewComments;
 }
 function prTracking(profile) {
-    return { ...DEFAULT_PR_TRACKING, ...(profile.prTracking ?? {}) };
+    const tracking = profile.prTracking;
+    if (!tracking || typeof tracking !== "object") {
+        throw new Error("profile.prTracking is required (run `auto-work migrate`)");
+    }
+    const { enabled, pollMinutes, maxFollowUps, fixFailingChecks, fixReviewComments } = tracking;
+    if (typeof enabled !== "boolean")
+        throw new Error("profile.prTracking.enabled must be a boolean (run `auto-work migrate`)");
+    if (typeof pollMinutes !== "number" || !Number.isFinite(pollMinutes)) {
+        throw new Error("profile.prTracking.pollMinutes must be a number (run `auto-work migrate`)");
+    }
+    if (typeof maxFollowUps !== "number" || !Number.isFinite(maxFollowUps)) {
+        throw new Error("profile.prTracking.maxFollowUps must be a number (run `auto-work migrate`)");
+    }
+    if (typeof fixFailingChecks !== "boolean" || typeof fixReviewComments !== "boolean") {
+        throw new Error("profile.prTracking.fixFailingChecks/fixReviewComments must be booleans (run `auto-work migrate`)");
+    }
+    return { enabled, pollMinutes, maxFollowUps, fixFailingChecks, fixReviewComments };
 }
 function prTaskKey(task) {
     return `pr:${task.prUrl ?? task.number ?? "unknown"}`;
@@ -249,7 +411,7 @@ async function processPrFollowUp(ctx, task) {
     await save(ctx);
     const heartbeat = setInterval(() => {
         agent.client.heartbeat(issue.id).catch(() => { });
-    }, 10 * 60 * 1000);
+    }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy: ctx.profile.heartbeatPolicy, zikiWorkflow: ctx.zikiWorkflow }));
     let result;
     try {
         result = await runFollowUp({
@@ -308,7 +470,7 @@ async function processPrFollowUp(ctx, task) {
         await save(ctx);
         return;
     }
-    const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
+    const protectedHits = effectiveProtectedFiles(ctx.profile);
     if (protectedHits.length) {
         await escalatePrFollowUp(ctx, issue, task, `protected files changed: ${protectedHits.join(", ")}`);
         await save(ctx);
@@ -317,7 +479,7 @@ async function processPrFollowUp(ctx, task) {
     const diff = await ctx.github.git(["diff", "--cached", "HEAD"], { cwd: task.worktree })
         .then((output) => output.stdout)
         .catch(() => "");
-    const secretHits = scanSecrets(diff);
+    const secretHits = scanSecrets(diff, ctx.profile.safety?.secretPatterns);
     if (secretHits.length) {
         await escalatePrFollowUp(ctx, issue, task, `possible secret in follow-up: ${secretHits[0]}`);
         await save(ctx);
@@ -533,8 +695,10 @@ function agentHooks(ctx) {
 function counter(ctx) {
     return counterFor(ctx.state);
 }
-function markRecent(ctx, key, ms = 30 * 60_000) {
-    ctx.state.recentFeedKeys[key] = Date.now() - (30 * 60_000 - ms);
+function markRecent(ctx, key, ms) {
+    const configured = requireTimingMs(ctx.profile, "markRecentMs");
+    const window = ms ?? configured;
+    ctx.state.recentFeedKeys[key] = Date.now() - (configured - window);
 }
 function history(ctx, entry) {
     void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => { });
@@ -638,6 +802,251 @@ async function maybeReloadConfig(ctx, force = false) {
  * and persistence both happen here, and persistence happens only after a
  * human approval — via Ziki escalation reply or `auto-work approve`.
  */
+/** One wedged retry of the whole outbox is enough per cycle; the rest waits. */
+/**
+ * Flush queued Ziki writes FIFO once the loop is healthy again. Runs on the
+ * normal cycle path only (never while blocked). Never throws: failures stay
+ * queued for the next cycle, exhaustions move to outbox.failed with history.
+ */
+async function flushOutboxPass(ctx) {
+    if (!ctx.state.outbox?.items.length)
+        return;
+    if (ctx.dryRun) {
+        ctx.logger.info(`Dry run: would flush ${ctx.state.outbox.items.length} queued write(s)`, {
+            kinds: ctx.state.outbox.items.map((entry) => entry.kind)
+        });
+        return;
+    }
+    const knownIdeaTitles = new Set((ctx.platform.ideas ?? []).map((idea) => idea.title));
+    const result = await flushOutbox(ctx.state, ctx.primary.client, {
+        policy: ctx.profile.outbox,
+        knownIdeaTitles,
+        logger: ctx.logger,
+        onEvent: (event) => {
+            if (event.type === "flushed") {
+                counter(ctx).aux += 1;
+                history(ctx, {
+                    type: "outbox",
+                    detail: `flushed queued ${event.entry.kind}${event.entry.issueNumber ? ` #${event.entry.issueNumber}` : ""}${event.entry.title ? ` (${event.entry.title})` : ""}`.slice(0, 200),
+                    data: { kind: event.entry.kind, id: event.entry.id }
+                });
+            }
+            else if (event.type === "skipped-duplicate") {
+                history(ctx, {
+                    type: "outbox",
+                    detail: `skipped duplicate queued idea: ${event.entry.title ?? event.entry.id}`,
+                    data: { kind: event.entry.kind, id: event.entry.id }
+                });
+            }
+            else if (event.type === "dropped") {
+                history(ctx, {
+                    type: "outbox",
+                    detail: `dropped queued ${event.entry.kind} after repeated failures: ${event.error ?? "unknown error"}`,
+                    data: { kind: event.entry.kind, id: event.entry.id }
+                });
+            }
+        }
+    }).catch((error) => {
+        ctx.logger.warn(`Outbox flush failed: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+    });
+    if (!result)
+        return;
+    if (result.flushed || result.skipped) {
+        ctx.logger.info(`Outbox flush: ${result.flushed} applied, ${result.skipped} skipped as duplicates, ${result.pending} pending`);
+    }
+    await save(ctx).catch(() => { });
+}
+/** PR watch while the loop is blocked: GitHub reads only, local bookkeeping, no Ziki or Git writes. */
+function offlinePolicy(ctx) {
+    const offline = ctx.profile.offline;
+    if (!offline || typeof offline !== "object") {
+        throw new Error("profile.offline is required (run `auto-work migrate`)");
+    }
+    const { maxPrs, checkTimeoutMs, mutatingPattern, excludedStatuses } = offline;
+    if (typeof maxPrs !== "number" || !Number.isInteger(maxPrs) || maxPrs < 0) {
+        throw new Error("profile.offline.maxPrs must be a non-negative integer (run `auto-work migrate`)");
+    }
+    if (typeof checkTimeoutMs !== "number" || !Number.isFinite(checkTimeoutMs) || checkTimeoutMs <= 0) {
+        throw new Error("profile.offline.checkTimeoutMs must be a positive number (run `auto-work migrate`)");
+    }
+    if (typeof mutatingPattern !== "string" || !mutatingPattern) {
+        throw new Error("profile.offline.mutatingPattern must be a non-empty string (run `auto-work migrate`)");
+    }
+    if (!Array.isArray(excludedStatuses) || !excludedStatuses.every((entry) => typeof entry === "string")) {
+        throw new Error("profile.offline.excludedStatuses must be an array of strings (run `auto-work migrate`)");
+    }
+    return { maxPrs, checkTimeoutMs, mutatingPattern: new RegExp(mutatingPattern, "i"), excludedStatuses };
+}
+async function offlineWatchPass(ctx) {
+    const now = Date.now();
+    const policy = offlinePolicy(ctx);
+    const intervalMs = requireTimingMs(ctx.profile, "offlineWatchMs");
+    const last = ctx.state.lastOfflineWatchAt ? new Date(ctx.state.lastOfflineWatchAt).getTime() : 0;
+    if (now - last < intervalMs)
+        return;
+    ctx.state.lastOfflineWatchAt = new Date().toISOString();
+    const freshMs = requireTimingMs(ctx.profile, "offlineFreshMs");
+    const candidates = Object.values(ctx.state.tasks)
+        .filter((task) => task.prUrl && !policy.excludedStatuses.includes(task.status))
+        .slice(0, policy.maxPrs);
+    for (const task of candidates) {
+        try {
+            if (task.prLastCheckedAt && now - new Date(task.prLastCheckedAt).getTime() < freshMs)
+                continue;
+            const status = await ctx.github.prStatus(task.prUrl);
+            const changed = task.prState !== status.state ||
+                task.prChecks !== status.checks ||
+                task.prMergeable !== status.mergeable ||
+                task.prReviewDecision !== status.reviewDecision;
+            task.prState = status.state;
+            task.prChecks = status.checks;
+            task.prMergeable = status.mergeable;
+            task.prReviewDecision = status.reviewDecision;
+            task.prLastCheckedAt = new Date().toISOString();
+            if (changed) {
+                history(ctx, {
+                    type: "health",
+                    detail: `offline PR watch: ${task.prUrl} → ${status.state}/${status.checks}`,
+                    data: { pr: task.prUrl, state: status.state, checks: status.checks, number: task.number }
+                });
+                ctx.logger.info(`Offline PR watch: ${task.prUrl} is now ${status.state}/${status.checks}`);
+            }
+        }
+        catch (error) {
+            ctx.logger.warn(`Offline PR watch failed for ${task.prUrl}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+}
+/**
+ * Repo health checks while blocked: run the configured non-mutating checks in
+ * the repo clone, record results locally. Mutating checks (format-style) are
+ * skipped — nothing may dirty the working tree outside an agent worktree.
+ * Failures surface as a *warning* health item (visible in NEEDS-HUMAN), never
+ * a blocker.
+ */
+async function repoHealthPass(ctx) {
+    if (!ctx.repoReady)
+        return;
+    const now = Date.now();
+    const policy = offlinePolicy(ctx);
+    const intervalMs = requireTimingMs(ctx.profile, "repoHealthMs");
+    const last = ctx.state.lastRepoHealthAt ? new Date(ctx.state.lastRepoHealthAt).getTime() : 0;
+    if (now - last < intervalMs)
+        return;
+    ctx.state.lastRepoHealthAt = new Date().toISOString();
+    const repoDir = path.join(ctx.profilePaths.reposDir, "repo");
+    const results = [];
+    for (const check of ctx.profile.checks ?? []) {
+        const cmdline = `${check.command} ${check.args.join(" ")}`;
+        if (policy.mutatingPattern.test(cmdline)) {
+            results.push({ name: check.name, skipped: "mutating check skipped outside agent worktrees" });
+            continue;
+        }
+        try {
+            const result = await runCommand(check.command, check.args, {
+                cwd: repoDir,
+                timeoutMs: check.timeoutMs ?? policy.checkTimeoutMs
+            });
+            results.push({ name: check.name, ok: result.ok });
+            if (!result.ok) {
+                ctx.logger.warn(`Repo health check failed: ${check.name}`, {
+                    tail: truncate(`${result.stdout}\n${result.stderr}`.trim(), 1000)
+                });
+            }
+        }
+        catch (error) {
+            results.push({ name: check.name, ok: false });
+            ctx.logger.warn(`Repo health check errored: ${check.name}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+    const failing = results.filter((result) => result.ok === false).map((result) => result.name);
+    history(ctx, {
+        type: "health",
+        detail: failing.length
+            ? `offline repo health: FAILING (${failing.join(", ")})`
+            : "offline repo health: all runnable checks pass",
+        data: { results: results.map((result) => ({ name: result.name, ok: result.ok ?? null })) }
+    });
+    if (failing.length) {
+        await applyHealth(ctx, {
+            component: "repo",
+            code: "checks_failing",
+            severity: "warning",
+            message: `Repo checks failing while blocked: ${failing.join(", ")}`,
+            retryMs: requireTimingMs(ctx.profile, "repoHealthMs")
+        });
+    }
+    else {
+        await clearHealth(ctx, "repo");
+    }
+}
+/** Parked-loop bookkeeping: PR watch + repo health, then stay blocked. Never throws. */
+async function parkBlocked(ctx) {
+    setPhase(ctx, "blocked");
+    try {
+        await offlineWatchPass(ctx);
+    }
+    catch (error) {
+        ctx.logger.warn(`Offline watch failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+        await repoHealthPass(ctx);
+    }
+    catch (error) {
+        ctx.logger.warn(`Repo health check failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+        await detectUnknownVocabulary(ctx);
+    }
+    catch (error) {
+        ctx.logger.warn(`Vocabulary drift check failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await save(ctx).catch(() => { });
+    return { blocked: true };
+}
+/**
+ * Adopt a bootstrap escalation filed while the config was broken: track it in
+ * state so the normal poll() reaps the human's answer. No strategy attached —
+ * decisions on it are informational only (nothing auto-applies without a
+ * validated configPatch, which bootstrap never creates).
+ */
+async function adoptBootstrapEscalation(state, profileName, logger) {
+    const { bootstrapFile } = await import("./bootstrap.js");
+    let record = null;
+    try {
+        const raw = await readFile(bootstrapFile(profileName), "utf8");
+        record = JSON.parse(raw);
+    }
+    catch {
+        return;
+    }
+    const id = typeof record?.escalationId === "string" && record.escalationId ? record.escalationId : null;
+    if (!id || state.escalations[id])
+        return;
+    state.escalations[id] = {
+        id,
+        issueId: null,
+        issueNumber: null,
+        issueTitle: null,
+        type: "human_approval",
+        body: `Startup needed help: ${typeof record?.reason === "string" ? record.reason.slice(0, 500) : "config missing or invalid"}`,
+        agentName: "bootstrap",
+        createdAt: new Date().toISOString(),
+        status: "open",
+        answer: typeof record?.escalationAnswer === "string" ? record.escalationAnswer : null,
+        resolvedAt: null,
+        kind: "config",
+        strategy: "bootstrap",
+        configPatch: null,
+        decision: null,
+        rounds: 1,
+        remoteStatus: "open",
+        appliedAt: null,
+        previousId: null
+    };
+    logger.info(`Adopted bootstrap escalation ${id} for answer tracking`);
+}
 async function repairBlockedLoop(ctx, code, blocker) {
     const strategy = strategyFor(ctx.profile, code);
     if (!strategy)
@@ -700,6 +1109,27 @@ async function runRepairStateMachine(ctx, code, blocker, strategy) {
                 return "wait";
             }
             return startRepairRound(ctx, code, blocker, strategy, existing);
+        }
+        // Open, awaiting the first answer. Re-diagnose: if the fresh diagnosis
+        // covers strictly more than the pending proposal (e.g. a project-ID fix
+        // now needs slugs too), supersede the stale escalation instead of
+        // waiting on an incomplete fix. Monotonic growth guarantees termination.
+        const fresh = await diagnoseForCode(ctx, code, blocker).catch(() => null);
+        const extra = fresh && !fresh.done ? supersedingPaths(existing.configPatch, fresh.ops) : null;
+        if (fresh && extra) {
+            markEscalationExpired(ctx.state, existing.id, `superseded by a deeper diagnosis (${extra.join(", ")})`);
+            history(ctx, {
+                type: "health",
+                detail: `config repair superseded with a deeper patch: ${code}`,
+                data: { previous: existing.id }
+            });
+            await save(ctx).catch(() => { });
+            return startRepairRound(ctx, code, blocker, strategy, existing, {
+                evidence: fresh.evidence,
+                ops: fresh.ops,
+                summary: fresh.summary,
+                done: null
+            });
         }
         await save(ctx).catch(() => { });
         return "wait";
@@ -805,34 +1235,121 @@ async function applyApprovedRepair(ctx, code, escalation) {
     await save(ctx).catch(() => { });
     return "continue";
 }
-/** One proposal round: deterministic diagnosis as evidence + agent proposal + escalation. */
-async function startRepairRound(ctx, code, blocker, strategy, previous) {
-    const repair = repairConfigFor(ctx.profile);
-    const maxRounds = maxRoundsFor(strategy);
-    const round = (previous?.rounds ?? 0) + 1;
+/**
+ * Deterministic diagnosis for a repair code: live reads only, no agent.
+ * Returns ops to propose plus a done flag when the diagnosis itself resolves
+ * the cycle (repair applied inline) or finds nothing actionable.
+ */
+async function diagnoseForCode(ctx, code, blocker) {
     const evidence = [
         `${code} — ${blocker.message} (attempts: ${blocker.attempts ?? "?"}, since: ${blocker.since ?? blocker.lastAttemptAt ?? "?"})`
     ];
-    let deterministicOps = [];
-    let deterministicSummary = "";
+    let ops = [];
+    let summary = "";
     const shortCode = code.includes(":") ? code.split(":").slice(1).join(":") : code;
     if (shortCode === "not_found" && code === "platform:not_found") {
         try {
             const diagnosis = await diagnoseProjectMismatch(ctx.primary.client, ctx.profile, ctx.logger);
             evidence.push(`tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`);
-            if (diagnosis.match) {
-                deterministicOps = projectRotationPatch(diagnosis.match.project, diagnosis.match.reason);
-                deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone on Ziki; matched replacement ${diagnosis.match.project.slug} (${diagnosis.match.reason}).`;
+            ops = diagnosis.ops;
+            summary = diagnosis.detail;
+        }
+        catch (error) {
+            summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+    }
+    else if (code === "feed:unexpected_response_shape") {
+        try {
+            const diagnosis = await diagnoseProjectMismatch(ctx.primary.client, ctx.profile, ctx.logger);
+            evidence.push(`tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`);
+            if (!diagnosis.ops.length) {
+                ctx.logger.warn(`Feed shape check failed but project identity matches; leaving the warning up for investigation: ${code}`);
+                history(ctx, {
+                    type: "health",
+                    detail: `feed shape failure with matching identity (no automatic fix): ${code}`,
+                    data: {}
+                });
+                await save(ctx).catch(() => { });
+                return { evidence, ops, summary, done: "wait" };
             }
-            else if (diagnosis.ambiguous?.length) {
-                deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone; ${diagnosis.ambiguous.length} candidates need a human pick — no automatic proposal.`;
+            ops = diagnosis.ops;
+            summary = `Work feed is unreachable in its expected shape; ${diagnosis.detail}`;
+        }
+        catch (error) {
+            summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+    }
+    else if (shortCode === "missing_key" && code.startsWith("config:")) {
+        try {
+            const { loadInitTemplates } = await import("./config-templates.js");
+            const templates = await loadInitTemplates();
+            const diagnosis = diagnoseMissingKeys(ctx.profile, templates);
+            evidence.push(`template comparison: ${diagnosis.summary}`);
+            ops = diagnosis.ops;
+            summary = diagnosis.summary;
+        }
+        catch (error) {
+            summary = `Missing-key diagnosis failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+    }
+    else if (code === "config:unknown_endpoint") {
+        try {
+            const parsed = parseUnknownEndpoint(blocker.message);
+            if (!parsed) {
+                summary = "Could not parse the unknown endpoint from the failure; a human must map the route.";
             }
             else {
-                deterministicSummary = `Project ${ctx.profile.ziki.projectId} is gone; no tenant project matches platform "${ctx.profile.ziki.platform}".`;
+                const { loadInitTemplates } = await import("./config-templates.js");
+                const templates = await loadInitTemplates();
+                const diagnosis = diagnoseUnknownEndpoint(parsed.group, parsed.name, ctx.profile, templates);
+                evidence.push(`template endpoint check: ${parsed.group}.${parsed.name}`);
+                ops = diagnosis.ops;
+                summary = diagnosis.summary;
             }
         }
         catch (error) {
-            deterministicSummary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+            summary = `Unknown-endpoint diagnosis failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+    }
+    else if (shortCode === "unknown_kind") {
+        const values = blocker.details?.values;
+        const kinds = Array.isArray(values) ? values.filter((value) => typeof value === "string") : [];
+        if (!kinds.length) {
+            summary = "Unknown-kind warning carries no values; nothing to propose.";
+        }
+        else {
+            const allOps = [];
+            for (const kind of kinds) {
+                allOps.push(...diagnoseUnknownKind(kind, ctx.profile).ops);
+            }
+            // One bucket-array op wins (append all kinds at once, not one op per kind).
+            const priorityOps = allOps.filter((op) => op.path.startsWith("queue.priorities."));
+            const auxKinds = kinds.filter((kind) => {
+                const aux = ctx.profile.queue?.buckets?.aux;
+                return !(Array.isArray(aux) && aux.includes(kind));
+            });
+            ops = priorityOps;
+            if (auxKinds.length) {
+                const aux = Array.isArray(ctx.profile.queue?.buckets?.aux) ? [...ctx.profile.queue.buckets.aux] : [];
+                ops.push({
+                    path: "queue.buckets.aux",
+                    value: [...aux, ...auxKinds],
+                    reason: `new Ziki kinds (${auxKinds.join(", ")}) queue as auxiliary work until triaged`
+                });
+            }
+            summary = `Ziki reports ${kinds.length} unknown work kind(s): ${kinds.join(", ")}.`;
+        }
+    }
+    else if (shortCode === "unknown_vocabulary") {
+        const values = blocker.details?.values;
+        const words = Array.isArray(values) ? values.filter((value) => typeof value === "string") : [];
+        if (!words.length) {
+            summary = "Unknown-vocabulary warning carries no values; nothing to propose.";
+        }
+        else {
+            const diagnosis = diagnoseUnknownVocabulary(words, ctx.profile);
+            ops = diagnosis.ops;
+            summary = diagnosis.summary;
         }
     }
     else if (shortCode === "unknown_filter") {
@@ -844,18 +1361,32 @@ async function startRepairRound(ctx, code, blocker, strategy, previous) {
                 ctx.logger.info(`Platform filter "${diagnosis.current}" resolves again; clearing ${code}`);
                 history(ctx, { type: "health", detail: `config warning cleared: ${code}`, data: {} });
                 await save(ctx).catch(() => { });
-                return "continue";
+                return { evidence, ops, summary, done: "continue" };
             }
-            deterministicOps = diagnosis.suggested;
-            deterministicSummary = diagnosis.reason;
+            ops = diagnosis.suggested;
+            summary = diagnosis.reason;
         }
         catch (error) {
-            deterministicSummary = `Platform list lookup failed: ${error instanceof Error ? error.message : String(error)}`;
+            summary = `Platform list lookup failed: ${error instanceof Error ? error.message : String(error)}`;
         }
     }
     else {
-        deterministicSummary = `No deterministic diagnosis for ${code}; relying on the agent proposal.`;
+        summary = `No deterministic diagnosis for ${code}; relying on the agent proposal.`;
     }
+    return { evidence, ops, summary, done: null };
+}
+/** One proposal round: deterministic diagnosis as evidence + agent proposal + escalation. */
+async function startRepairRound(ctx, code, blocker, strategy, previous, precomputed) {
+    const repair = repairConfigFor(ctx.profile);
+    const maxRounds = maxRoundsFor(strategy);
+    const round = (previous?.rounds ?? 0) + 1;
+    const diagnosed = precomputed ?? (await diagnoseForCode(ctx, code, blocker));
+    if (diagnosed.done === "continue")
+        return "continue";
+    if (diagnosed.done === "wait")
+        return "wait";
+    const { evidence, summary: deterministicSummary } = diagnosed;
+    let deterministicOps = diagnosed.ops;
     if (ctx.dryRun) {
         ctx.logger.info(`Dry run: config-repair round ${round}/${maxRounds} for ${code} (no agent, no escalation)`, {
             deterministicOps,
@@ -907,7 +1438,9 @@ async function startRepairRound(ctx, code, blocker, strategy, previous) {
         previousId: previous?.id ?? null,
         rounds: round,
         body,
-        agentName: "config-doctor"
+        // Attribute to the posting agent identity so hitl.poll() resolves the
+        // right client for answers — never a synthetic role name.
+        agentName: ctx.primary.name
     });
     if (!escalated.ok) {
         ctx.logger.warn(`Config-repair escalation failed: ${escalated.error ?? "unknown error"}`);
@@ -930,6 +1463,29 @@ async function runRepairDoctor(ctx, code, blocker, evidence, previous) {
     const repair = repairConfigFor(ctx.profile);
     const loopContext = await loopContextFor(ctx, {}).catch(() => "(loop context unavailable)");
     const hooks = agentHooks(ctx);
+    const shortCode = code.includes(":") ? code.split(":").slice(1).join(":") : code;
+    // The agent only sees the sections relevant to the failure — the full
+    // config never leaves the loop. New codes add their sections here.
+    const sliceForCode = {
+        unknown_kind: (profile) => ({ queue: profile.queue }),
+        unknown_vocabulary: (profile) => ({ statuses: profile.statuses, queue: profile.queue }),
+        missing_key: (profile) => ({
+            ziki: profile.ziki,
+            transport: profile.transport,
+            operations: profile.operations,
+            timing: profile.timing,
+            loop: profile.loop,
+            outbox: profile.outbox,
+            queue: profile.queue,
+            statuses: profile.statuses
+        }),
+        unknown_endpoint: (profile) => ({
+            ziki: profile.ziki,
+            operations: profile.operations,
+            transport: profile.transport
+        })
+    };
+    const sliceFn = sliceForCode[shortCode] ?? sliceForCode[code];
     const result = await runConfigDoctor({
         profile: ctx.profile,
         profilePaths: ctx.profilePaths,
@@ -938,12 +1494,14 @@ async function runRepairDoctor(ctx, code, blocker, evidence, previous) {
         failureMessage: blocker.message,
         attempts: blocker.attempts ?? 0,
         evidence: evidence.join("\n"),
-        configSlice: {
-            ziki: ctx.profile.ziki,
-            discovery: ctx.profile.discovery,
-            pollSeconds: ctx.profile.pollSeconds,
-            memoryRefreshMinutes: ctx.profile.memoryRefreshMinutes
-        },
+        configSlice: sliceFn
+            ? sliceFn(ctx.profile)
+            : {
+                ziki: ctx.profile.ziki,
+                discovery: ctx.profile.discovery,
+                pollSeconds: ctx.profile.pollSeconds,
+                memoryRefreshMinutes: ctx.profile.memoryRefreshMinutes
+            },
         mutablePaths: repair.mutablePaths,
         allowNewKeys: repair.allowNewKeys,
         previousAnswer: previous?.answer ?? null,
@@ -966,7 +1524,7 @@ async function runRepairDoctor(ctx, code, blocker, evidence, previous) {
 async function recordFeedHealth(ctx, failures) {
     const groups = new Map();
     for (const failure of failures) {
-        const report = classifyError(failure.error, "feed");
+        const report = classifyError(failure.error, "feed", ctx.profile);
         const key = blockerId(report.component, report.code);
         const group = groups.get(key);
         if (!group) {
@@ -1031,7 +1589,7 @@ async function handleProviderLimit(ctx, result) {
             code: "quota",
             severity: "blocked",
             message: "The provider account has no quota/credits left.",
-            retryMs: 5 * 60_000
+            retryMs: retryMsFor(ctx.profile, "provider:quota")
         });
         if (!ctx.providerLimitNotified) {
             ctx.providerLimitNotified = true;
@@ -1047,7 +1605,7 @@ async function handleProviderLimit(ctx, result) {
             code: "rate_limit",
             severity: "degraded",
             message: "The provider rate limit was hit; waiting before retrying.",
-            retryMs: minutes * 60_000
+            retryMs: retryMsFor(ctx.profile, "provider:rate_limit")
         });
         ctx.rateLimitUntil = Date.now() + minutes * 60 * 1000;
         ctx.logger.warn(`Provider rate limit hit; backing off ${minutes} minutes (${ctx.rateLimitCount}/3)`);
@@ -1149,7 +1707,7 @@ async function loopContextFor(ctx, options = {}) {
         };
     }
     const task = issue ? ctx.state.tasks[taskKey(issue)] ?? null : null;
-    const decisions = parseOwnerDecisions(issue?.comments);
+    const decisions = parseOwnerDecisions(issue?.comments, ctx.profile.decisions);
     const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
     const available = (ctx.queue?.all ?? []).slice(0, 8).map((entry) => `${entry.kind} #${entry.issueNumber ?? entry.ideaNumber ?? "?"} ${truncate(entry.title, 80)}`);
     const blocked = [
@@ -1457,13 +2015,13 @@ async function loadPlatformSets(ctx) {
             cached = null;
         }
     }
-    if (cached?.fetchedAt && Date.now() - new Date(cached.fetchedAt).getTime() < 10 * 60 * 1000) {
+    if (cached?.fetchedAt && Date.now() - new Date(cached.fetchedAt).getTime() < loopMs(ctx.profile, "platformCacheMs")) {
         return cached;
     }
     try {
         const [issues, ideas] = await Promise.all([
-            ctx.primary.client.listAllIssues({ platform: apiPlatformFilter(ctx.profile), max: 2000 }),
-            ctx.primary.client.listAllIdeas({ platform: apiPlatformFilter(ctx.profile), max: 1000 })
+            ctx.primary.client.listAllIssues({ platform: apiPlatformFilter(ctx.profile), max: loopMs(ctx.profile, "platformMaxIssues") }),
+            ctx.primary.client.listAllIdeas({ platform: apiPlatformFilter(ctx.profile), max: loopMs(ctx.profile, "platformMaxIdeas") })
         ]);
         const data = {
             fetchedAt: new Date().toISOString(),
@@ -1482,31 +2040,33 @@ async function loadPlatformSets(ctx) {
     }
     catch (error) {
         ctx.logger.warn(`Platform set refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-        await applyHealth(ctx, classifyError(error, "platform"));
+        await applyHealth(ctx, classifyError(error, "platform", ctx.profile));
         return cached ?? { fetchedAt: null, issues: [], ideas: [] };
     }
 }
 async function heartbeatPass(ctx) {
     const now = Date.now();
-    const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now));
+    const policy = ctx.profile.heartbeatPolicy;
+    const intervalMs = resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy, zikiWorkflow: ctx.zikiWorkflow });
+    const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now, intervalMs, policy));
     if (!live.length)
         return;
     const results = await Promise.allSettled(live.map(async (task) => {
         const agent = clientByName(ctx, task.agentName);
         if (!agent || !task.id)
             throw new Error("agent key is not available");
-        await agent.client.heartbeat(task.id, { timeoutMs: 15_000, retries: 0, maxRetryAfterMs: 15_000 });
+        await agent.client.heartbeat(task.id);
         return { task, agent };
     }));
     for (let index = 0; index < results.length; index += 1) {
         const task = live[index];
         const result = results[index];
         if (result.status === "fulfilled") {
-            applyHeartbeatSuccess(task, now);
+            applyHeartbeatSuccess(task, now, intervalMs);
             ctx.logger.info(`Heartbeat #${task.number}`, { agent: result.value.agent.name });
             continue;
         }
-        const failure = applyHeartbeatFailure(task, result.reason, now);
+        const failure = applyHeartbeatFailure(task, result.reason, now, policy);
         const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
         ctx.logger.warn(`Heartbeat failed for #${task.number}: ${message}`, {
             claimLost: failure.claimLost,
@@ -1598,7 +2158,11 @@ async function processWorkItem(ctx, item, preferredWorker) {
     if (!issue)
         return;
     const existingTask = ctx.state.tasks[taskKey(issue)] ?? null;
-    const terminalStatus = TERMINAL.has(issue.status) || ["done", "merge", "accepted"].includes(issue.status) || ["done", "merge"].includes(issue.substatus);
+    const terminal = terminalStatuses(ctx.profile);
+    const terminalSub = terminalSubstatuses(ctx.profile);
+    const terminalStatus = terminal.has(issue.status) ||
+        terminal.has(issue.substatus) ||
+        (typeof issue.substatus === "string" && terminalSub.has(issue.substatus));
     if (issue.pullRequestUrl) {
         if (issue.holder && issue.holder.status === "active" && !isOurAgent(ctx, issue.holder.agentName)) {
             markRecent(ctx, item.key);
@@ -1649,7 +2213,8 @@ async function processWorkItem(ctx, item, preferredWorker) {
         markRecent(ctx, item.key);
         return;
     }
-    if (!WORKABLE.has(issue.substatus) && !WORKABLE.has(issue.status)) {
+    const workable = workableStatuses(ctx.profile);
+    if (!workable.has(issue.substatus) && !workable.has(issue.status)) {
         markRecent(ctx, item.key);
         return;
     }
@@ -1683,7 +2248,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
         .join("\n\n") || "(none)";
     const heartbeat = setInterval(() => {
         worker.client.heartbeat(issue.id).catch(() => { });
-    }, 10 * 60 * 1000);
+    }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy: ctx.profile.heartbeatPolicy, zikiWorkflow: ctx.zikiWorkflow }));
     let result;
     try {
         result = await runWorker({
@@ -1737,7 +2302,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
     if (diffStats.total > ctx.profile.workflow.maxLines) {
         return handleWorkFailure(ctx, issue, item, { error: `change is ${diffStats.total} lines (max ${ctx.profile.workflow.maxLines})` }, worker, dir);
     }
-    const protectedHits = protectedFiles(changed, ctx.profile.repo.protectedFiles);
+    const protectedHits = effectiveProtectedFiles(ctx.profile);
     if (protectedHits.length) {
         return handleWorkFailure(ctx, issue, item, { error: `protected files changed: ${protectedHits.join(", ")}` }, worker, dir);
     }
@@ -1745,7 +2310,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
         .git(["diff", "--cached", `upstream/${ctx.profile.repo.base}`], { cwd: dir })
         .then((output) => output.stdout)
         .catch(() => "");
-    const secretHits = scanSecrets(diff);
+    const secretHits = scanSecrets(diff, ctx.profile.safety?.secretPatterns);
     if (secretHits.length) {
         return handleWorkFailure(ctx, issue, item, { error: `possible secret in diff: ${secretHits[0]}` }, worker, dir);
     }
@@ -1926,7 +2491,7 @@ async function handleWorkFailure(ctx, issue, item, result, worker, dir) {
     await save(ctx);
 }
 async function ensureReady(ctx, issue) {
-    if (issue.substatus === "requires_confirmation") {
+    if (issue.substatus && confirmationStatuses(ctx.profile).has(issue.substatus)) {
         const confirmer = pickManagerOrWorker(ctx);
         if (!confirmer)
             return false;
@@ -1982,9 +2547,11 @@ async function ensureReady(ctx, issue) {
         markRecent(ctx, `confirm:${issue.id}`);
         return false;
     }
-    if (issue.status === "open" || issue.substatus === "open")
+    if (issue.status && workableStatuses(ctx.profile).has(issue.status))
         return true;
-    return issue.status === "in_progress" || issue.substatus === "in_progress";
+    if (issue.substatus && workableStatuses(ctx.profile).has(issue.substatus))
+        return true;
+    return false;
 }
 async function ensureBidAndAward(ctx, issue, preferred) {
     const worker = preferred ?? pickWorker(ctx);
@@ -2089,9 +2656,10 @@ async function processTestFix(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return;
     }
-    const reviewable = issue.status === "done" ||
-        ["requires_review", "accepted"].includes(issue.substatus) ||
-        ["done", "accepted"].includes(issue.status);
+    const gatePolicy = ctx.profile.reviewGate;
+    const reviewableStatuses = new Set(requireStringList(gatePolicy?.reviewableStatuses, "profile.reviewGate.reviewableStatuses"));
+    const reviewableSubstatuses = new Set(requireStringList(gatePolicy?.reviewableSubstatuses, "profile.reviewGate.reviewableSubstatuses"));
+    const reviewable = reviewableStatuses.has(issue.status) || reviewableSubstatuses.has(issue.substatus);
     if (!reviewable) {
         ctx.logger.info(`Skipping review of #${issue.number}: it is ${issue.status}/${issue.substatus}, not awaiting review`);
         markRecent(ctx, item.key);
@@ -2115,7 +2683,8 @@ async function processTestFix(ctx, item, preferred) {
     const gate = reviewGate({
         status,
         goodVerdicts,
-        verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow)
+        verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow, ctx.profile.reviewGate?.workflowKeys),
+        policy: ctx.profile.reviewGate ?? {}
     });
     if (!gate.ok || !status) {
         ctx.logger.info(`Skipping review of #${issue.number}: ${gate.reason}`);
@@ -2178,7 +2747,7 @@ async function processTestFix(ctx, item, preferred) {
         });
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.review)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "review"), ctx.profile.noop)) {
             ctx.logger.info(`Review of #${issue.number} is no longer needed: ${errorMessage(error)}`);
             history(ctx, { type: "decision", issue: issue.number, detail: `review skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
@@ -2389,9 +2958,9 @@ async function processDeploymentReport(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    const environment = deploymentEnvironment(item.key);
+    const environment = deploymentEnvironment(item.key, ctx.profile.urls);
     if (!environment) {
-        ctx.logger.warn(`Deployment report for #${issue.number} has no on_dev/on_staging/on_prod key suffix; skipping`);
+        ctx.logger.warn(`Deployment report for #${issue.number} has no known environment key suffix; skipping`);
         markRecent(ctx, item.key);
         return false;
     }
@@ -2442,7 +3011,7 @@ async function processBidVote(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    const policy = resolveVotePolicy(ctx.profile.workflow.autoVoteBids);
+    const policy = resolveVotePolicy(ctx.profile.workflow.autoVoteBids, ctx.profile.votes);
     if (policy === "off") {
         history(ctx, { type: "aux", issue: item.issueNumber, detail: "bid vote skipped: autoVoteBids is off" });
         markRecent(ctx, item.key);
@@ -2452,7 +3021,7 @@ async function processBidVote(ctx, item, preferred) {
     if (!voter)
         return false;
     if (policy === "heuristic") {
-        if (!heuristicBidVote(item.detail)) {
+        if (!heuristicBidVote(item.detail, ctx.profile.votes)) {
             markRecent(ctx, item.key);
             return false;
         }
@@ -2536,7 +3105,7 @@ async function processCommentUpvote(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    const policy = resolveVotePolicy(ctx.profile.workflow.autoUpvoteComments);
+    const policy = resolveVotePolicy(ctx.profile.workflow.autoUpvoteComments, ctx.profile.votes);
     if (policy === "off") {
         history(ctx, { type: "aux", issue: item.issueNumber, detail: "comment vote skipped: autoUpvoteComments is off" });
         markRecent(ctx, item.key);
@@ -2546,7 +3115,7 @@ async function processCommentUpvote(ctx, item, preferred) {
     if (!voter)
         return false;
     if (policy === "heuristic") {
-        if (!heuristicCommentVote(item.detail)) {
+        if (!heuristicCommentVote(item.detail, ctx.profile.votes)) {
             markRecent(ctx, item.key);
             return false;
         }
@@ -2700,7 +3269,7 @@ async function processIdeaVerdict(ctx, item, preferred) {
 async function processConfirm(ctx, item, preferred) {
     const data = await ctx.primary.client.getIssue(item.issueId ?? item.issueNumber ?? "");
     const issue = normalizeIssue(data);
-    if (!issue || issue.substatus !== "requires_confirmation") {
+    if (!issue || !issue.substatus || !confirmationStatuses(ctx.profile).has(issue.substatus)) {
         markRecent(ctx, item.key);
         return false;
     }
@@ -2776,7 +3345,8 @@ async function processOpenIssue(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    if (issue.status !== "requires_confirmation" && issue.substatus !== "requires_confirmation") {
+    const awaiting = confirmationStatuses(ctx.profile);
+    if (!awaiting.has(issue.status) && !awaiting.has(issue.substatus)) {
         history(ctx, { type: "decision", issue: issue.number, detail: "open skipped: issue is not awaiting confirmation" });
         markRecent(ctx, item.key);
         return false;
@@ -2785,7 +3355,7 @@ async function processOpenIssue(ctx, item, preferred) {
         await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.open)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "open"), ctx.profile.noop)) {
             history(ctx, { type: "decision", issue: issue.number, detail: `open skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
             return false;
@@ -2821,7 +3391,7 @@ async function processReclaim(ctx, item, preferred) {
         await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.reclaim)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "reclaim"), ctx.profile.noop)) {
             history(ctx, { type: "decision", issue: issue.number, detail: `reclaim skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
             return false;
@@ -3325,7 +3895,7 @@ async function processReviewIdle(ctx, item, preferred) {
         await manager.client.reclaim(issue.id);
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.reclaim)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "reclaim"), ctx.profile.noop)) {
             history(ctx, { type: "decision", issue: issue.number, detail: `idle reclaim skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
             return false;
@@ -3410,7 +3980,13 @@ async function processMergeFix(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return true;
     }
-    const zikiReady = issue.status === "merge" || issue.status === "accepted" || issue.substatus === "ready_to_merge" || issue.substatus === "accepted";
+    const mergePolicy = decisionsPolicy(ctx.profile);
+    const mergeReady = (list, value) => new Set(list).has(value);
+    const zikiReady = mergeReady(mergePolicy.mergeReadyStatuses, issue.status) ||
+        mergeReady(mergePolicy.mergeReadySubstatuses, issue.substatus);
+    const reviewGate = ctx.profile.reviewGate;
+    const reviewDecisions = ctx.profile.github?.reviewDecisions;
+    const approvedDecision = requireString(reviewDecisions?.approved, "profile.github.reviewDecisions.approved");
     const gate = mergeGateReason({
         zikiReady,
         checks: status.checks,
@@ -3418,8 +3994,15 @@ async function processMergeFix(ctx, item, preferred) {
         merged: status.merged,
         state: status.state,
         reviewDecision: status.reviewDecision,
-        approvedReviews: status.reviews.filter((review) => review.state === "APPROVED").length,
-        requiredReviewers: ctx.profile.repo.requiredReviewers?.length ?? 0
+        approvedReviews: status.reviews.filter((review) => review.state === approvedDecision).length,
+        requiredReviewers: ctx.profile.repo.requiredReviewers?.length ?? 0,
+        policy: {
+            openState: requireString(reviewGate?.openState, "profile.reviewGate.openState"),
+            passingChecks: requireString(reviewGate?.checkStates?.passing, "profile.reviewGate.checkStates.passing"),
+            noneChecks: requireString(reviewGate?.checkStates?.none, "profile.reviewGate.checkStates.none"),
+            changesRequested: requireString(reviewDecisions?.changesRequested, "profile.github.reviewDecisions.changesRequested"),
+            approved: approvedDecision
+        }
     });
     if (gate) {
         ctx.logger.info(`merge_fix for #${issue.number} held: ${gate} (checks=${status.checks}, mergeable=${String(status.mergeable)}, review=${String(status.reviewDecision)})`);
@@ -3450,28 +4033,32 @@ async function discoveryPass(ctx) {
     const runCycles = cyclesThisRun(ctx.state);
     if (runCycles <= 0 || runCycles % every !== 0)
         return;
+    const existingStatuses = new Set(discoverStrings(ctx.profile, "existingStatuses"));
+    const mergedStatuses = new Set(discoverStrings(ctx.profile, "recentMergedStatuses"));
+    const mergedSubstatuses = new Set(discoverStrings(ctx.profile, "recentMergedSubstatuses"));
     const existing = (ctx.platform.issues ?? [])
-        .filter((issue) => ["open", "in_progress", "done", "merge", "resolved", "closed"].includes(issue.status))
-        .slice(0, 300)
+        .filter((issue) => existingStatuses.has(issue.status))
+        .slice(0, discoverLimit(ctx.profile, "contextIssueLimit"))
         .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
         .join("\n");
     const existingIdeas = (ctx.platform.ideas ?? [])
-        .slice(0, 300)
+        .slice(0, discoverLimit(ctx.profile, "contextIssueLimit"))
         .map((idea) => `#${idea.number} ${idea.title} [${idea.status}]`)
         .join("\n");
     const recentMerged = (ctx.platform.issues ?? [])
-        .filter((issue) => ["resolved", "closed"].includes(issue.status) || ["on_dev", "on_staging", "on_prod"].includes(issue.substatus))
-        .slice(0, 60)
+        .filter((issue) => mergedStatuses.has(issue.status) || mergedSubstatuses.has(issue.substatus))
+        .slice(0, discoverLimit(ctx.profile, "contextMergedLimit"))
         .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
         .join("\n");
+    const taskLimit = discoverLimit(ctx.profile, "contextTaskLimit");
     const inFlight = [
         ...Object.values(ctx.state.tasks)
             .filter((task) => ["claimed", "working", "delivered"].includes(task.status))
-            .slice(0, 40)
+            .slice(0, taskLimit)
             .map((task) => `#${task.number} ${task.title ?? ""} [${task.status}]`),
         ...Object.values(ctx.state.tasks)
             .filter((task) => task.claimId && ["claimed", "working"].includes(task.status))
-            .slice(0, 40)
+            .slice(0, taskLimit)
             .map((task) => `claim #${task.number} ${task.claimId}`)
     ].join("\n");
     const platformPolicy = [
@@ -3517,19 +4104,29 @@ async function discoveryPass(ctx) {
     const filed = [];
     const skipped = [];
     const failed = [];
+    const queued = [];
     for (const idea of ideas) {
         if (!idea?.title || !idea?.description)
             continue;
+        const ideaLimits = ideaPolicyLimits(ctx.profile.idea);
         const baseInput = {
-            title: idea.title.slice(0, 200),
-            summary: sanitizeIdeaSummary(idea.summary, idea.title),
-            description: idea.description.slice(0, 5000),
+            title: idea.title.slice(0, ideaLimits.titleMax),
+            summary: sanitizeIdeaSummary(idea.summary, idea.title, ctx.profile.idea),
+            description: idea.description.slice(0, ideaLimits.descriptionMax),
             idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
             acknowledgeSimilar: false
         };
         const vetted = ctx.profile.discovery.alreadyVetted === true && Boolean(ctx.profile.discovery.vettedNote);
+        const queueForLater = (body, error) => {
+            queueOutbox(ctx.state, { kind: "createIdea", body, title: idea.title });
+            queued.push(idea.title);
+            ctx.logger.warn(`Could not file idea "${idea.title}" now; queued in outbox: ${error}`);
+        };
         try {
-            const created = await ctx.primary.client.createIdea(vetted ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote } : baseInput);
+            const input = vetted
+                ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote }
+                : baseInput;
+            const created = await ctx.primary.client.createIdea(input);
             const createdIdea = normalizeIdea(created);
             counter(ctx).discoveries += 1;
             ctx.state.run.discoveries += 1;
@@ -3564,25 +4161,28 @@ async function discoveryPass(ctx) {
                         skipped.push(idea.title);
                     }
                     else {
-                        ctx.logger.warn(`Could not file idea "${idea.title}": ${message}`);
-                        failed.push({ title: idea.title, error: message });
+                        queueForLater(baseInput, message);
                     }
                 }
             }
             else {
                 const message = error instanceof Error ? error.message : String(error);
-                ctx.logger.warn(`Could not file idea "${idea.title}": ${message}`);
-                failed.push({ title: idea.title, error: message });
+                queueForLater(vetted ? { ...baseInput, alreadyVetted: true, vettedNote: ctx.profile.discovery.vettedNote } : baseInput, message);
             }
         }
     }
     if (ideas.length) {
         history(ctx, {
             type: "discovery",
-            detail: `discovery: ${filed.length} filed, ${skipped.length} similar, ${failed.length} failed of ${ideas.length} proposed`,
-            data: { filed, skipped, failed: failed.map((entry) => entry.title) }
+            detail: `discovery: ${filed.length} filed, ${skipped.length} similar, ${queued.length} queued for filing, ${failed.length} failed of ${ideas.length} proposed`,
+            data: { filed, skipped, queued, failed: failed.map((entry) => entry.title) }
         });
-        await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${filed.length} of ${ideas.length} idea(s)`, [...filed.map((title) => `- ${title}`), ...failed.map((entry) => `- FAILED ${entry.title}: ${entry.error}`)].join("\n"), ctx.state, ctx.primary.name);
+        try {
+            await recordTaskNote(ctx.primary.client, { id: "discovery", number: "discovery", title: "Discovery" }, "discovery", `Filed ${filed.length} of ${ideas.length} idea(s)${queued.length ? `, ${queued.length} queued for filing` : ""}`, [...filed.map((title) => `- ${title}`), ...queued.map((title) => `- QUEUED: ${title}`), ...failed.map((entry) => `- FAILED ${entry.title}: ${entry.error}`)].join("\n"), ctx.state, ctx.primary.name);
+        }
+        catch (error) {
+            ctx.logger.warn(`Discovery note skipped (will retry with the queue): ${error instanceof Error ? error.message : String(error)}`);
+        }
     }
     await save(ctx);
 }
@@ -3601,24 +4201,27 @@ async function cleanupOldWorktrees(ctx) {
     }
 }
 async function ownerDecisionPass(ctx) {
-    const candidates = (ctx.platform.issues ?? []).filter((issue) => issue.substatus === "requires_confirmation" ||
-        issue.substatus === "requires_review" ||
-        issue.status === "requires_confirmation" ||
-        ["done", "accepted", "merge"].includes(issue.status));
-    for (const candidate of candidates.slice(0, 25)) {
+    const policy = decisionsPolicy(ctx.profile);
+    const candidateSubstatuses = new Set(policy.candidateSubstatuses);
+    const candidateStatuses = new Set(policy.candidateStatuses);
+    const candidates = (ctx.platform.issues ?? []).filter((issue) => candidateSubstatuses.has(issue.substatus) ||
+        candidateSubstatuses.has(issue.status) ||
+        candidateStatuses.has(issue.status));
+    for (const candidate of candidates.slice(0, discoverLimit(ctx.profile, "ownerCandidateLimit"))) {
         if (ctx.pool.total() >= ctx.capacity.agentCeiling)
             return;
         const data = await ctx.primary.client.getIssue(candidate.id).catch(() => null);
         const issue = normalizeIssue(data);
         if (!issue)
             continue;
-        const decisions = parseOwnerDecisions(issue.comments);
+        const decisions = parseOwnerDecisions(issue.comments, ctx.profile.decisions);
         if (!decisions.length)
             continue;
-        const stateKey = (decision) => `decision:${issue.id}:${decision.kind}:${decision.answer}:${decision.text.slice(0, 80)}`;
+        const stateKey = (decision) => `decision:${issue.id}:${decision.kind}:${decision.answer}:${decision.text.slice(0, policy.keyChars)}`;
         const confirm = latestDecision(decisions, "confirm");
         const merge = latestDecision(decisions, "merge");
-        if (confirm && (issue.substatus === "requires_confirmation" || issue.status === "requires_confirmation")) {
+        const awaiting = confirmationStatuses(ctx.profile);
+        if (confirm && (awaiting.has(issue.substatus) || awaiting.has(issue.status))) {
             const key = stateKey(confirm);
             if (ctx.state.recentFeedKeys[key])
                 continue;
@@ -3670,7 +4273,7 @@ async function ownerDecisionPass(ctx) {
                 ctx.logger.warn(`Owner confirmation decision for #${issue.number} failed: ${error instanceof Error ? error.message : String(error)}`);
             }
         }
-        if (merge && (["done", "accepted", "merge"].includes(issue.status) || issue.substatus === "requires_review")) {
+        if (merge && (new Set(policy.mergeStatuses).has(issue.status) || new Set(policy.mergeSubstatuses).has(issue.substatus))) {
             const key = stateKey(merge);
             if (ctx.state.recentFeedKeys[key])
                 continue;
@@ -3785,14 +4388,11 @@ async function runCycle(ctx) {
                 ctx.logger.warn(`Config repair failed: ${error instanceof Error ? error.message : String(error)}`);
                 return "wait";
             });
-            if (outcome === "wait") {
-                setPhase(ctx, "blocked");
-                return { blocked: true };
-            }
+            if (outcome === "wait")
+                return parkBlocked(ctx);
         }
         else if (nextRetryDelay(ctx.state.health) !== null) {
-            setPhase(ctx, "blocked");
-            return { blocked: true };
+            return parkBlocked(ctx);
         }
     }
     setPhase(ctx, "poll");
@@ -3802,7 +4402,7 @@ async function runCycle(ctx) {
         clientForName: (name) => clientByName(ctx, name)?.client ?? null
     });
     if (polled.errors.length) {
-        const report = classifyError(polled.errors[0], "inbox");
+        const report = classifyError(polled.errors[0], "inbox", ctx.profile);
         if (report.code !== "profile_incomplete")
             await applyHealth(ctx, report);
     }
@@ -3820,7 +4420,7 @@ async function runCycle(ctx) {
             await clearHealth(ctx, "memory");
         }
         catch (error) {
-            await applyHealth(ctx, classifyError(error, "memory"));
+            await applyHealth(ctx, classifyError(error, "memory", ctx.profile));
         }
     }
     const feedResult = await fetchMergedFeed(ctx);
@@ -3840,6 +4440,10 @@ async function runCycle(ctx) {
         }
     }
     ctx.platform = await loadPlatformSets(ctx);
+    // Flush anything queued while the loop was blocked before building the queue.
+    await flushOutboxPass(ctx).catch((error) => {
+        ctx.logger.warn(`Outbox flush failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
     // Warning-level repair (e.g. renamed Ziki categories): diagnose + escalate
     // without parking the loop. Failures here must never break the cycle.
     await repairWarningLoop(ctx).catch((error) => {
@@ -3853,6 +4457,9 @@ async function runCycle(ctx) {
         platformNumbers,
         platformIdeaNumbers,
         state: ctx.state
+    });
+    await detectUnknownVocabulary(ctx).catch((error) => {
+        ctx.logger.warn(`Vocabulary drift check failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     if (ctx.dryRun) {
         setPhase(ctx, "dry-run");
@@ -4310,7 +4917,7 @@ async function preflightHealth(ctx) {
             }
         }
         catch (error) {
-            await applyHealth(ctx, { ...classifyError(error, "agent"), agents: [agent.name] });
+            await applyHealth(ctx, { ...classifyError(error, "agent", ctx.profile), agents: [agent.name] });
         }
     }
     if (incomplete.length) {
@@ -4325,7 +4932,7 @@ async function preflightHealth(ctx) {
                 perAgent: Object.fromEntries(incomplete.map((entry) => [entry.agent, entry])),
                 helpUrl: incomplete.find((entry) => entry.helpUrl)?.helpUrl ?? null
             },
-            retryMs: 5 * 60_000
+            retryMs: retryMsFor(ctx.profile, "agent:profile_incomplete")
         });
     }
     else {
@@ -4340,7 +4947,7 @@ async function preflightHealth(ctx) {
             code: "project_workflow",
             severity: "warning",
             message: "Could not read the Ziki project workflow; claim limits are unknown.",
-            retryMs: 5 * 60_000
+            retryMs: retryMsFor(ctx.profile, "config:project_workflow")
         });
     }
 }
@@ -4368,6 +4975,9 @@ export async function runLoop(options = {}) {
     state.profile = loaded.profileName;
     state.startedAt ??= new Date().toISOString();
     state.stoppedAt = null;
+    await adoptBootstrapEscalation(state, loaded.profileName, logger).catch((error) => {
+        logger.warn(`Bootstrap adoption failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
     const stalePids = killStalePids(state, logger);
     for (const task of Object.values(state.tasks)) {
         if (task.status === "working")
@@ -4513,24 +5123,25 @@ export async function runLoop(options = {}) {
             if (ctx.tokenLimitReached) {
                 stopReason = "token-limit";
                 logger.info("Run token budget reached", { tokens: ctx.state.run.tokens.total });
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             if (ctx.providerLimit) {
                 stopReason = "provider-limit";
                 logger.info("Provider limit reached; stopping");
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             if (options.once) {
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             if (ctx.rateLimitUntil > Date.now()) {
                 while (ctx.rateLimitUntil > Date.now() && !controller.signal.aborted) {
                     await heartbeatPass(ctx);
-                    const wait = Math.min(5 * 60_000, ctx.rateLimitUntil - Date.now());
-                    await sleep(Math.max(1000, wait), controller.signal);
+                    const chunkMs = requireTimingMs(ctx.profile, "rateLimitChunkMs");
+                    const wait = Math.min(chunkMs, ctx.rateLimitUntil - Date.now());
+                    await sleep(Math.max(loopMs(ctx.profile, "pollFloorMs"), wait), controller.signal);
                 }
                 continue;
             }
@@ -4538,12 +5149,13 @@ export async function runLoop(options = {}) {
             if (reason) {
                 stopReason = reason;
                 logger.info(`Run limit reached: ${reason}`, { cycles: ctx.state.cycles, deliveries: ctx.state.run.deliveries });
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             const retry = nextRetryDelay(ctx.state.health);
             const waitMs = Math.max(ctx.profile.pollSeconds * 1000, retry ?? 0);
-            await ctx.pool.waitForPoolOrTimeout(Number.isFinite(waitMs) ? waitMs : ctx.profile.pollSeconds * 1000, controller.signal);
+            const floorMs = loopMs(ctx.profile, "pollFloorMs");
+            await ctx.pool.waitForPoolOrTimeout(Number.isFinite(waitMs) ? Math.max(waitMs, floorMs) : ctx.profile.pollSeconds * 1000, controller.signal);
         } while (!controller.signal.aborted);
     }
     catch (error) {
@@ -4579,10 +5191,10 @@ export async function runLoop(options = {}) {
             controller.abort();
             killActiveAgents();
         }
-        await ctx.pool.drain(30_000);
+        await ctx.pool.drain(loopMs(ctx.profile, "stopDrainMs"), loopMs(ctx.profile, "drainSliceMs"));
         if (ctx.pool.total()) {
             killActiveAgents();
-            await ctx.pool.drain(5_000);
+            await ctx.pool.drain(loopMs(ctx.profile, "killDrainMs"), loopMs(ctx.profile, "drainSliceMs"));
         }
         ctx.state.activePids = [];
         if (ctx.statusTimer)

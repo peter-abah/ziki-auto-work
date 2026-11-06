@@ -27,3 +27,45 @@ test("preserves an explicit environment hint", () => {
   );
   assert.equal(result?.environmentHint, "flutter is not on PATH");
 });
+
+test("recovers a printed result when the agent never writes the file", async () => {
+  const { runAgent } = await import("./agent.js");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const dir = mkdtempSync(path.join(tmpdir(), "aw-agent-"));
+  const answer = {
+    ok: true,
+    summary: "recovered",
+    configPatch: [{ path: "ziki.projectId", value: "c1", reason: "test" }]
+  };
+  const profile = {
+    ziki: {
+      baseUrl: "https://ziki.dev",
+      projectId: "project_test",
+      projectSlug: "test",
+      platform: "desktop"
+    },
+    executor: {
+      provider: "custom",
+      command: process.execPath,
+      args: ["-e", `console.log(${JSON.stringify(JSON.stringify(answer))})`]
+    }
+  } as unknown as import("./types.js").ProfileConfig;
+  const profilePaths = {
+    resultsDir: path.join(dir, "results"),
+    logsDir: path.join(dir, "logs")
+  } as unknown as import("./types.js").ProfilePaths;
+  const resultPath = path.join(dir, "results", "configDoctor-test.json");
+  const result = await runAgent({
+    profile,
+    profilePaths,
+    role: "configDoctor",
+    prompt: "print the answer",
+    cwd: dir,
+    resultPath,
+    logPath: path.join(dir, "logs", "agents.log")
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configPatch, answer.configPatch);
+});

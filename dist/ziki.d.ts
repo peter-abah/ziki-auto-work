@@ -1,4 +1,4 @@
-import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, ProfileConfig, ResearchJob, Stake, TestVerdict, WorkFeed, WorkItem, ApiContractStore, ProjectSummary } from "./types.js";
+import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, OperationConfig, ProfileConfig, ResearchJob, Stake, TestVerdict, TransportConfig, WorkFeed, WorkItem, ApiContractStore, ProjectSummary } from "./types.js";
 export declare class ZikiError extends Error {
     status: number;
     body: unknown;
@@ -38,21 +38,58 @@ export declare class ZikiClient {
     apiKey: string;
     projectId: string;
     projectSlug: string;
+    orgSlug?: string | null;
+    vars: Record<string, string>;
+    endpoints: Record<string, Record<string, string>>;
+    transport: TransportConfig;
+    operations: Record<string, Record<string, OperationConfig>>;
     agentName: string;
     timeoutMs: number;
     contracts?: ApiContractStore;
     repair?: ApiRepairHandler;
+    apiRepairPolicy?: {
+        deterministicRetries?: number;
+        agentRepairs?: number;
+        statuses?: number[];
+    };
     constructor(options: {
         baseUrl?: string;
         apiKey: string;
         projectId: string;
         projectSlug: string;
-        agentName?: string;
+        orgSlug?: string | null;
+        vars?: Record<string, string>;
+        endpoints?: Record<string, Record<string, string>>;
+        transport: TransportConfig;
+        operations: Record<string, Record<string, OperationConfig>>;
+        agentName: string;
         timeoutMs?: number;
         contracts?: ApiContractStore;
         repair?: ApiRepairHandler;
+        apiRepairPolicy?: {
+            deterministicRetries?: number;
+            agentRepairs?: number;
+            statuses?: number[];
+        };
     });
+    /** Operation contract for group.name — throws unknown_operation when absent. */
+    op(group: string, name: string): OperationConfig;
+    /**
+     * Resolve a configured endpoint template into a path, interpolating
+     * `{var}` placeholders from explicit params, configured vars, and identity
+     * fields (projectId/projectSlug/orgSlug/platform). Throws on unknown or
+     * missing required vars — a wrong but well-formed URL is worse than none.
+     * No built-in fallback: unknown names fail loud so URL-shape changes
+     * surface as repair proposals instead of silent wrong calls.
+     */
+    route(group: string, name: string, params?: Record<string, string | number>): string;
     private url;
+    /** Policy knobs for the adaptive repair loop (apiRepair config section). */
+    repairPolicy(): {
+        deterministicRetries: number;
+        agentRepairs: number;
+        statuses: number[];
+    };
     request<T = any>(method: string, pathname: string, options?: {
         query?: Record<string, unknown>;
         body?: unknown;
@@ -62,6 +99,12 @@ export declare class ZikiClient {
         retries?: number;
         timeoutMs?: number;
         maxRetryAfterMs?: number;
+        /**
+         * Expected shape of a successful response. Mismatches throw instead of
+         * being swallowed downstream (e.g. an HTML login page where a JSON feed
+         * was expected). Keep narrow: only set where the shape is contractual.
+         */
+        expect?: "feed" | "list" | "object";
     }): Promise<T>;
     private requestOnce;
     get<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
@@ -69,6 +112,32 @@ export declare class ZikiClient {
     patch<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     put<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
     del<T = any>(pathname: string, options?: Parameters<ZikiClient["request"]>[2]): Promise<T>;
+    /**
+     * Config-driven operation call. Method, expected shape, timeout and retry
+     * budget come from `operations.<group>.<name>` — a Ziki method change,
+     * renamed payload or new pagination policy is a config patch, never code.
+     * Thin typed wrappers below supply only field data (the loop's own inputs).
+     */
+    invoke<T = any>(group: string, name: string, options?: {
+        params?: Record<string, string | number>;
+        query?: Record<string, unknown>;
+        body?: unknown;
+        headers?: Record<string, string>;
+        raw?: boolean;
+        timeoutMs?: number;
+        retries?: number;
+        maxRetryAfterMs?: number;
+        idempotencyKey?: string;
+    }): Promise<T>;
+    /**
+     * Config-driven cursor pagination. Keys, page size and page/item caps come
+     * from `operations.<group>.<name>.pagination`.
+     */
+    listAllOp<T = any>(group: string, name: string, options?: {
+        params?: Record<string, string | number>;
+        query?: Record<string, unknown>;
+        max?: number;
+    }): Promise<T[]>;
     me(): Promise<AgentMe>;
     updateProfile(input: {
         username?: string;
@@ -105,6 +174,10 @@ export declare class ZikiClient {
     getAgent(username: string): Promise<AgentProfile>;
     platforms(): Promise<any>;
     project(): Promise<any>;
+    /** Read one project by id (used to verify rotation targets and parse workUrl). */
+    readProject(projectId: string): Promise<ProjectSummary & {
+        workUrl?: string;
+    }>;
     /**
      * Every project in the agent's tenant — the recovery endpoint for a retired
      * projectId. Needs no project scope, so it works while project routes 404.
@@ -348,6 +421,11 @@ export declare class ZikiClient {
 export declare function clientForAgent(agent: AgentKey, profile: ProfileConfig, options?: {
     contracts?: ApiContractStore;
     repair?: ApiRepairHandler;
+    apiRepairPolicy?: {
+        deterministicRetries?: number;
+        agentRepairs?: number;
+        statuses?: number[];
+    };
 }): ZikiClient;
 export declare function normalizeIssue(data: any): Issue | null;
 export declare function normalizeIdea(data: any): Idea | null;

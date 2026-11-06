@@ -1,0 +1,92 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { flushOutbox, outboxDepth, queueOutbox } from "./outbox.js";
+import { loadInitTemplates } from "./config-templates.js";
+const templates = await loadInitTemplates();
+const policy = templates.outbox;
+function fixtureState() {
+    return { escalations: {} };
+}
+const ideas = [{ id: "a", number: 1, title: "Alpha", status: "open" }];
+test("queues and flushes ideas FIFO, skipping known titles", async () => {
+    const state = fixtureState();
+    queueOutbox(state, { kind: "createIdea", body: { title: "Alpha" }, title: "Alpha" });
+    queueOutbox(state, { kind: "createIdea", body: { title: "Beta" }, title: "Beta" });
+    assert.equal(outboxDepth(state), 2);
+    const created = [];
+    const client = {
+        createIdea: async (body) => {
+            created.push(body.title);
+            return { idea: { number: 9 } };
+        }
+    };
+    const events = [];
+    const result = await flushOutbox(state, client, {
+        policy,
+        knownIdeaTitles: new Set(["Alpha"]),
+        onEvent: (event) => events.push(event.type)
+    });
+    assert.deepEqual(created, ["Beta"]);
+    assert.deepEqual(events, ["skipped-duplicate", "flushed"]);
+    assert.equal(result.flushed, 1);
+    assert.equal(result.skipped, 1);
+    assert.equal(outboxDepth(state), 0);
+});
+test("a failing flush stops the queue and retries next cycle, then drops after max attempts", async () => {
+    const state = fixtureState();
+    queueOutbox(state, { kind: "createIdea", body: { title: "Gamma" }, title: "Gamma" });
+    const failing = {
+        createIdea: async () => {
+            throw new Error("Project not found");
+        }
+    };
+    const first = await flushOutbox(state, failing, { policy, knownIdeaTitles: new Set() });
+    assert.equal(first.flushed, 0);
+    assert.equal(first.pending, 1);
+    assert.equal(first.deferred, "Project not found");
+    assert.equal(outboxDepth(state), 1);
+    for (let attempt = 0; attempt < policy.maxAttempts + 5; attempt += 1) {
+        await flushOutbox(state, failing, { policy, knownIdeaTitles: new Set() });
+    }
+    assert.equal(outboxDepth(state), 0);
+    assert.equal(state.outbox.failed.length, 1);
+    assert.equal(state.outbox.failed[0].attempts >= policy.maxAttempts, true);
+});
+test("max attempts come from policy, not code", async () => {
+    const state = fixtureState();
+    queueOutbox(state, { kind: "createIdea", body: { title: "Delta" }, title: "Delta" });
+    const failing = {
+        createIdea: async () => {
+            throw new Error("nope");
+        }
+    };
+    const custom = { maxAttempts: 2, maxPerFlush: 5, fifo: true };
+    await flushOutbox(state, failing, { policy: custom, knownIdeaTitles: new Set() });
+    await flushOutbox(state, failing, { policy: custom, knownIdeaTitles: new Set() });
+    assert.equal(outboxDepth(state), 0);
+    assert.equal(state.outbox.failed.length, 1);
+    await assert.rejects(flushOutbox(fixtureState(), failing, { knownIdeaTitles: new Set() }), /outbox policy is required/);
+});
+test("report entries call through with their stored payload", async () => {
+    const state = fixtureState();
+    queueOutbox(state, {
+        kind: "reportPrStatus",
+        issueId: "issue-1",
+        issueNumber: 42,
+        body: { state: "merged" }
+    });
+    const calls = [];
+    const client = {
+        createIssue: async () => {
+            throw new Error("should not be called");
+        },
+        reportPrStatus: async (id, report) => {
+            calls.push([id, report]);
+            return { ok: true };
+        }
+    };
+    const result = await flushOutbox(state, client, { policy, knownIdeaTitles: new Set(ideas.map((idea) => idea.title)) });
+    assert.equal(result.flushed, 1);
+    assert.deepEqual(calls, [["issue-1", { state: "merged" }]]);
+});
+//# sourceMappingURL=outbox.test.js.map

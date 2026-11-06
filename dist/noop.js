@@ -1,4 +1,24 @@
-const NOOP_STATUSES = new Set([400, 409, 422]);
+function resolveStatuses(policy) {
+    const statuses = policy?.statuses;
+    if (!Array.isArray(statuses) || !statuses.every((entry) => typeof entry === "number")) {
+        throw new Error("noop.statuses must be an array of numbers (run `auto-work migrate`)");
+    }
+    return new Set(statuses);
+}
+export function resolvePatterns(policy) {
+    const patterns = policy?.patterns;
+    if (!patterns || typeof patterns !== "object" || Array.isArray(patterns)) {
+        throw new Error("noop.patterns must be an object of action -> regex strings (run `auto-work migrate`)");
+    }
+    const out = {};
+    for (const [action, list] of Object.entries(patterns)) {
+        if (!Array.isArray(list) || !list.every((entry) => typeof entry === "string")) {
+            throw new Error(`noop.patterns.${action} must be an array of regex strings (run \`auto-work migrate\`)`);
+        }
+        out[action] = list.map((source) => new RegExp(source, "i"));
+    }
+    return out;
+}
 export function errorMessage(error) {
     if (error && typeof error === "object") {
         const body = error.body;
@@ -14,17 +34,15 @@ export function errorMessage(error) {
     }
     return String(error);
 }
-export function isNoopZikiError(error, patterns) {
+export function isNoopZikiError(error, patterns, policy) {
     const status = Number(error?.status ?? 0);
-    if (!NOOP_STATUSES.has(status))
+    if (!resolveStatuses(policy).has(status))
         return false;
     const message = errorMessage(error);
     return patterns.some((pattern) => pattern.test(message));
 }
-export const NOOP_PATTERNS = {
-    reclaim: [/nothing to reclaim/i, /not stale/i],
-    open: [/not awaiting confirmation/i, /requires confirmation/i, /already open/i],
-    review: [/already has .*judgements?/i, /already (?:been )?(?:accepted|reviewed)/i, /not (?:awaiting|reviewable)/i],
-    convert: [/valid JSON body/i]
-};
+/** Resolve one action's compiled patterns (e.g. "reclaim") from policy. */
+export function noopPatterns(policy, action) {
+    return resolvePatterns(policy)[action] ?? [];
+}
 //# sourceMappingURL=noop.js.map

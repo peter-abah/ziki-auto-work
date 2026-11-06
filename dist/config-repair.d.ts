@@ -1,4 +1,5 @@
 import type { Config, ConfigPatchOp, EscalationRecord, HealthBlocker, ProfileConfig, ProfilePaths, ProjectSummary, RepairConfig, RepairStrategyConfig, State } from "./types.js";
+import type { InitTemplates } from "./config-templates.js";
 import type { ZikiClient } from "./ziki.js";
 import type { Logger } from "./log.js";
 export declare const PROJECT_NOT_FOUND_MESSAGE = "Project not found.";
@@ -38,11 +39,70 @@ export interface ProjectDiagnosis {
     projects: ProjectSummary[];
     match: ProjectMatch | null;
     ambiguous: ProjectSummary[] | null;
+    /** Patch ops for identity fields that differ from the profile (may be empty). */
+    ops: ConfigPatchOp[];
+    /** Human-readable diagnosis summary. */
+    detail: string;
+    /**
+     * The project's workUrl when it did not parse as /{org}/{project}/work.
+     * Signals a URL-shape change: never guess from it, ask the owner instead.
+     */
+    unparsedWorkUrl: string | null;
 }
-/** Live diagnosis: list the tenant's projects and match a replacement. Read-only. */
+/**
+ * Live diagnosis: list the tenant's projects, match a replacement, read it
+ * back and diff every identity field (projectId, projectSlug, orgSlug from
+ * workUrl) against the profile. Read-only; proposes only what differs.
+ */
 export declare function diagnoseProjectMismatch(client: ZikiClient, profile: ProfileConfig, logger?: Logger): Promise<ProjectDiagnosis>;
-/** Build the patch ops for adopting a replacement project. */
-export declare function projectRotationPatch(project: ProjectSummary, reason: string): ConfigPatchOp[];
+export interface MissingKeyDiagnosis {
+    ops: ConfigPatchOp[];
+    summary: string;
+}
+/**
+ * Deterministic missing-key repair: diff the live profile against init
+ * templates (the same fill `migrate`/`loadProfile` apply) and propose
+ * exactly the absent paths. No agent needed; the human approves the values.
+ */
+export declare function diagnoseMissingKeys(profile: ProfileConfig, templates: InitTemplates): MissingKeyDiagnosis;
+export interface UnknownKindDiagnosis {
+    ops: ConfigPatchOp[];
+    summary: string;
+}
+/**
+ * Deterministic unknown-kind repair: a Ziki work kind the queue has never
+ * seen. Proposed into the aux bucket with priority after every known kind
+ * (visible, never silently dropped); the human moves it to owner/work/review
+ * if triage says otherwise.
+ */
+export declare function diagnoseUnknownKind(kind: string, profile: ProfileConfig): UnknownKindDiagnosis;
+export interface UnknownVocabularyDiagnosis {
+    ops: ConfigPatchOp[];
+    summary: string;
+}
+/**
+ * Deterministic unknown-vocabulary repair: append unseen Ziki statuses or
+ * substatuses to statuses.known ONLY (drift vocabulary — never redefines
+ * what counts as done; workable/terminal lists stay human-owned).
+ */
+export declare function diagnoseUnknownVocabulary(values: string[], profile: ProfileConfig): UnknownVocabularyDiagnosis;
+export interface UnknownEndpointDiagnosis {
+    ops: ConfigPatchOp[];
+    summary: string;
+}
+/**
+ * Deterministic unknown-endpoint repair: an operations entry points at an
+ * endpoint name missing from ziki.endpoints. If init templates know that
+ * endpoint (config drift), propose the template value. If templates don't
+ * know it either, Ziki added a route — a human must add the endpoint first
+ * (agents never invent API routes).
+ */
+export declare function diagnoseUnknownEndpoint(group: string, name: string, profile: ProfileConfig, templates: InitTemplates): UnknownEndpointDiagnosis;
+/** Parse "unknown endpoint: group.name" / "unknown operation: group.name" from a blocker message. */
+export declare function parseUnknownEndpoint(message: string | null | undefined): {
+    group: string;
+    name: string;
+} | null;
 export interface FilterDiagnosis {
     platforms: Array<{
         slug?: string | null;
@@ -82,3 +142,9 @@ export declare function formatRepairEscalationBody(options: {
 }): string;
 /** Latest open config escalation for a strategy (reaps local CLI approvals first). */
 export declare function latestStrategyEscalation(state: State, strategy: string): EscalationRecord | null;
+/**
+ * Supersede check: returns the newly covered paths when the fresh diagnosis is
+ * a strict superset of the pending proposal (monotonic growth guarantees the
+ * escalation chain terminates), else null. Pure function — extracted for testing.
+ */
+export declare function supersedingPaths(existing: ConfigPatchOp[] | null | undefined, fresh: ConfigPatchOp[] | null | undefined): string[] | null;

@@ -1,8 +1,10 @@
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { DEFAULT_REPAIR_ALLOW_NEW_KEYS, DEFAULT_REPAIR_MUTABLE_PATHS, DEFAULT_REPAIR_STRATEGIES, setConfigPath, validateConfig, validateConfigPatch, saveConfig } from "./config.js";
+import { DEFAULT_REPAIR_ALLOW_NEW_KEYS, DEFAULT_REPAIR_MUTABLE_PATHS, DEFAULT_REPAIR_STRATEGIES, getConfigPath, setConfigPath, validateConfig, validateConfigPatch, saveConfig } from "./config.js";
 import { apiPlatformFilter } from "./ziki.js";
+import { parseWorkUrl } from "./ziki-endpoints.js";
+import { fillProfileFromTemplates } from "./config-templates.js";
 export const PROJECT_NOT_FOUND_MESSAGE = "Project not found.";
 /** True only for the retired-project signature — not for any other 404 (e.g. a renamed route). */
 export function isProjectNotFoundBlocker(code, message) {
@@ -123,7 +125,11 @@ function githubRepoName(value) {
     const bare = trimmed.match(/^([^/]+\/[^/]+)$/);
     return bare ? bare[1].toLowerCase() : null;
 }
-/** Live diagnosis: list the tenant's projects and match a replacement. Read-only. */
+/**
+ * Live diagnosis: list the tenant's projects, match a replacement, read it
+ * back and diff every identity field (projectId, projectSlug, orgSlug from
+ * workUrl) against the profile. Read-only; proposes only what differs.
+ */
 export async function diagnoseProjectMismatch(client, profile, logger) {
     const response = await client.listProjects();
     const projects = Array.isArray(response?.items) ? response.items : [];
@@ -131,14 +137,201 @@ export async function diagnoseProjectMismatch(client, profile, logger) {
         slugs: projects.map((project) => project.slug)
     });
     const matched = matchReplacementProject(projects, profile);
-    if (matched && "project" in matched) {
-        return { projects, match: { project: matched.project, reason: matched.reason }, ambiguous: null };
+    if (!matched || !("project" in matched)) {
+        return {
+            projects,
+            match: null,
+            ambiguous: matched && "ambiguous" in matched ? matched.ambiguous : null,
+            ops: [],
+            unparsedWorkUrl: null,
+            detail: matched && "ambiguous" in matched
+                ? `multiple tenant projects match; need a human pick: ${matched.ambiguous.map((project) => project.slug).join(", ")}`
+                : `no tenant project matches platform "${profile.ziki.platform}" or repo "${profile.repo.githubRepo}"`
+        };
     }
-    return { projects, match: null, ambiguous: matched && "ambiguous" in matched ? matched.ambiguous : null };
+    const project = matched.project;
+    let work = null;
+    let rawWorkUrl = null;
+    try {
+        const full = await client.readProject(project.id);
+        if (typeof full?.workUrl === "string" && full.workUrl) {
+            rawWorkUrl = full.workUrl;
+            work = parseWorkUrl(full.workUrl);
+        }
+    }
+    catch (error) {
+        logger?.warn(`Project read failed for ${project.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const ops = [];
+    if (profile.ziki.projectId !== project.id) {
+        ops.push({ path: "ziki.projectId", value: project.id, reason: matched.reason });
+    }
+    if (profile.ziki.projectSlug !== project.slug) {
+        ops.push({ path: "ziki.projectSlug", value: project.slug, reason: `tenant project slug is "${project.slug}"` });
+    }
+    if (work?.org && profile.ziki.orgSlug !== work.org) {
+        ops.push({ path: "ziki.orgSlug", value: work.org, reason: `project workUrl lives under org "${work.org}"` });
+    }
+    if (work && work.project !== project.slug) {
+        logger?.warn(`Project slug mismatch: list says "${project.slug}" but workUrl points at "${work.project}"`);
+    }
+    // Unrecognized address shape: do NOT guess org/project from it. The match
+    // above still lets the agent propose identity fields it can see, but a
+    // human must confirm the addressing before anything applies.
+    const unparsedWorkUrl = !work && rawWorkUrl ? rawWorkUrl : null;
+    if (unparsedWorkUrl) {
+        logger?.warn(`Unrecognized project URL shape (needs human confirmation): ${unparsedWorkUrl}`);
+    }
+    return {
+        projects,
+        match: { project, reason: matched.reason },
+        ambiguous: null,
+        ops,
+        unparsedWorkUrl,
+        detail: ops.length
+            ? `Project ${profile.ziki.projectId} is gone on Ziki; matched replacement ${project.slug} (${matched.reason}).` +
+                (unparsedWorkUrl
+                    ? ` NOTE: the project's address format is unrecognized (${unparsedWorkUrl}) — confirm the project URL shape with a human before approving.`
+                    : "")
+            : `Project identity already matches tenant project ${project.slug}; no rotation needed.`
+    };
 }
-/** Build the patch ops for adopting a replacement project. */
-export function projectRotationPatch(project, reason) {
-    return [{ path: "ziki.projectId", value: project.id, reason }];
+/**
+ * Deterministic missing-key repair: diff the live profile against init
+ * templates (the same fill `migrate`/`loadProfile` apply) and propose
+ * exactly the absent paths. No agent needed; the human approves the values.
+ */
+export function diagnoseMissingKeys(profile, templates) {
+    const { profile: filledProfile, filled: filledPaths } = fillProfileFromTemplates(profile, templates);
+    const repair = repairConfigFor(filledProfile);
+    const ops = [];
+    const dropped = [];
+    for (const path of filledPaths) {
+        const op = {
+            path,
+            value: getConfigPath(filledProfile, path),
+            reason: "absent from config; value from init templates (last-known-good — verify against Ziki before approving)"
+        };
+        // Keep only ops the allowlist accepts: protected paths (repo identity,
+        // executors, statuses semantics) stay a manual human edit, never an
+        // agent proposal — even a deterministic one.
+        if (validateConfigPatch(filledProfile, [op], repair).ok)
+            ops.push(op);
+        else
+            dropped.push(path);
+    }
+    return {
+        ops,
+        summary: ops.length
+            ? `Config is missing ${ops.length} templated value(s): ${ops.map((op) => op.path).join(",")}${dropped.length ? ` (${dropped.length} protected path(s) need a manual edit: ${dropped.join(", ")})` : ""}.`
+            : dropped.length
+                ? `Only protected paths are missing (${dropped.join(", ")}); edit the config manually.`
+                : "Profile already matches init templates; the failure needs a human look."
+    };
+}
+/**
+ * Deterministic unknown-kind repair: a Ziki work kind the queue has never
+ * seen. Proposed into the aux bucket with priority after every known kind
+ * (visible, never silently dropped); the human moves it to owner/work/review
+ * if triage says otherwise.
+ */
+export function diagnoseUnknownKind(kind, profile) {
+    const priorities = profile.queue?.priorities ?? {};
+    const maxKnown = Math.max(0, ...Object.values(priorities).filter((value) => typeof value === "number"));
+    const buckets = profile.queue?.buckets;
+    const aux = Array.isArray(buckets?.aux) ? [...buckets.aux] : [];
+    const ops = [
+        {
+            path: `queue.priorities.${kind}`,
+            value: maxKnown + 1,
+            reason: `new Ziki kind "${kind}" sorts after every known kind until triaged`
+        }
+    ];
+    if (!aux.includes(kind)) {
+        ops.push({
+            path: "queue.buckets.aux",
+            value: [...aux, kind],
+            reason: `new Ziki kind "${kind}" is queued as auxiliary work (move buckets if triage says otherwise)`
+        });
+    }
+    return {
+        ops,
+        summary: `Ziki reports work kind "${kind}", which no bucket or priority covers.`
+    };
+}
+/**
+ * Deterministic unknown-vocabulary repair: append unseen Ziki statuses or
+ * substatuses to statuses.known ONLY (drift vocabulary — never redefines
+ * what counts as done; workable/terminal lists stay human-owned).
+ */
+export function diagnoseUnknownVocabulary(values, profile) {
+    const known = profile.statuses?.known;
+    if (!Array.isArray(known)) {
+        return { ops: [], summary: "statuses.known is not configured; run `auto-work migrate` first." };
+    }
+    const unseen = [...new Set(values.filter((value) => typeof value === "string" && value && !known.includes(value)))];
+    if (!unseen.length) {
+        return { ops: [], summary: "Unknown values already recorded in statuses.known; nothing to propose." };
+    }
+    return {
+        ops: [
+            {
+                path: "statuses.known",
+                value: [...known, ...unseen],
+                reason: `record Ziki drift vocabulary (${unseen.join(", ")}) so the warning clears; done-ness untouched`
+            }
+        ],
+        summary: `Ziki uses vocabulary outside statuses.known: ${unseen.join(", ")}.`
+    };
+}
+/**
+ * Deterministic unknown-endpoint repair: an operations entry points at an
+ * endpoint name missing from ziki.endpoints. If init templates know that
+ * endpoint (config drift), propose the template value. If templates don't
+ * know it either, Ziki added a route — a human must add the endpoint first
+ * (agents never invent API routes).
+ */
+export function diagnoseUnknownEndpoint(group, name, profile, templates) {
+    const templateEndpoints = templates.endpoints;
+    const templateValue = templateEndpoints?.[group]?.[name];
+    if (typeof templateValue !== "string" || !templateValue) {
+        return {
+            ops: [],
+            summary: `Endpoint ${group}.${name} is in neither the profile nor init templates — ` +
+                "Ziki likely added a route. Add ziki.endpoints + operations entries manually, then re-run."
+        };
+    }
+    const ops = [
+        {
+            path: `ziki.endpoints.${group}.${name}`,
+            value: templateValue,
+            reason: `endpoint known from init templates (config drift, not a Ziki change)`
+        }
+    ];
+    const templateOps = templates.operations;
+    const opTemplate = templateOps?.[group]?.[name];
+    const existingOp = profile.operations?.[group]?.[name];
+    if (opTemplate && typeof opTemplate === "object" && existingOp === undefined) {
+        ops.push({
+            path: `operations.${group}.${name}`,
+            value: JSON.parse(JSON.stringify(opTemplate)),
+            reason: "operation contract known from init templates (config drift)"
+        });
+    }
+    return {
+        ops,
+        summary: `Endpoint ${group}.${name} is missing from ziki.endpoints but known from init templates.`
+    };
+}
+const UNKNOWN_ENDPOINT_PATTERN = /unknown (?:endpoint|operation): ([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/;
+/** Parse "unknown endpoint: group.name" / "unknown operation: group.name" from a blocker message. */
+export function parseUnknownEndpoint(message) {
+    if (!message)
+        return null;
+    const match = message.match(UNKNOWN_ENDPOINT_PATTERN);
+    if (!match)
+        return null;
+    return { group: match[1], name: match[2] };
 }
 /**
  * Diagnose an unknown platform/area filter: list the tenant's current
@@ -286,5 +479,20 @@ export function latestStrategyEscalation(state, strategy) {
         escalation.status === "open")
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return open[0] ?? null;
+}
+/**
+ * Supersede check: returns the newly covered paths when the fresh diagnosis is
+ * a strict superset of the pending proposal (monotonic growth guarantees the
+ * escalation chain terminates), else null. Pure function — extracted for testing.
+ */
+export function supersedingPaths(existing, fresh) {
+    if (!fresh?.length)
+        return null;
+    const pending = new Set((existing ?? []).map((op) => op.path));
+    const covers = new Set(fresh.map((op) => op.path));
+    const extra = [...covers].filter((path) => !pending.has(path));
+    if ([...pending].every((path) => covers.has(path)) && extra.length)
+        return extra;
+    return null;
 }
 //# sourceMappingURL=config-repair.js.map

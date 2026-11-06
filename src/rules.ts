@@ -2,13 +2,16 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { ProfileConfig, WorkflowConfig } from "./types.js";
-import { DEFAULT_PROTECTED } from "./checks.js";
 import { GENERIC_PR_TEMPLATE } from "./github.js";
 import { resolvePrTemplate } from "./config.js";
 
 export function effectiveProtectedFiles(profile: ProfileConfig): string[] {
+  const safety = profile.safety?.protectedFiles;
+  if (!Array.isArray(safety) || !safety.length) {
+    throw new Error("profile.safety.protectedFiles must be a non-empty array (run `auto-work migrate`)");
+  }
   const configured = profile.repo.protectedFiles;
-  return configured && configured.length ? configured : DEFAULT_PROTECTED;
+  return configured && configured.length ? configured : safety;
 }
 
 export function formatProtectedFiles(profile: ProfileConfig): string {

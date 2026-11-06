@@ -1,6 +1,13 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { CheckResult, CheckRunResult, CheckSpec, ProfileConfig } from "./types.js";
+import type {
+  CheckResult,
+  CheckRunResult,
+  CheckSpec,
+  ChecksDefaultsConfig,
+  ProfileConfig,
+  SafetyPolicyConfig
+} from "./types.js";
 import { expandHome } from "./platform/paths.js";
 import { runCommand } from "./platform/spawn.js";
 import { buildCheckEnv } from "./env.js";
@@ -16,9 +23,9 @@ export function resolveCommand(profile: ProfileConfig, command: string): string 
   return command;
 }
 
-function tail(output: string): string {
-  const lines = output.split("\n").filter(Boolean);
-  return lines.slice(-40).join("\n");
+function tail(output: string, lines: number): string {
+  const parts = output.split("\n").filter(Boolean);
+  return parts.slice(-lines).join("\n");
 }
 
 function normalizeTestPath(url: unknown): string {
@@ -66,9 +73,10 @@ export async function runChecks(
   }
 ): Promise<CheckRunResult> {
   const results: CheckResult[] = [];
+  const defaults = requireChecksDefaults(profile);
 
   for (const spec of profile.checks) {
-    const required = spec.required !== false;
+    const required = spec.required ?? defaults.requiredDefault;
     const command = resolveCommand(profile, spec.command);
     const files = filesFor(spec, options.changedFiles);
 
@@ -80,7 +88,7 @@ export async function runChecks(
     const args = [...spec.args, ...files];
     const result = await runCommand(command, args, {
       cwd: worktree,
-      timeoutMs: spec.timeoutMs ?? 20 * 60 * 1000,
+      timeoutMs: spec.timeoutMs ?? defaults.timeoutMs,
       env: buildCheckEnv(profile, spec.env)
     });
 
@@ -96,7 +104,7 @@ export async function runChecks(
       name: spec.name,
       ok,
       required,
-      output: tail(`${result.stdout}\n${result.stderr}`),
+      output: tail(`${result.stdout}\n${result.stderr}`, defaults.tailLines),
       ...(failures ? { failures } : {})
     });
 
@@ -110,19 +118,46 @@ export async function runChecks(
   return { ok, results };
 }
 
-export const DEFAULT_PROTECTED = [
-  ".github/**",
-  "AGENTS.md",
-  "CONTRIBUTING.md",
-  ".env",
-  ".env.*",
-  "*.p12",
-  "*.pfx",
-  "*.pem",
-  "*.p8",
-  "*.jks",
-  "*.keystore"
-];
+function requireChecksDefaults(profile: ProfileConfig): {
+  timeoutMs: number;
+  tailLines: number;
+  requiredDefault: boolean;
+} {
+  const defaults = profile.checksDefaults;
+  if (!defaults || typeof defaults !== "object") {
+    throw new Error("profile.checksDefaults is required (run `auto-work migrate`)");
+  }
+  const { timeoutMs, tailLines, requiredDefault } = defaults;
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("profile.checksDefaults.timeoutMs must be a positive number (run `auto-work migrate`)");
+  }
+  if (typeof tailLines !== "number" || !Number.isInteger(tailLines) || tailLines <= 0) {
+    throw new Error("profile.checksDefaults.tailLines must be a positive integer (run `auto-work migrate`)");
+  }
+  if (typeof requiredDefault !== "boolean") {
+    throw new Error("profile.checksDefaults.requiredDefault must be a boolean (run `auto-work migrate`)");
+  }
+  return { timeoutMs, tailLines, requiredDefault };
+}
+
+function requireSafety(profile: ProfileConfig): { protectedFiles: string[]; secretPatterns: string[] } {
+  const safety = profile.safety;
+  if (!safety || typeof safety !== "object") {
+    throw new Error("profile.safety is required (run `auto-work migrate`)");
+  }
+  const { protectedFiles, secretPatterns } = safety;
+  if (
+    !Array.isArray(protectedFiles) ||
+    !protectedFiles.length ||
+    !protectedFiles.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("profile.safety.protectedFiles must be a non-empty string array (run `auto-work migrate`)");
+  }
+  if (!Array.isArray(secretPatterns) || !secretPatterns.every((entry) => typeof entry === "string")) {
+    throw new Error("profile.safety.secretPatterns must be an array of regex strings (run `auto-work migrate`)");
+  }
+  return { protectedFiles, secretPatterns };
+}
 
 function globToRegExp(pattern: string): RegExp {
   const escaped = pattern
@@ -134,7 +169,10 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
-export function protectedFiles(files: string[], patterns: string[] = DEFAULT_PROTECTED): string[] {
+export function protectedFiles(files: string[], patterns: string[] | null | undefined): string[] {
+  if (!Array.isArray(patterns)) {
+    throw new Error("protected file patterns are required (safety.protectedFiles, run `auto-work migrate`)");
+  }
   const regexes = patterns.map((pattern) =>
     pattern.startsWith("re:") ? new RegExp(pattern.slice(3)) : globToRegExp(pattern)
   );
@@ -145,29 +183,23 @@ export function protectedFiles(files: string[], patterns: string[] = DEFAULT_PRO
   });
 }
 
-const SECRET_PATTERNS = [
-  /ZIKI_KEY[A-Z0-9_]*\s*=\s*\S+/i,
-  /\bghp_[A-Za-z0-9]{20,}\b/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
-  /\bsk-[A-Za-z0-9]{20,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY/,
-  /\bpassword\s*[:=]\s*["'][^"']{4,}["']/i
-];
-
-export function scanSecretsText(text: string): string[] {
+export function scanSecretsText(text: string, patterns: string[] | null | undefined): string[] {
+  if (!Array.isArray(patterns)) {
+    throw new Error("secret patterns are required (safety.secretPatterns, run `auto-work migrate`)");
+  }
   const hits: string[] = [];
-  for (const pattern of SECRET_PATTERNS) {
+  for (const source of patterns) {
+    const pattern = new RegExp(source, "i");
     const match = text.match(pattern);
     if (match?.[0]) hits.push(match[0].slice(0, 80));
   }
   return hits;
 }
 
-export function scanSecrets(diff: string): string[] {
+export function scanSecrets(diff: string, patterns: string[] | null | undefined): string[] {
   const added = diff
     .split("\n")
     .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
     .join("\n");
-  return scanSecretsText(added);
+  return scanSecretsText(added, patterns);
 }

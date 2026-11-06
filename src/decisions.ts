@@ -1,11 +1,37 @@
-import type { Comment, OwnerDecision } from "./types.js";
+import type { Comment, DecisionsPolicyConfig, OwnerDecision } from "./types.js";
 
-export const DECISION_MARKER = "**Decision from the owner:**";
+export interface DecisionParserPolicy {
+  marker?: string;
+  kinds?: string[];
+  trueWords?: string[];
+  falseWords?: string[];
+}
 
-function markerBody(body: string): string | null {
-  const index = body.indexOf(DECISION_MARKER);
+function requirePolicy(policy: DecisionParserPolicy | DecisionsPolicyConfig | null | undefined): {
+  marker: string;
+  kinds: string[];
+  trueWords: string[];
+  falseWords: string[];
+} {
+  const marker = policy?.marker;
+  const kinds = policy?.kinds;
+  const trueWords = policy?.trueWords;
+  const falseWords = policy?.falseWords;
+  if (typeof marker !== "string" || !marker) {
+    throw new Error("decisions.marker must be a non-empty string (run `auto-work migrate`)");
+  }
+  for (const [key, value] of [["kinds", kinds], ["trueWords", trueWords], ["falseWords", falseWords]] as const) {
+    if (!Array.isArray(value) || !value.length || !value.every((entry) => typeof entry === "string")) {
+      throw new Error(`decisions.${key} must be a non-empty string array (run \`auto-work migrate\`)`);
+    }
+  }
+  return { marker, kinds: kinds as string[], trueWords: trueWords as string[], falseWords: falseWords as string[] };
+}
+
+function markerBody(body: string, marker: string): string | null {
+  const index = body.indexOf(marker);
   if (index < 0) return null;
-  return body.slice(index + DECISION_MARKER.length).trim();
+  return body.slice(index + marker.length).trim();
 }
 
 function stripPunctuation(value: string): string {
@@ -21,34 +47,38 @@ function cleanKey(key: string): string {
   return text.trim();
 }
 
-function decisionKind(key: string): "confirm" | "merge" | null {
+function decisionKind(key: string, kinds: string[]): string | null {
   const text = cleanKey(key).toLowerCase();
-  for (const kind of ["confirm", "merge"] as const) {
-    if (text === kind || text.startsWith(`${kind} `) || text.startsWith(`${kind}#`)) return kind;
+  for (const kind of kinds) {
+    const lower = kind.toLowerCase();
+    if (text === lower || text.startsWith(`${lower} `) || text.startsWith(`${lower}#`)) return kind;
   }
   return null;
 }
 
-function decisionAnswer(value: string): boolean | null {
+function decisionAnswer(value: string, trueWords: string[], falseWords: string[]): boolean | null {
   let text = value.trim();
   while (text && "*`\"'".includes(text[0]!)) text = text.slice(1).trim();
   text = stripPunctuation(text).toLowerCase();
-  if (text === "yes" || text === "y" || text === "true") return true;
-  if (text === "no" || text === "n" || text === "false") return false;
+  if (trueWords.map((word) => word.toLowerCase()).includes(text)) return true;
+  if (falseWords.map((word) => word.toLowerCase()).includes(text)) return false;
   return null;
 }
 
-function labelledDecisions(body: string): Array<{ kind: "confirm" | "merge"; answer: boolean; text: string }> {
-  const found: Array<{ kind: "confirm" | "merge"; answer: boolean; text: string }> = [];
+function labelledDecisions(
+  body: string,
+  policy: { kinds: string[]; trueWords: string[]; falseWords: string[] }
+): Array<{ kind: string; answer: boolean; text: string }> {
+  const found: Array<{ kind: string; answer: boolean; text: string }> = [];
   for (const line of body.split(/\r?\n/)) {
     for (const segment of line.split(",")) {
       const separator = segment.indexOf(":");
       const equals = segment.indexOf("=");
       const at = separator >= 0 ? separator : equals;
       if (at < 0) continue;
-      const kind = decisionKind(segment.slice(0, at));
+      const kind = decisionKind(segment.slice(0, at), policy.kinds);
       if (!kind) continue;
-      const answer = decisionAnswer(segment.slice(at + 1));
+      const answer = decisionAnswer(segment.slice(at + 1), policy.trueWords, policy.falseWords);
       if (answer === null) continue;
       found.push({ kind, answer, text: segment.trim() });
     }
@@ -56,12 +86,16 @@ function labelledDecisions(body: string): Array<{ kind: "confirm" | "merge"; ans
   return found;
 }
 
-export function parseOwnerDecisions(comments: Comment[] | null | undefined): OwnerDecision[] {
+export function parseOwnerDecisions(
+  comments: Comment[] | null | undefined,
+  policy?: DecisionParserPolicy | DecisionsPolicyConfig | null | undefined
+): OwnerDecision[] {
+  const resolved = requirePolicy(policy);
   const decisions: OwnerDecision[] = [];
   for (const comment of comments ?? []) {
-    const body = markerBody(String(comment.body ?? ""));
+    const body = markerBody(String(comment.body ?? ""), resolved.marker);
     if (!body) continue;
-    for (const entry of labelledDecisions(body)) {
+    for (const entry of labelledDecisions(body, resolved)) {
       decisions.push({
         kind: entry.kind,
         answer: entry.answer,

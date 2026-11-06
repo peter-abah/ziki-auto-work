@@ -1,5 +1,7 @@
 import type { Idea, Issue, ProfileConfig } from "./types.js";
 export declare function baseUrl(profile: ProfileConfig): string;
+/** Project path segment: `org/project` when the org is known, else the legacy bare slug. */
+export declare function projectPath(profile: ProfileConfig): string;
 export declare function issueUrl(profile: ProfileConfig, issue: {
     number: number | string;
 }): string;

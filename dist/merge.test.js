@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mergeGateReason } from "./merge.js";
+const policy = {
+    openState: "OPEN",
+    passingChecks: "passing",
+    noneChecks: "none",
+    changesRequested: "CHANGES_REQUESTED",
+    approved: "APPROVED"
+};
 const base = {
     zikiReady: true,
     checks: "passing",
@@ -8,7 +15,8 @@ const base = {
     merged: false,
     state: "OPEN",
     reviewDecision: "APPROVED",
-    approvedReviews: 1
+    approvedReviews: 1,
+    policy
 };
 test("auto merge passes only when every gate is green", () => {
     assert.equal(mergeGateReason(base), null);
@@ -26,5 +34,18 @@ test("auto merge refuses handoff-only and blocked states", () => {
 test("required reviewer count must be met", () => {
     assert.match(mergeGateReason({ ...base, approvedReviews: 1, requiredReviewers: 2 }), /approvals/);
     assert.equal(mergeGateReason({ ...base, approvedReviews: 2, requiredReviewers: 2 }), null);
+});
+test("gate vocabulary comes from policy, not code", () => {
+    const custom = {
+        ...policy,
+        openState: "Abierto",
+        passingChecks: "ok",
+        approved: "YES",
+        changesRequested: "NO"
+    };
+    assert.equal(mergeGateReason({ ...base, state: "Abierto", checks: "ok", reviewDecision: "YES", approvedReviews: 1, policy: custom }), null);
+    assert.match(mergeGateReason({ ...base, state: "OPEN", policy: custom }), /pull request is open/);
+    assert.match(mergeGateReason({ ...base, state: "Abierto", checks: "ok", reviewDecision: "NO", policy: custom }), /changes/);
+    assert.throws(() => mergeGateReason({ ...base, policy: null }), /merge gate policy is required/);
 });
 //# sourceMappingURL=merge.test.js.map

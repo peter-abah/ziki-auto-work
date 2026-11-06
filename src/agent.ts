@@ -41,6 +41,32 @@ export function render(template: string, vars: Record<string, unknown>): string 
   });
 }
 
+/**
+ * Timeout for an agent spawn, fully config-driven (see `timing` in config).
+ * The role→knob wiring is fixed; every value must come from profile.timing
+ * (filled from init templates by loadProfile/migrate — never code literals).
+ */
+const ROLE_TIMEOUT_KEY = {
+  apiRepair: "repairMs",
+  configDoctor: "doctorMs",
+  triage: "triageMs",
+  owner: "ownerMs",
+  discovery: "discoveryMs"
+} as const;
+
+function requireTimingMs(profile: ProfileConfig, key: string): number {
+  const value = (profile.timing as Record<string, unknown> | undefined)?.[key];
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`profile.timing.${key} must be a positive number (run \`auto-work migrate\`)`);
+  }
+  return value;
+}
+
+export function agentTimeoutMs(profile: ProfileConfig, role: Role): number {
+  const key = (ROLE_TIMEOUT_KEY as Partial<Record<Role, string>>)[role] ?? "agentDefaultMs";
+  return requireTimingMs(profile, key);
+}
+
 const PROMPT_FILES: Partial<Record<Role | "pr", string>> = {
   stakeVote: "stake-vote",
   senseCheck: "sense-check",
@@ -208,9 +234,11 @@ export async function runAgent(options: {
     return { ok: false, error: `agent failed to start: ${exit.error.message}`, logPath, tail: truncate(tail, 2000), providerLimit: null };
   }
   let parsed: AgentResult | null = null;
+  let parsedFrom: "file" | "stdout" | null = null;
   if (existsSync(resultPath)) {
     try {
       parsed = JSON.parse(await readFile(resultPath, "utf8")) as AgentResult;
+      parsedFrom = "file";
     } catch (error) {
       return {
         ok: false,
@@ -221,8 +249,15 @@ export async function runAgent(options: {
         providerLimit: null
       };
     }
-  } else if (resultMode === "stdout") {
+  } else {
+    // The agent printed instead of writing the result file. The stdout tail
+    // often still holds a complete, valid answer — parse it rather than
+    // discarding the work, whatever the provider's result mode is.
     parsed = extractJsonResult(tail);
+    if (parsed) {
+      parsedFrom = "stdout";
+      logger?.info(`Agent result recovered from stdout (missing ${resultPath})`);
+    }
   }
 
   if (!parsed) {
@@ -387,7 +422,7 @@ export async function runApiRepair(options: {
     resultPath,
     logPath,
     logger: options.logger,
-    timeoutMs: 5 * 60_000,
+    timeoutMs: agentTimeoutMs(profile, "apiRepair"),
     onSpawn: options.onSpawn,
     onExit: options.onExit
   });
@@ -444,7 +479,7 @@ export async function runConfigDoctor(options: {
     resultPath,
     logPath,
     logger: options.logger,
-    timeoutMs: options.timeoutMs ?? 5 * 60_000,
+    timeoutMs: options.timeoutMs ?? agentTimeoutMs(profile, "configDoctor"),
     onSpawn: options.onSpawn,
     onExit: options.onExit
   });
@@ -497,7 +532,7 @@ export async function runDiscovery(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: 45 * 60 * 1000,
+    timeoutMs: agentTimeoutMs(profile, "discovery"),
     onSpawn: options.onSpawn,
     onExit: options.onExit
   });
@@ -695,7 +730,7 @@ export async function runTriage(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: 20 * 60 * 1000,
+    timeoutMs: agentTimeoutMs(profile, "triage"),
     onSpawn: options.onSpawn,
     onExit: options.onExit
   });
@@ -737,7 +772,7 @@ export async function runOwner(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: 30 * 60 * 1000,
+    timeoutMs: agentTimeoutMs(profile, "owner"),
     onSpawn: options.onSpawn,
     onExit: options.onExit
   });
@@ -785,7 +820,7 @@ export async function runPromptTask(options: {
     resultPath,
     logPath,
     logger,
-    timeoutMs: options.timeoutMs ?? 20 * 60 * 1000,
+    timeoutMs: options.timeoutMs ?? agentTimeoutMs(profile, role),
     onSpawn: options.onSpawn,
     onExit: options.onExit
   });
