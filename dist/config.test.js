@@ -43,6 +43,20 @@ function fixtureProfile(overrides = {}) {
         pollSeconds: 120,
         memoryRefreshMinutes: 30,
         hitl: { enabled: true, defaultType: "question", notifyCommand: null },
+        urls: {
+            envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
+            issuePath: "/{org?}/{project}/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        },
+        queue: {
+            priorities: { ready_issue: 6 },
+            buckets: { owner: [], work: ["ready_issue"], review: [], aux: [] },
+            noIssueKinds: [],
+            blockedStatuses: ["done"],
+            activeStatuses: ["working", "claimed"],
+            recentMs: 1800000
+        },
         ...overrides
     };
 }

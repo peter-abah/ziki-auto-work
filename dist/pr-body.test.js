@@ -22,6 +22,12 @@ function profile(templateFile) {
         platformMatch: { keywords: ["desktop"] },
         prompts: { dir: "prompts/generic" },
         pr: { templateFile, teamLead: "@lead" },
+        urls: {
+            envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
+            issuePath: "/{org?}/{project}/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        },
         discovery: { enabled: false },
         workflow: { maxFiles: 5, maxLines: 400, branchPrefix: "fix", commitTypes: ["fix"], requireTests: true },
         limits: {

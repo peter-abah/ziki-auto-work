@@ -1,7 +1,7 @@
 import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import { DEFAULT_TIMING, resolveModel, resolvePromptDir } from "./config.js";
+import { resolveModel, resolvePromptDir } from "./config.js";
 import { getProvider } from "./providers/index.js";
 import { PACKAGE_ROOT } from "./platform/paths.js";
 import { spawnCommand } from "./platform/spawn.js";
@@ -30,7 +30,8 @@ export function render(template, vars) {
 }
 /**
  * Timeout for an agent spawn, fully config-driven (see `timing` in config).
- * Falls back to built-in defaults so ad-hoc profiles keep working.
+ * The role→knob wiring is fixed; every value must come from profile.timing
+ * (filled from init templates by loadProfile/migrate — never code literals).
  */
 const ROLE_TIMEOUT_KEY = {
     apiRepair: "repairMs",
@@ -39,15 +40,16 @@ const ROLE_TIMEOUT_KEY = {
     owner: "ownerMs",
     discovery: "discoveryMs"
 };
+function requireTimingMs(profile, key) {
+    const value = profile.timing?.[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`profile.timing.${key} must be a positive number (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
 export function agentTimeoutMs(profile, role) {
-    const key = ROLE_TIMEOUT_KEY[role];
-    const specific = key ? profile.timing?.[key] : undefined;
-    if (typeof specific === "number" && specific > 0)
-        return specific;
-    const fallback = profile.timing?.agentDefaultMs;
-    if (typeof fallback === "number" && fallback > 0)
-        return fallback;
-    return DEFAULT_TIMING[key ?? "agentDefaultMs"] ?? 45 * 60_000;
+    const key = ROLE_TIMEOUT_KEY[role] ?? "agentDefaultMs";
+    return requireTimingMs(profile, key);
 }
 const PROMPT_FILES = {
     stakeVote: "stake-vote",

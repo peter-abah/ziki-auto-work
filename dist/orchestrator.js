@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULT_PR_TRACKING, DEFAULT_TIMING, loadProfile, resolveMergeMethod, resolveMergeMode, resolveParityFile, resolveRunLimits, validateConfigPatch } from "./config.js";
+import { loadProfile, resolveMergeMethod, resolveMergeMode, resolveParityFile, resolveRunLimits, validateConfigPatch } from "./config.js";
 import { createLogger, sleep, truncate } from "./log.js";
 import { runCommand } from "./platform/spawn.js";
 import { acquireLock, releaseLock, loadState, saveState, writePid, clearPid, isPaused, isStopped, counterFor, setTask, taskKey, pruneState, appendHistory, isAlive } from "./state.js";
@@ -23,7 +23,7 @@ import { escalate, markEscalationExpired, poll, writeNeedsHuman } from "./hitl.j
 import { buildQueue, textMatchesPlatform } from "./queue.js";
 import { rotatedKinds } from "./fair-queue.js";
 import { countGoodVerdicts, reviewGate, verdictsNeeded } from "./review-gate.js";
-import { errorMessage, isNoopZikiError, NOOP_PATTERNS } from "./noop.js";
+import { errorMessage, isNoopZikiError, noopPatterns } from "./noop.js";
 import { scanSecrets, protectedFiles } from "./checks.js";
 import { PACKAGE_ROOT, paths, safeName } from "./platform/paths.js";
 import { escalationUrl, inboxUrl } from "./urls.js";
@@ -45,40 +45,73 @@ import { blockerId, classifyError, clearBlocker, healthLabel, nextRetryDelay, re
 import { heuristicBidVote, heuristicCommentVote, resolveVotePolicy } from "./votes.js";
 import { latestDecision, parseOwnerDecisions } from "./decisions.js";
 import { formatLoopContext } from "./loop-context.js";
-import { sanitizeIdeaSummary } from "./idea-input.js";
+import { ideaPolicyLimits, sanitizeIdeaSummary } from "./idea-input.js";
+function requireStatusList(profile, key) {
+    const value = profile.statuses?.[key];
+    if (!Array.isArray(value) || !value.length || !value.every((entry) => typeof entry === "string")) {
+        throw new Error(`profile.statuses.${key} must be a non-empty string array (run \`auto-work migrate\`)`);
+    }
+    return new Set(value);
+}
 function workableStatuses(profile) {
-    const custom = profile.statuses?.workable;
-    return new Set(custom && custom.length ? custom : ["requires_confirmation", "open", "in_progress"]);
+    return requireStatusList(profile, "workable");
 }
 function terminalStatuses(profile) {
-    const custom = profile.statuses?.terminal;
-    return new Set(custom && custom.length ? custom : ["resolved", "closed", "done", "merge", "accepted"]);
+    return requireStatusList(profile, "terminal");
 }
 function terminalSubstatuses(profile) {
-    const custom = profile.statuses?.terminalSubstatus;
-    return new Set(custom && custom.length ? custom : ["done", "merge"]);
+    return requireStatusList(profile, "terminalSubstatus");
 }
 function confirmationStatuses(profile) {
-    const custom = profile.statuses?.confirmation;
-    return new Set(custom && custom.length ? custom : ["requires_confirmation"]);
+    return requireStatusList(profile, "confirmation");
 }
 function knownVocabulary(profile) {
-    const custom = profile.statuses?.known;
-    if (custom && custom.length)
-        return new Set(custom);
-    return new Set([
-        ...workableStatuses(profile),
-        ...terminalStatuses(profile),
-        ...terminalSubstatuses(profile),
-        "on_dev", "on_staging", "on_prod", "archived", "converted", "rejected",
-        // feed kinds the loop knows how to handle (see dispatch in processAux)
-        "ready_issue", "test_fix", "award_bid", "review_bid", "review_comment",
-        "reclaim_issue", "investigate_issue", "report_deployment", "report_pr_status",
-        "categorize", "sense_check", "active_claim", "offer", "review_offer",
-        "job_review_offer", "open_issue", "confirm_issue", "vote_importance",
-        "estimate_reward", "refresh_stake", "vote_stake", "merge_review",
-        "close_issue", "research_job", "review_idle", "join_request", "idea"
-    ]);
+    return requireStatusList(profile, "known");
+}
+function requireStringList(value, path) {
+    if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+        throw new Error(`${path} must be an array of strings (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function requirePositiveInt(value, path) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+        throw new Error(`${path} must be a non-negative integer (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function loopMs(profile, key) {
+    const value = profile.loop?.[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        throw new Error(`profile.loop.${key} must be a non-negative number (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function requireTimingMs(profile, key) {
+    const value = profile.timing?.[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`profile.timing.${key} must be a positive number (run \`auto-work migrate\`)`);
+    }
+    return value;
+}
+function discoverStrings(profile, key) {
+    return requireStringList(profile.discovery?.[key], `profile.discovery.${key}`);
+}
+function discoverLimit(profile, key) {
+    return requirePositiveInt(profile.discovery?.[key], `profile.discovery.${key}`);
+}
+function decisionsPolicy(profile) {
+    const decisions = profile.decisions;
+    if (!decisions || typeof decisions !== "object") {
+        throw new Error("profile.decisions is required (run `auto-work migrate`)");
+    }
+    return {
+        candidateStatuses: requireStringList(decisions.candidateStatuses, "profile.decisions.candidateStatuses"),
+        candidateSubstatuses: requireStringList(decisions.candidateSubstatuses, "profile.decisions.candidateSubstatuses"),
+        mergeStatuses: requireStringList(decisions.mergeStatuses, "profile.decisions.mergeStatuses"),
+        mergeSubstatuses: requireStringList(decisions.mergeSubstatuses, "profile.decisions.mergeSubstatuses"),
+        keyChars: requirePositiveInt(decisions.keyChars, "profile.decisions.keyChars")
+    };
 }
 /**
  * Surface any Ziki vocabulary we have never seen: statues, substatuses or
@@ -156,7 +189,23 @@ function trackingEnabled(profile) {
     return prTracking(profile).fixReviewComments;
 }
 function prTracking(profile) {
-    return { ...DEFAULT_PR_TRACKING, ...(profile.prTracking ?? {}) };
+    const tracking = profile.prTracking;
+    if (!tracking || typeof tracking !== "object") {
+        throw new Error("profile.prTracking is required (run `auto-work migrate`)");
+    }
+    const { enabled, pollMinutes, maxFollowUps, fixFailingChecks, fixReviewComments } = tracking;
+    if (typeof enabled !== "boolean")
+        throw new Error("profile.prTracking.enabled must be a boolean (run `auto-work migrate`)");
+    if (typeof pollMinutes !== "number" || !Number.isFinite(pollMinutes)) {
+        throw new Error("profile.prTracking.pollMinutes must be a number (run `auto-work migrate`)");
+    }
+    if (typeof maxFollowUps !== "number" || !Number.isFinite(maxFollowUps)) {
+        throw new Error("profile.prTracking.maxFollowUps must be a number (run `auto-work migrate`)");
+    }
+    if (typeof fixFailingChecks !== "boolean" || typeof fixReviewComments !== "boolean") {
+        throw new Error("profile.prTracking.fixFailingChecks/fixReviewComments must be booleans (run `auto-work migrate`)");
+    }
+    return { enabled, pollMinutes, maxFollowUps, fixFailingChecks, fixReviewComments };
 }
 function prTaskKey(task) {
     return `pr:${task.prUrl ?? task.number ?? "unknown"}`;
@@ -325,7 +374,7 @@ async function processPrFollowUp(ctx, task) {
     await save(ctx);
     const heartbeat = setInterval(() => {
         agent.client.heartbeat(issue.id).catch(() => { });
-    }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, zikiWorkflow: ctx.zikiWorkflow }));
+    }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy: ctx.profile.heartbeatPolicy, zikiWorkflow: ctx.zikiWorkflow }));
     let result;
     try {
         result = await runFollowUp({
@@ -610,8 +659,9 @@ function counter(ctx) {
     return counterFor(ctx.state);
 }
 function markRecent(ctx, key, ms) {
-    const window = ms ?? ctx.profile.timing?.markRecentMs ?? 30 * 60_000;
-    ctx.state.recentFeedKeys[key] = Date.now() - (30 * 60_000 - window);
+    const configured = requireTimingMs(ctx.profile, "markRecentMs");
+    const window = ms ?? configured;
+    ctx.state.recentFeedKeys[key] = Date.now() - (configured - window);
 }
 function history(ctx, entry) {
     void appendHistory(ctx.profilePaths, { at: new Date().toISOString(), ...entry }).catch(() => { });
@@ -772,18 +822,38 @@ async function flushOutboxPass(ctx) {
     await save(ctx).catch(() => { });
 }
 /** PR watch while the loop is blocked: GitHub reads only, local bookkeeping, no Ziki or Git writes. */
-const OFFLINE_WATCH_MAX_PRS = 5;
+function offlinePolicy(ctx) {
+    const offline = ctx.profile.offline;
+    if (!offline || typeof offline !== "object") {
+        throw new Error("profile.offline is required (run `auto-work migrate`)");
+    }
+    const { maxPrs, checkTimeoutMs, mutatingPattern, excludedStatuses } = offline;
+    if (typeof maxPrs !== "number" || !Number.isInteger(maxPrs) || maxPrs < 0) {
+        throw new Error("profile.offline.maxPrs must be a non-negative integer (run `auto-work migrate`)");
+    }
+    if (typeof checkTimeoutMs !== "number" || !Number.isFinite(checkTimeoutMs) || checkTimeoutMs <= 0) {
+        throw new Error("profile.offline.checkTimeoutMs must be a positive number (run `auto-work migrate`)");
+    }
+    if (typeof mutatingPattern !== "string" || !mutatingPattern) {
+        throw new Error("profile.offline.mutatingPattern must be a non-empty string (run `auto-work migrate`)");
+    }
+    if (!Array.isArray(excludedStatuses) || !excludedStatuses.every((entry) => typeof entry === "string")) {
+        throw new Error("profile.offline.excludedStatuses must be an array of strings (run `auto-work migrate`)");
+    }
+    return { maxPrs, checkTimeoutMs, mutatingPattern: new RegExp(mutatingPattern, "i"), excludedStatuses };
+}
 async function offlineWatchPass(ctx) {
     const now = Date.now();
-    const intervalMs = ctx.profile.timing?.offlineWatchMs ?? DEFAULT_TIMING.offlineWatchMs;
+    const policy = offlinePolicy(ctx);
+    const intervalMs = requireTimingMs(ctx.profile, "offlineWatchMs");
     const last = ctx.state.lastOfflineWatchAt ? new Date(ctx.state.lastOfflineWatchAt).getTime() : 0;
     if (now - last < intervalMs)
         return;
     ctx.state.lastOfflineWatchAt = new Date().toISOString();
-    const freshMs = ctx.profile.timing?.offlineFreshMs ?? DEFAULT_TIMING.offlineFreshMs;
+    const freshMs = requireTimingMs(ctx.profile, "offlineFreshMs");
     const candidates = Object.values(ctx.state.tasks)
-        .filter((task) => task.prUrl && !["done", "failed", "skipped"].includes(task.status))
-        .slice(0, OFFLINE_WATCH_MAX_PRS);
+        .filter((task) => task.prUrl && !policy.excludedStatuses.includes(task.status))
+        .slice(0, policy.maxPrs);
     for (const task of candidates) {
         try {
             if (task.prLastCheckedAt && now - new Date(task.prLastCheckedAt).getTime() < freshMs)
@@ -823,7 +893,8 @@ async function repoHealthPass(ctx) {
     if (!ctx.repoReady)
         return;
     const now = Date.now();
-    const intervalMs = ctx.profile.timing?.repoHealthMs ?? DEFAULT_TIMING.repoHealthMs;
+    const policy = offlinePolicy(ctx);
+    const intervalMs = requireTimingMs(ctx.profile, "repoHealthMs");
     const last = ctx.state.lastRepoHealthAt ? new Date(ctx.state.lastRepoHealthAt).getTime() : 0;
     if (now - last < intervalMs)
         return;
@@ -832,14 +903,14 @@ async function repoHealthPass(ctx) {
     const results = [];
     for (const check of ctx.profile.checks ?? []) {
         const cmdline = `${check.command} ${check.args.join(" ")}`;
-        if (/format/i.test(cmdline)) {
+        if (policy.mutatingPattern.test(cmdline)) {
             results.push({ name: check.name, skipped: "mutating check skipped outside agent worktrees" });
             continue;
         }
         try {
             const result = await runCommand(check.command, check.args, {
                 cwd: repoDir,
-                timeoutMs: check.timeoutMs ?? 10 * 60_000
+                timeoutMs: check.timeoutMs ?? policy.checkTimeoutMs
             });
             results.push({ name: check.name, ok: result.ok });
             if (!result.ok) {
@@ -867,7 +938,7 @@ async function repoHealthPass(ctx) {
             code: "checks_failing",
             severity: "warning",
             message: `Repo checks failing while blocked: ${failing.join(", ")}`,
-            retryMs: ctx.profile.timing?.repoHealthMs ?? DEFAULT_TIMING.repoHealthMs
+            retryMs: requireTimingMs(ctx.profile, "repoHealthMs")
         });
     }
     else {
@@ -1502,7 +1573,7 @@ async function loopContextFor(ctx, options = {}) {
         };
     }
     const task = issue ? ctx.state.tasks[taskKey(issue)] ?? null : null;
-    const decisions = parseOwnerDecisions(issue?.comments);
+    const decisions = parseOwnerDecisions(issue?.comments, ctx.profile.decisions);
     const started = ctx.state.run.startedAt ? new Date(ctx.state.run.startedAt).getTime() : Date.now();
     const available = (ctx.queue?.all ?? []).slice(0, 8).map((entry) => `${entry.kind} #${entry.issueNumber ?? entry.ideaNumber ?? "?"} ${truncate(entry.title, 80)}`);
     const blocked = [
@@ -1841,15 +1912,16 @@ async function loadPlatformSets(ctx) {
 }
 async function heartbeatPass(ctx) {
     const now = Date.now();
-    const intervalMs = resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, zikiWorkflow: ctx.zikiWorkflow });
-    const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now, intervalMs));
+    const policy = ctx.profile.heartbeatPolicy;
+    const intervalMs = resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy, zikiWorkflow: ctx.zikiWorkflow });
+    const live = Object.values(ctx.state.tasks).filter((task) => heartbeatDue(task, now, intervalMs, policy));
     if (!live.length)
         return;
     const results = await Promise.allSettled(live.map(async (task) => {
         const agent = clientByName(ctx, task.agentName);
         if (!agent || !task.id)
             throw new Error("agent key is not available");
-        await agent.client.heartbeat(task.id, { timeoutMs: 15_000, retries: 0, maxRetryAfterMs: 15_000 });
+        await agent.client.heartbeat(task.id);
         return { task, agent };
     }));
     for (let index = 0; index < results.length; index += 1) {
@@ -1860,7 +1932,7 @@ async function heartbeatPass(ctx) {
             ctx.logger.info(`Heartbeat #${task.number}`, { agent: result.value.agent.name });
             continue;
         }
-        const failure = applyHeartbeatFailure(task, result.reason, now);
+        const failure = applyHeartbeatFailure(task, result.reason, now, policy);
         const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
         ctx.logger.warn(`Heartbeat failed for #${task.number}: ${message}`, {
             claimLost: failure.claimLost,
@@ -2042,7 +2114,7 @@ async function processWorkItem(ctx, item, preferredWorker) {
         .join("\n\n") || "(none)";
     const heartbeat = setInterval(() => {
         worker.client.heartbeat(issue.id).catch(() => { });
-    }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, zikiWorkflow: ctx.zikiWorkflow }));
+    }, resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy: ctx.profile.heartbeatPolicy, zikiWorkflow: ctx.zikiWorkflow }));
     let result;
     try {
         result = await runWorker({
@@ -2450,9 +2522,10 @@ async function processTestFix(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return;
     }
-    const reviewable = issue.status === "done" ||
-        ["requires_review", "accepted"].includes(issue.substatus) ||
-        ["done", "accepted"].includes(issue.status);
+    const gatePolicy = ctx.profile.reviewGate;
+    const reviewableStatuses = new Set(requireStringList(gatePolicy?.reviewableStatuses, "profile.reviewGate.reviewableStatuses"));
+    const reviewableSubstatuses = new Set(requireStringList(gatePolicy?.reviewableSubstatuses, "profile.reviewGate.reviewableSubstatuses"));
+    const reviewable = reviewableStatuses.has(issue.status) || reviewableSubstatuses.has(issue.substatus);
     if (!reviewable) {
         ctx.logger.info(`Skipping review of #${issue.number}: it is ${issue.status}/${issue.substatus}, not awaiting review`);
         markRecent(ctx, item.key);
@@ -2476,9 +2549,8 @@ async function processTestFix(ctx, item, preferred) {
     const gate = reviewGate({
         status,
         goodVerdicts,
-        verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow),
-        transientMs: ctx.profile.timing?.reviewTransientMs,
-        terminalMs: ctx.profile.timing?.reviewTerminalMs
+        verdictsNeeded: verdictsNeeded(ctx.zikiWorkflow, ctx.profile.reviewGate?.workflowKeys),
+        policy: ctx.profile.reviewGate ?? {}
     });
     if (!gate.ok || !status) {
         ctx.logger.info(`Skipping review of #${issue.number}: ${gate.reason}`);
@@ -2541,7 +2613,7 @@ async function processTestFix(ctx, item, preferred) {
         });
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.review)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "review"), ctx.profile.noop)) {
             ctx.logger.info(`Review of #${issue.number} is no longer needed: ${errorMessage(error)}`);
             history(ctx, { type: "decision", issue: issue.number, detail: `review skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
@@ -2752,9 +2824,9 @@ async function processDeploymentReport(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    const environment = deploymentEnvironment(item.key);
+    const environment = deploymentEnvironment(item.key, ctx.profile.urls);
     if (!environment) {
-        ctx.logger.warn(`Deployment report for #${issue.number} has no on_dev/on_staging/on_prod key suffix; skipping`);
+        ctx.logger.warn(`Deployment report for #${issue.number} has no known environment key suffix; skipping`);
         markRecent(ctx, item.key);
         return false;
     }
@@ -2805,7 +2877,7 @@ async function processBidVote(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    const policy = resolveVotePolicy(ctx.profile.workflow.autoVoteBids);
+    const policy = resolveVotePolicy(ctx.profile.workflow.autoVoteBids, ctx.profile.votes);
     if (policy === "off") {
         history(ctx, { type: "aux", issue: item.issueNumber, detail: "bid vote skipped: autoVoteBids is off" });
         markRecent(ctx, item.key);
@@ -2815,7 +2887,7 @@ async function processBidVote(ctx, item, preferred) {
     if (!voter)
         return false;
     if (policy === "heuristic") {
-        if (!heuristicBidVote(item.detail)) {
+        if (!heuristicBidVote(item.detail, ctx.profile.votes)) {
             markRecent(ctx, item.key);
             return false;
         }
@@ -2899,7 +2971,7 @@ async function processCommentUpvote(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    const policy = resolveVotePolicy(ctx.profile.workflow.autoUpvoteComments);
+    const policy = resolveVotePolicy(ctx.profile.workflow.autoUpvoteComments, ctx.profile.votes);
     if (policy === "off") {
         history(ctx, { type: "aux", issue: item.issueNumber, detail: "comment vote skipped: autoUpvoteComments is off" });
         markRecent(ctx, item.key);
@@ -2909,7 +2981,7 @@ async function processCommentUpvote(ctx, item, preferred) {
     if (!voter)
         return false;
     if (policy === "heuristic") {
-        if (!heuristicCommentVote(item.detail)) {
+        if (!heuristicCommentVote(item.detail, ctx.profile.votes)) {
             markRecent(ctx, item.key);
             return false;
         }
@@ -3139,7 +3211,8 @@ async function processOpenIssue(ctx, item, preferred) {
         markRecent(ctx, item.key);
         return false;
     }
-    if (issue.status !== "requires_confirmation" && issue.substatus !== "requires_confirmation") {
+    const awaiting = confirmationStatuses(ctx.profile);
+    if (!awaiting.has(issue.status) && !awaiting.has(issue.substatus)) {
         history(ctx, { type: "decision", issue: issue.number, detail: "open skipped: issue is not awaiting confirmation" });
         markRecent(ctx, item.key);
         return false;
@@ -3148,7 +3221,7 @@ async function processOpenIssue(ctx, item, preferred) {
         await (preferred ?? agentForItem(ctx, item)).client.openIssue(issue.id);
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.open)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "open"), ctx.profile.noop)) {
             history(ctx, { type: "decision", issue: issue.number, detail: `open skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
             return false;
@@ -3184,7 +3257,7 @@ async function processReclaim(ctx, item, preferred) {
         await (preferred ?? agentForItem(ctx, item)).client.reclaim(issue.id);
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.reclaim)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "reclaim"), ctx.profile.noop)) {
             history(ctx, { type: "decision", issue: issue.number, detail: `reclaim skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
             return false;
@@ -3688,7 +3761,7 @@ async function processReviewIdle(ctx, item, preferred) {
         await manager.client.reclaim(issue.id);
     }
     catch (error) {
-        if (isNoopZikiError(error, NOOP_PATTERNS.reclaim)) {
+        if (isNoopZikiError(error, noopPatterns(ctx.profile.noop, "reclaim"), ctx.profile.noop)) {
             history(ctx, { type: "decision", issue: issue.number, detail: `idle reclaim skipped: ${errorMessage(error)}` });
             markRecent(ctx, item.key);
             return false;
@@ -3813,28 +3886,32 @@ async function discoveryPass(ctx) {
     const runCycles = cyclesThisRun(ctx.state);
     if (runCycles <= 0 || runCycles % every !== 0)
         return;
+    const existingStatuses = new Set(discoverStrings(ctx.profile, "existingStatuses"));
+    const mergedStatuses = new Set(discoverStrings(ctx.profile, "recentMergedStatuses"));
+    const mergedSubstatuses = new Set(discoverStrings(ctx.profile, "recentMergedSubstatuses"));
     const existing = (ctx.platform.issues ?? [])
-        .filter((issue) => ["open", "in_progress", "done", "merge", "resolved", "closed"].includes(issue.status))
-        .slice(0, 300)
+        .filter((issue) => existingStatuses.has(issue.status))
+        .slice(0, discoverLimit(ctx.profile, "contextIssueLimit"))
         .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
         .join("\n");
     const existingIdeas = (ctx.platform.ideas ?? [])
-        .slice(0, 300)
+        .slice(0, discoverLimit(ctx.profile, "contextIssueLimit"))
         .map((idea) => `#${idea.number} ${idea.title} [${idea.status}]`)
         .join("\n");
     const recentMerged = (ctx.platform.issues ?? [])
-        .filter((issue) => ["resolved", "closed"].includes(issue.status) || ["on_dev", "on_staging", "on_prod"].includes(issue.substatus))
-        .slice(0, 60)
+        .filter((issue) => mergedStatuses.has(issue.status) || mergedSubstatuses.has(issue.substatus))
+        .slice(0, discoverLimit(ctx.profile, "contextMergedLimit"))
         .map((issue) => `#${issue.number} ${issue.title} [${issue.status}/${issue.substatus}]`)
         .join("\n");
+    const taskLimit = discoverLimit(ctx.profile, "contextTaskLimit");
     const inFlight = [
         ...Object.values(ctx.state.tasks)
             .filter((task) => ["claimed", "working", "delivered"].includes(task.status))
-            .slice(0, 40)
+            .slice(0, taskLimit)
             .map((task) => `#${task.number} ${task.title ?? ""} [${task.status}]`),
         ...Object.values(ctx.state.tasks)
             .filter((task) => task.claimId && ["claimed", "working"].includes(task.status))
-            .slice(0, 40)
+            .slice(0, taskLimit)
             .map((task) => `claim #${task.number} ${task.claimId}`)
     ].join("\n");
     const platformPolicy = [
@@ -3884,10 +3961,11 @@ async function discoveryPass(ctx) {
     for (const idea of ideas) {
         if (!idea?.title || !idea?.description)
             continue;
+        const ideaLimits = ideaPolicyLimits(ctx.profile.idea);
         const baseInput = {
-            title: idea.title.slice(0, 200),
-            summary: sanitizeIdeaSummary(idea.summary, idea.title),
-            description: idea.description.slice(0, 5000),
+            title: idea.title.slice(0, ideaLimits.titleMax),
+            summary: sanitizeIdeaSummary(idea.summary, idea.title, ctx.profile.idea),
+            description: idea.description.slice(0, ideaLimits.descriptionMax),
             idempotencyKey: `aw-${ctx.profileName}-${new Date().toISOString().slice(0, 10)}-${slugify(idea.title, 50)}`,
             acknowledgeSimilar: false
         };
@@ -3976,24 +4054,27 @@ async function cleanupOldWorktrees(ctx) {
     }
 }
 async function ownerDecisionPass(ctx) {
-    const candidates = (ctx.platform.issues ?? []).filter((issue) => issue.substatus === "requires_confirmation" ||
-        issue.substatus === "requires_review" ||
-        issue.status === "requires_confirmation" ||
-        ["done", "accepted", "merge"].includes(issue.status));
-    for (const candidate of candidates.slice(0, 25)) {
+    const policy = decisionsPolicy(ctx.profile);
+    const candidateSubstatuses = new Set(policy.candidateSubstatuses);
+    const candidateStatuses = new Set(policy.candidateStatuses);
+    const candidates = (ctx.platform.issues ?? []).filter((issue) => candidateSubstatuses.has(issue.substatus) ||
+        candidateSubstatuses.has(issue.status) ||
+        candidateStatuses.has(issue.status));
+    for (const candidate of candidates.slice(0, discoverLimit(ctx.profile, "ownerCandidateLimit"))) {
         if (ctx.pool.total() >= ctx.capacity.agentCeiling)
             return;
         const data = await ctx.primary.client.getIssue(candidate.id).catch(() => null);
         const issue = normalizeIssue(data);
         if (!issue)
             continue;
-        const decisions = parseOwnerDecisions(issue.comments);
+        const decisions = parseOwnerDecisions(issue.comments, ctx.profile.decisions);
         if (!decisions.length)
             continue;
-        const stateKey = (decision) => `decision:${issue.id}:${decision.kind}:${decision.answer}:${decision.text.slice(0, 80)}`;
+        const stateKey = (decision) => `decision:${issue.id}:${decision.kind}:${decision.answer}:${decision.text.slice(0, policy.keyChars)}`;
         const confirm = latestDecision(decisions, "confirm");
         const merge = latestDecision(decisions, "merge");
-        if (confirm && (issue.substatus === "requires_confirmation" || issue.status === "requires_confirmation")) {
+        const awaiting = confirmationStatuses(ctx.profile);
+        if (confirm && (awaiting.has(issue.substatus) || awaiting.has(issue.status))) {
             const key = stateKey(confirm);
             if (ctx.state.recentFeedKeys[key])
                 continue;
@@ -4045,7 +4126,7 @@ async function ownerDecisionPass(ctx) {
                 ctx.logger.warn(`Owner confirmation decision for #${issue.number} failed: ${error instanceof Error ? error.message : String(error)}`);
             }
         }
-        if (merge && (["done", "accepted", "merge"].includes(issue.status) || issue.substatus === "requires_review")) {
+        if (merge && (new Set(policy.mergeStatuses).has(issue.status) || new Set(policy.mergeSubstatuses).has(issue.substatus))) {
             const key = stateKey(merge);
             if (ctx.state.recentFeedKeys[key])
                 continue;
@@ -4895,25 +4976,25 @@ export async function runLoop(options = {}) {
             if (ctx.tokenLimitReached) {
                 stopReason = "token-limit";
                 logger.info("Run token budget reached", { tokens: ctx.state.run.tokens.total });
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             if (ctx.providerLimit) {
                 stopReason = "provider-limit";
                 logger.info("Provider limit reached; stopping");
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             if (options.once) {
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             if (ctx.rateLimitUntil > Date.now()) {
                 while (ctx.rateLimitUntil > Date.now() && !controller.signal.aborted) {
                     await heartbeatPass(ctx);
-                    const chunkMs = ctx.profile.timing?.rateLimitChunkMs ?? DEFAULT_TIMING.rateLimitChunkMs;
+                    const chunkMs = requireTimingMs(ctx.profile, "rateLimitChunkMs");
                     const wait = Math.min(chunkMs, ctx.rateLimitUntil - Date.now());
-                    await sleep(Math.max(1000, wait), controller.signal);
+                    await sleep(Math.max(loopMs(ctx.profile, "pollFloorMs"), wait), controller.signal);
                 }
                 continue;
             }
@@ -4921,12 +5002,13 @@ export async function runLoop(options = {}) {
             if (reason) {
                 stopReason = reason;
                 logger.info(`Run limit reached: ${reason}`, { cycles: ctx.state.cycles, deliveries: ctx.state.run.deliveries });
-                await ctx.pool.drain(120_000);
+                await ctx.pool.drain(loopMs(ctx.profile, "drainMs"), loopMs(ctx.profile, "drainSliceMs"));
                 break;
             }
             const retry = nextRetryDelay(ctx.state.health);
             const waitMs = Math.max(ctx.profile.pollSeconds * 1000, retry ?? 0);
-            await ctx.pool.waitForPoolOrTimeout(Number.isFinite(waitMs) ? waitMs : ctx.profile.pollSeconds * 1000, controller.signal);
+            const floorMs = loopMs(ctx.profile, "pollFloorMs");
+            await ctx.pool.waitForPoolOrTimeout(Number.isFinite(waitMs) ? Math.max(waitMs, floorMs) : ctx.profile.pollSeconds * 1000, controller.signal);
         } while (!controller.signal.aborted);
     }
     catch (error) {
@@ -4962,10 +5044,10 @@ export async function runLoop(options = {}) {
             controller.abort();
             killActiveAgents();
         }
-        await ctx.pool.drain(30_000);
+        await ctx.pool.drain(loopMs(ctx.profile, "stopDrainMs"), loopMs(ctx.profile, "drainSliceMs"));
         if (ctx.pool.total()) {
             killActiveAgents();
-            await ctx.pool.drain(5_000);
+            await ctx.pool.drain(loopMs(ctx.profile, "killDrainMs"), loopMs(ctx.profile, "drainSliceMs"));
         }
         ctx.state.activePids = [];
         if (ctx.statusTimer)

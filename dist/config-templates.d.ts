@@ -24,7 +24,7 @@ export declare function templateVersion(templates: InitTemplates): number;
  * values. Sections present in templates: limits, workflow, prTracking,
  * timing, statuses, repair, transport, operations, queue, reviewGate,
  * heartbeatPolicy, decisions, noop, votes, idea, apiRepair, capacity, urls,
- * discover, github, safety, checksDefaults, outbox, bootstrap, loop, envFiles.
+ * discover, github, safety, checksDefaults, outbox, bootstrap, offline, loop, envFiles.
  */
 export declare function fillProfileFromTemplates(profile: ProfileConfig, templates: InitTemplates): {
     profile: ProfileConfig;

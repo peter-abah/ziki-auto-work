@@ -35,7 +35,7 @@ test("TaskPool enforces per-kind and total agent limits", async () => {
   assert.equal(pool.canStart("aux"), false);
 
   [gates[0]!, gates[1]!, gates[3]!, gates[4]!].forEach((gate) => gate.release());
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
   assert.equal(pool.total(), 0);
 });
 
@@ -66,7 +66,7 @@ test("scheduler starts two deliveries and one review concurrently", async () => 
   assert.deepEqual(started.sort(), ["d1", "d2", "r1"]);
   assert.equal(pool.reserve("issue-3", "delivery", task("d3")), false);
   gates.forEach((release) => release());
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
 });
 
 test("TaskPool.list reports in-flight kind and age for status", async () => {
@@ -79,7 +79,7 @@ test("TaskPool.list reports in-flight kind and age for status", async () => {
   assert.equal(list[0]!.kind, "delivery");
   assert.ok(list[0]!.ageMs >= 0);
   gate.release();
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
 });
 
 test("TaskPool keeps a human label alongside the raw dedupe key", async () => {
@@ -91,7 +91,7 @@ test("TaskPool keeps a human label alongside the raw dedupe key", async () => {
   assert.equal(task!.key, "ready_issue:cmw2");
   assert.equal(task!.label, "#2624 typing-indicator");
   gate.release();
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
   assert.equal(pool.total(), 0);
 });
 
@@ -115,7 +115,7 @@ test("TaskPool records which agent runs a task", async () => {
   pool.reserve("key", "delivery", gate.run, "#1 fix", "Muadib");
   assert.equal(pool.list()[0]!.agent, "Muadib");
   gate.release();
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
 });
 
 test("TaskPool notifies when tasks start and finish", async () => {
@@ -126,7 +126,7 @@ test("TaskPool notifies when tasks start and finish", async () => {
   pool.reserve("key", "delivery", gate.run);
   assert.equal(changes, 1);
   gate.release();
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
   assert.equal(changes, 2);
 });
 
@@ -148,5 +148,5 @@ test("waitForPoolOrTimeout wakes early when a pooled task finishes", async () =>
   const started = Date.now();
   await pool.waitForPoolOrTimeout(5000);
   assert.ok(Date.now() - started < 2000, `did not wake early (${Date.now() - started}ms)`);
-  await pool.drain(1000);
+  await pool.drain(1000, 100);
 });

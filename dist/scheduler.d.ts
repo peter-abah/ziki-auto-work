@@ -37,5 +37,5 @@ export declare class TaskPool {
      * joins the race when it is non-empty.
      */
     waitForPoolOrTimeout(ms: number, signal?: AbortSignal): Promise<void>;
-    drain(timeoutMs?: number): Promise<void>;
+    drain(timeoutMs: number, sliceMs: number): Promise<void>;
 }

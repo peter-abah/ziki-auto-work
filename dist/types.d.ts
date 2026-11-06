@@ -239,6 +239,16 @@ export interface DiscoveryConfig {
     maxCyclesBeforeRun?: number;
     alreadyVetted?: boolean;
     vettedNote?: string;
+    /** Issue statuses shown as existing context (informational prompt context). */
+    existingStatuses?: string[];
+    /** Resolved-ish statuses/substatuses shown as recently merged context. */
+    recentMergedStatuses?: string[];
+    recentMergedSubstatuses?: string[];
+    /** Prompt-context caps (counts, not behavior). */
+    contextIssueLimit?: number;
+    contextMergedLimit?: number;
+    contextTaskLimit?: number;
+    ownerCandidateLimit?: number;
 }
 export interface LimitsConfig {
     maxActiveClaims: CapacityLimit;
@@ -416,6 +426,8 @@ export interface QueuePolicyConfig {
         aux?: string[];
     };
     noIssueKinds?: string[];
+    blockedStatuses?: string[];
+    activeStatuses?: string[];
     recentMs?: number;
 }
 export interface ReviewGatePolicyConfig {
@@ -429,6 +441,9 @@ export interface ReviewGatePolicyConfig {
         none?: string;
     };
     workflowKeys?: string[];
+    /** Issue states that count as awaiting test review (processTestFix gate). */
+    reviewableStatuses?: string[];
+    reviewableSubstatuses?: string[];
 }
 export interface HeartbeatPolicyConfig {
     intervalMs?: number;
@@ -443,6 +458,14 @@ export interface DecisionsPolicyConfig {
     kinds?: string[];
     trueWords?: string[];
     falseWords?: string[];
+    /** Issue statuses/substatuses scanned for owner decisions. */
+    candidateStatuses?: string[];
+    candidateSubstatuses?: string[];
+    /** Issue states where a merge decision may be acted on. */
+    mergeStatuses?: string[];
+    mergeSubstatuses?: string[];
+    /** Chars of decision text kept in the dedupe key. */
+    keyChars?: number;
 }
 export interface NoopPolicyConfig {
     statuses?: number[];
@@ -458,6 +481,8 @@ export interface IdeaPolicyConfig {
     summaryMin?: number;
     suffix?: string;
     summaryMax?: number;
+    titleMax?: number;
+    descriptionMax?: number;
     fallback?: string;
 }
 export interface ApiRepairPolicyConfig {
@@ -522,9 +547,23 @@ export interface BootstrapPolicyConfig {
 }
 export interface LoopPolicyConfig {
     drainMs?: number;
+    stopDrainMs?: number;
+    killDrainMs?: number;
+    drainSliceMs?: number;
     truncLen?: number;
     cacheMs?: number;
     statusAgeMs?: number;
+    pollFloorMs?: number;
+}
+export interface OfflinePolicyConfig {
+    /** Max PRs re-read per blocked-loop pass. */
+    maxPrs?: number;
+    /** Timeout for each repo health check. */
+    checkTimeoutMs?: number;
+    /** Case-insensitive pattern; matching checks are skipped as mutating. */
+    mutatingPattern?: string;
+    /** Task states excluded from the blocked-loop PR watch. */
+    excludedStatuses?: string[];
 }
 export interface ChecksDefaultsConfig {
     timeoutMs?: number;
@@ -579,6 +618,7 @@ export interface ProfileConfig {
     outbox?: OutboxPolicyConfig;
     bootstrap?: BootstrapPolicyConfig;
     loop?: LoopPolicyConfig;
+    offline?: OfflinePolicyConfig;
 }
 export interface DoctorConfig {
     minFreeGb?: number;
@@ -780,7 +820,7 @@ export interface ResearchJob {
     [key: string]: unknown;
 }
 export interface OwnerDecision {
-    kind: "confirm" | "merge";
+    kind: string;
     answer: boolean;
     text: string;
     at?: string;

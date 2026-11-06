@@ -973,21 +973,18 @@ export async function loadProfile(profileName?: string): Promise<LoadedProfile> 
     );
   }
   const merged = deepMerge(config.defaults ?? {}, rawProfile) as ProfileConfig;
-  merged.limits = { ...DEFAULT_LIMITS, ...(merged.limits ?? {}) };
-  merged.workflow = { ...DEFAULT_WORKFLOW, ...(merged.workflow ?? {}) };
   merged.providers = { ...(config.providers ?? {}), ...(merged.providers ?? {}) };
-  merged.repo = { ...merged.repo, envFiles: merged.repo?.envFiles ?? DEFAULT_ENV_FILES };
-  merged.executor = { ...merged.executor, timeoutMs: merged.executor?.timeoutMs ?? 2_700_000, permissionMode: merged.executor?.permissionMode ?? "auto" };
-  const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: merged } });
-  if (!validation.ok) {
-    throw new Error(`Invalid profile "${name}":\n${validation.errors.join("\n")}`);
-  }
-  // v4 sections are data-filled from init templates (never code literals), so
-  // unmigrated v3 profiles run with template-sourced transport/operations.
-  // `config --explain` reports this provenance; `migrate` persists it to disk.
+  // Behavioural values are data-filled from init templates (never code
+  // literals), so unmigrated profiles keep working with template-sourced
+  // values. `config --explain` reports this provenance; `migrate` persists
+  // it to disk.
   const { loadInitTemplates, fillProfileFromTemplates } = await import("./config-templates.js");
   const templates = await loadInitTemplates();
   const { profile } = fillProfileFromTemplates(merged, templates);
+  const validation = validateConfig({ ...config, activeProfile: name, profiles: { [name]: profile } });
+  if (!validation.ok) {
+    throw new Error(`Invalid profile "${name}":\n${validation.errors.join("\n")}`);
+  }
 
   const env = await loadEnv();
   const getKey = (keyName: string): string | null => env[keyName] || process.env[keyName] || null;

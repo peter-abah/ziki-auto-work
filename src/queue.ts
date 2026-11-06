@@ -1,101 +1,75 @@
-import type { ProfileConfig, Queue, QueueEntry, State, WorkFeed, WorkItem } from "./types.js";
+import type { ProfileConfig, Queue, QueueEntry, QueuePolicyConfig, State, WorkFeed, WorkItem } from "./types.js";
 
-const PRIORITY: Record<string, number> = {
-  owner_request: 1,
-  offer: 2,
-  review_offer: 3,
-  job_review_offer: 3,
-  active_claim: 4,
-  reclaim_issue: 5,
-  ready_issue: 6,
-  open_issue: 7,
-  test_fix: 8,
-  deliver_stranded: 9,
-  accept_fix: 10,
-  merge_fix: 11,
-  reconcile_merged: 12,
-  await_release: 13,
-  convert_idea: 14,
-  reject_idea: 15,
-  confirm_issue: 16,
-  idea: 17,
-  vote_importance: 18,
-  sense_check: 19,
-  close_issue: 20,
-  review_idle: 21,
-  estimate_reward: 22,
-  investigate_issue: 23,
-  vote_stake: 24,
-  refresh_stake: 25,
-  review_comment: 26,
-  report_pr_status: 27,
-  report_deployment: 28,
-  repair_pull_request: 29,
-  research_job: 30,
-  award_bid: 31,
-  review_bid: 32,
-  categorize: 33
-};
+export interface QueueSets {
+  priorities: Record<string, number>;
+  owner: Set<string>;
+  work: Set<string>;
+  review: Set<string>;
+  aux: Set<string>;
+  known: Set<string>;
+  noIssue: Set<string>;
+  blockedStatuses: string[];
+  activeStatuses: string[];
+  recentMs: number;
+  unknownPriority: number;
+}
 
-export const OWNER_KINDS = new Set(["owner_request"]);
+function requireArray(value: unknown, path: string): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new Error(`${path} must be an array of strings (run \`auto-work migrate\`)`);
+  }
+  return value as string[];
+}
 
-export const WORK_KINDS = new Set([
-  "offer",
-  "review_offer",
-  "job_review_offer",
-  "active_claim",
-  "ready_issue",
-  "open_issue",
-  "reclaim_issue"
-]);
+/**
+ * Queue policy from config — no built-in buckets, priorities or gates.
+ * Unknown kinds sort after every known kind (derived max+1, not a literal)
+ * and land in the "other" bucket where the unknown-vocabulary warning
+ * surfaces them instead of dropping them.
+ */
+export function queueSets(profile: ProfileConfig): QueueSets {
+  const policy = profile.queue as QueuePolicyConfig | undefined;
+  if (!policy || typeof policy !== "object") {
+    throw new Error("profile.queue is required (run `auto-work migrate`)");
+  }
+  if (!policy.priorities || typeof policy.priorities !== "object") {
+    throw new Error("profile.queue.priorities is required (run `auto-work migrate`)");
+  }
+  const buckets = policy.buckets;
+  if (!buckets || typeof buckets !== "object") {
+    throw new Error("profile.queue.buckets is required (run `auto-work migrate`)");
+  }
+  const owner = new Set(requireArray(buckets.owner, "profile.queue.buckets.owner"));
+  const work = new Set(requireArray(buckets.work, "profile.queue.buckets.work"));
+  const review = new Set(requireArray(buckets.review, "profile.queue.buckets.review"));
+  const aux = new Set(requireArray(buckets.aux, "profile.queue.buckets.aux"));
+  const known = new Set([...owner, ...work, ...review, ...aux]);
+  const values = Object.values(policy.priorities);
+  const unknownPriority = values.length ? Math.max(...values) + 1 : 0;
+  return {
+    priorities: policy.priorities,
+    owner,
+    work,
+    review,
+    aux,
+    known,
+    noIssue: new Set(requireArray(policy.noIssueKinds, "profile.queue.noIssueKinds")),
+    blockedStatuses: requireArray(policy.blockedStatuses, "profile.queue.blockedStatuses"),
+    activeStatuses: requireArray(policy.activeStatuses, "profile.queue.activeStatuses"),
+    recentMs:
+      typeof policy.recentMs === "number" && Number.isFinite(policy.recentMs) && policy.recentMs >= 0
+        ? policy.recentMs
+        : (() => {
+            throw new Error("profile.queue.recentMs must be a non-negative number (run `auto-work migrate`)");
+          })(),
+    unknownPriority
+  };
+}
 
-export const REVIEW_KINDS = new Set([
-  "test_fix",
-  "accept_fix",
-  "review_idle",
-  "deliver_stranded",
-  "merge_fix",
-  "reconcile_merged"
-]);
-
-export const AUX_KINDS = new Set([
-  "idea",
-  "convert_idea",
-  "reject_idea",
-  "confirm_issue",
-  "close_issue",
-  "sense_check",
-  "vote_importance",
-  "estimate_reward",
-  "investigate_issue",
-  "review_comment",
-  "refresh_stake",
-  "vote_stake",
-  "report_pr_status",
-  "report_deployment",
-  "repair_pull_request",
-  "await_release",
-  "research_job",
-  "award_bid",
-  "review_bid",
-  "categorize"
-]);
-
-const NO_ISSUE_KINDS = new Set([
-  "owner_request",
-  "categorize",
-  "research_job",
-  "job_review_offer",
-  "refresh_stake",
-  "vote_stake"
-]);
-
-export const KNOWN_KINDS = new Set([
-  ...OWNER_KINDS,
-  ...WORK_KINDS,
-  ...REVIEW_KINDS,
-  ...AUX_KINDS
-]);
+/** Known feed kinds from the active profile's queue buckets (for tests/drift checks). */
+export function knownKinds(profile: ProfileConfig): Set<string> {
+  return queueSets(profile).known;
+}
 
 export function textMatchesPlatform(profile: ProfileConfig, text: string): boolean {
   if (profile.platformMatch.regex) {
@@ -123,13 +97,13 @@ export function buildQueue(options: {
   platformIdeaNumbers?: Set<number>;
   state?: State | null;
   now?: number;
-  recentMs?: number;
 }): Queue {
   const { feed, profile } = options;
+  const sets = queueSets(profile);
   const platformNumbers = options.platformNumbers ?? new Set<number>();
   const platformIdeaNumbers = options.platformIdeaNumbers ?? new Set<number>();
   const now = options.now ?? Date.now();
-  const recentMs = options.recentMs ?? 30 * 60 * 1000;
+  const recentMs = sets.recentMs;
   const recent = options.state?.recentFeedKeys ?? {};
   const tasks = options.state?.tasks ?? {};
   const queue: QueueEntry[] = [];
@@ -147,15 +121,13 @@ export function buildQueue(options: {
     const ideaId = item.idea?.id ?? null;
     const task = issueId ? tasks[issueId] : null;
 
-    const blocked = ["done", "failed", "skipped", "waiting_human", "delivered"];
-    if (kind !== "active_claim") blocked.push("working", "claimed");
+    const blocked = [...sets.blockedStatuses];
+    if (kind !== "active_claim") blocked.push(...sets.activeStatuses);
     if (task && blocked.includes(task.status)) continue;
     if (recent[item.key] && now - recent[item.key]! < recentMs) continue;
 
     let isPlatform = false;
-    if (NO_ISSUE_KINDS.has(kind)) {
-      isPlatform = true;
-    } else if (kind === "categorize") {
+    if (sets.noIssue.has(kind)) {
       isPlatform = true;
     } else if (issueNumber !== null) {
       isPlatform = platformNumbers.has(issueNumber) || matchesPlatform(profile, item);
@@ -166,7 +138,7 @@ export function buildQueue(options: {
     }
     if (!isPlatform) continue;
 
-    const priority = PRIORITY[kind] ?? 50;
+    const priority = sets.priorities[kind] ?? sets.unknownPriority;
     const entry: QueueEntry = {
       key: item.key,
       kind,
@@ -181,10 +153,10 @@ export function buildQueue(options: {
       actions: item.actions ?? [],
       bucket: "other"
     };
-    if (OWNER_KINDS.has(kind)) entry.bucket = "owner";
-    else if (WORK_KINDS.has(kind)) entry.bucket = "work";
-    else if (REVIEW_KINDS.has(kind)) entry.bucket = "review";
-    else if (AUX_KINDS.has(kind)) entry.bucket = "aux";
+    if (sets.owner.has(kind)) entry.bucket = "owner";
+    else if (sets.work.has(kind)) entry.bucket = "work";
+    else if (sets.review.has(kind)) entry.bucket = "review";
+    else if (sets.aux.has(kind)) entry.bucket = "aux";
 
     queue.push(entry);
   }

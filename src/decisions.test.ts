@@ -1,9 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { formatOwnerDecisions, latestDecision, parseOwnerDecisions } from "./decisions.js";
+import type { Comment } from "./types.js";
+
+const policy = {
+  marker: "**Decision from the owner:**",
+  kinds: ["confirm", "merge"],
+  trueWords: ["yes", "y", "true"],
+  falseWords: ["no", "n", "false"]
+};
+
+function parse(comments: Comment[]): ReturnType<typeof parseOwnerDecisions> {
+  return parseOwnerDecisions(comments, policy);
+}
 
 test("parses labelled confirm and merge decisions", () => {
-  const decisions = parseOwnerDecisions([
+  const decisions = parse([
     {
       id: "1",
       body: "**Decision from the owner:**\nConfirm #42: yes\nMerge: no",
@@ -17,18 +29,18 @@ test("parses labelled confirm and merge decisions", () => {
 });
 
 test("ambiguous prose is not a decision", () => {
-  const decisions = parseOwnerDecisions([
+  const decisions = parse([
     { id: "1", body: "**Decision from the owner:** Do not only confirm, maybe merge yes." }
   ]);
   assert.deepEqual(decisions, []);
 });
 
 test("ignores comments without the marker", () => {
-  assert.deepEqual(parseOwnerDecisions([{ id: "1", body: "Confirm: yes" }]), []);
+  assert.deepEqual(parse([{ id: "1", body: "Confirm: yes" }]), []);
 });
 
 test("later labelled decisions win", () => {
-  const decisions = parseOwnerDecisions([
+  const decisions = parse([
     { id: "1", body: "**Decision from the owner:**\nConfirm: no" },
     { id: "2", body: "**Decision from the owner:**\nConfirm: yes" }
   ]);
@@ -36,13 +48,22 @@ test("later labelled decisions win", () => {
 });
 
 test("accepts bold labels", () => {
-  const decisions = parseOwnerDecisions([
+  const decisions = parse([
     { id: "1", body: "**Decision from the owner:**\n**Confirm:** yes" }
   ]);
   assert.equal(latestDecision(decisions, "confirm")?.answer, true);
 });
 
 test("formats decisions for prompts", () => {
-  const decisions = parseOwnerDecisions([{ id: "1", body: "**Decision from the owner:**\nMerge=yes" }]);
+  const decisions = parse([{ id: "1", body: "**Decision from the owner:**\nMerge=yes" }]);
   assert.match(formatOwnerDecisions(decisions), /merge: yes/);
+});
+
+test("marker and vocabulary come from policy", () => {
+  const custom = { marker: "[DECIDE]", kinds: ["ship"], trueWords: ["go"], falseWords: ["stop"] };
+  const decisions = parseOwnerDecisions([{ id: "1", body: "[DECIDE]\nShip: go" }], custom);
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0]!.text, "Ship: go");
+  assert.deepEqual(parseOwnerDecisions([{ id: "1", body: "[DECIDE]\nShip: go" }], policy), []);
+  assert.throws(() => parseOwnerDecisions([{ id: "1", body: "x" }], null), /decisions.marker/);
 });

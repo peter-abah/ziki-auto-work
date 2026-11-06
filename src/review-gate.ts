@@ -1,7 +1,9 @@
+import type { ReviewGatePolicyConfig } from "./types.js";
+
 export interface ReviewGateStatus {
   state: string;
   merged: boolean;
-  checks: "passing" | "failing" | "pending" | "none";
+  checks: string;
   mergeable: boolean | null;
   isDraft?: boolean;
 }
@@ -10,8 +12,7 @@ export interface ReviewGateInput {
   status: ReviewGateStatus | null;
   goodVerdicts?: number;
   verdictsNeeded?: number | null;
-  transientMs?: number;
-  terminalMs?: number;
+  policy: ReviewGatePolicyConfig;
 }
 
 export interface ReviewGateResult {
@@ -20,15 +21,25 @@ export interface ReviewGateResult {
   recentMs?: number;
 }
 
-const TRANSIENT_RECENT_MS = 5 * 60_000;
-const TERMINAL_RECENT_MS = 30 * 60_000;
+function requireMs(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${path} must be a non-negative number (run \`auto-work migrate\`)`);
+  }
+  return value;
+}
 
-export function verdictsNeeded(workflow: Record<string, unknown> | null | undefined): number | null {
-  const raw =
-    workflow?.verdictsNeeded ??
-    workflow?.testVerdictsNeeded ??
-    workflow?.requiredTestVerdicts ??
-    workflow?.reviewsRequired;
+function requireString(value: unknown, path: string): string {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`${path} must be a non-empty string (run \`auto-work migrate\`)`);
+  }
+  return value;
+}
+
+export function verdictsNeeded(
+  workflow: Record<string, unknown> | null | undefined,
+  keys: readonly string[] = ["verdictsNeeded", "testVerdictsNeeded", "requiredTestVerdicts", "reviewsRequired"]
+): number | null {
+  const raw = keys.map((key) => workflow?.[key]).find((value) => value !== undefined);
   const value = Number(raw);
   return Number.isFinite(value) && value > 0 ? value : null;
 }
@@ -52,25 +63,28 @@ export function countGoodVerdicts(verdicts: ReadonlyArray<VerdictLike>): number 
 }
 
 export function reviewGate(input: ReviewGateInput): ReviewGateResult {
-  const { status, goodVerdicts = 0, verdictsNeeded: needed = null } = input;
-  const transientMs = input.transientMs ?? TRANSIENT_RECENT_MS;
-  const terminalMs = input.terminalMs ?? TERMINAL_RECENT_MS;
+  const { status, goodVerdicts = 0, verdictsNeeded: needed = null, policy } = input;
+  const transientMs = requireMs(policy.transientMs, "profile.reviewGate.transientMs");
+  const terminalMs = requireMs(policy.terminalMs, "profile.reviewGate.terminalMs");
+  const openState = requireString(policy.openState, "profile.reviewGate.openState");
+  const failing = requireString(policy.checkStates?.failing, "profile.reviewGate.checkStates.failing");
+  const pending = requireString(policy.checkStates?.pending, "profile.reviewGate.checkStates.pending");
   if (!status) {
     return { ok: false, reason: "PR status unavailable", recentMs: transientMs };
   }
   if (status.merged) {
     return { ok: false, reason: "PR is already merged", recentMs: terminalMs };
   }
-  if (status.state !== "OPEN") {
+  if (status.state !== openState) {
     return { ok: false, reason: `PR is ${status.state.toLowerCase()}`, recentMs: terminalMs };
   }
   if (status.isDraft) {
     return { ok: false, reason: "PR is still a draft", recentMs: transientMs };
   }
-  if (status.checks === "failing") {
+  if (status.checks === failing) {
     return { ok: false, reason: "PR checks are failing", recentMs: transientMs };
   }
-  if (status.checks === "pending") {
+  if (status.checks === pending) {
     return { ok: false, reason: "PR checks are still pending", recentMs: transientMs };
   }
   if (status.mergeable === false) {

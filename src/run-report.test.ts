@@ -27,6 +27,12 @@ function profile(): ProfileConfig {
     platformMatch: { keywords: ["desktop"] },
     prompts: { dir: "prompts/generic" },
     pr: { templateFile: "prompts/generic/pr.md" },
+    urls: {
+      envSuffixes: { on_dev: "dev", on_staging: "staging", on_prod: "prod" },
+      issuePath: "/{org?}/{project}/{issue}",
+      ideaPath: "/{org?}/{project}/ideas/{idea}",
+      inboxPath: "/inbox"
+    },
     discovery: { enabled: false },
     workflow: { ...DEFAULT_WORKFLOW },
     limits: { ...DEFAULT_LIMITS },

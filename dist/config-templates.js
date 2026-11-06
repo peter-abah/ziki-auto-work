@@ -35,6 +35,59 @@ export function templateVersion(templates) {
 function clone(value) {
     return JSON.parse(JSON.stringify(value ?? null));
 }
+function isPlainRecord(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/**
+ * Sections where nested keys fill from templates when absent (additive
+ * policy lists). Excluded: operations/endpoints/ziki/limits/workflow —
+ * maps where a missing key may be an intentional removal.
+ */
+const NESTED_FILL_SECTIONS = new Set([
+    "limits",
+    "workflow",
+    "prTracking",
+    "timing",
+    "statuses",
+    "health",
+    "discovery",
+    "decisions",
+    "queue",
+    "reviewGate",
+    "heartbeatPolicy",
+    "noop",
+    "votes",
+    "idea",
+    "apiRepair",
+    "capacity",
+    "urls",
+    "discover",
+    "github",
+    "safety",
+    "checksDefaults",
+    "outbox",
+    "bootstrap",
+    "offline",
+    "loop",
+    "transport",
+    "timing",
+    "health",
+    "repair",
+    "hitl",
+    "executor"
+]);
+function deepFillMissing(target, template, filled, prefix, root) {
+    for (const [key, templateValue] of Object.entries(template)) {
+        const current = target[key];
+        if (current === undefined) {
+            target[key] = clone(templateValue);
+            filled.push(`${prefix}.${key}`);
+        }
+        else if (NESTED_FILL_SECTIONS.has(root) && isPlainRecord(current) && isPlainRecord(templateValue)) {
+            deepFillMissing(current, templateValue, filled, `${prefix}.${key}`, root);
+        }
+    }
+}
 /**
  * Fill every missing top-level section of a profile from init templates.
  * Returns the filled profile plus the list of dot-paths that were filled
@@ -42,7 +95,7 @@ function clone(value) {
  * values. Sections present in templates: limits, workflow, prTracking,
  * timing, statuses, repair, transport, operations, queue, reviewGate,
  * heartbeatPolicy, decisions, noop, votes, idea, apiRepair, capacity, urls,
- * discover, github, safety, checksDefaults, outbox, bootstrap, loop, envFiles.
+ * discover, github, safety, checksDefaults, outbox, bootstrap, offline, loop, envFiles.
  */
 export function fillProfileFromTemplates(profile, templates) {
     const filled = [];
@@ -72,6 +125,7 @@ export function fillProfileFromTemplates(profile, templates) {
         checksDefaults: "checksDefaults",
         outbox: "outbox",
         bootstrap: "bootstrap",
+        offline: "offline",
         loop: "loop",
         pollSeconds: "pollSeconds",
         memoryRefreshMinutes: "memoryRefreshMinutes",
@@ -83,18 +137,14 @@ export function fillProfileFromTemplates(profile, templates) {
         if (out[profileKey] === undefined && templates[templateKey] !== undefined) {
             out[profileKey] = clone(templates[templateKey]);
             filled.push(profileKey);
+            continue;
         }
-    }
-    // executor is provider-chosen by the wizard; only the behavioral knobs fill
-    // from templates when the wizard leaves them absent.
-    const executor = out.executor;
-    const templateExecutor = templates.executor;
-    if (executor && templateExecutor) {
-        for (const key of ["timeoutMs", "permissionMode"]) {
-            if (executor[key] === undefined && templateExecutor[key] !== undefined) {
-                executor[key] = clone(templateExecutor[key]);
-                filled.push(`executor.${key}`);
-            }
+        // Present sections in the nested-fill set gain missing nested keys
+        // (additive policy lists). Anything explicit is never overwritten.
+        const current = out[profileKey];
+        const templateValue = templates[templateKey];
+        if (isPlainRecord(current) && isPlainRecord(templateValue)) {
+            deepFillMissing(current, templateValue, filled, profileKey, profileKey);
         }
     }
     // ziki.endpoints lives nested; fill when absent (a pre-endpoints v3
@@ -145,12 +195,21 @@ export function explainProfile(profileName, rawProfile, templates) {
         "limits", "workflow", "prTracking", "timing", "statuses", "repair",
         "transport", "operations", "queue", "reviewGate", "heartbeatPolicy",
         "decisions", "noop", "votes", "idea", "apiRepair", "capacity", "urls",
-        "discover", "github", "safety", "checksDefaults", "outbox", "bootstrap", "loop",
+        "discover", "github", "safety", "checksDefaults", "outbox", "bootstrap", "loop", "offline",
         "pollSeconds", "memoryRefreshMinutes", "hitl", "executor", "endpoints"
     ];
     // "endpoints" above is display-only: the real fill targets ziki.endpoints
     // (handled separately above), never a top-level key.
     for (const section of sections) {
+        if (section === "endpoints") {
+            const nested = rawProfile.ziki?.endpoints;
+            entries.push({
+                path: `profiles.${profileName}.ziki.endpoints`,
+                source: nested !== undefined ? "explicit" : "template",
+                detail: nested !== undefined ? undefined : "would fill from init-templates.json (v4) on migrate"
+            });
+            continue;
+        }
         if (rawProfile[section] !== undefined) {
             entries.push({ path: `profiles.${profileName}.${section}`, source: "explicit" });
         }

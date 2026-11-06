@@ -1077,6 +1077,17 @@
       "refresh_stake",
       "vote_stake"
     ],
+    "blockedStatuses": [
+      "done",
+      "failed",
+      "skipped",
+      "waiting_human",
+      "delivered"
+    ],
+    "activeStatuses": [
+      "working",
+      "claimed"
+    ],
     "recentMs": 1800000
   },
   "reviewGate": {
@@ -1094,6 +1105,14 @@
       "testVerdictsNeeded",
       "requiredTestVerdicts",
       "reviewsRequired"
+    ],
+    "reviewableStatuses": [
+      "done",
+      "accepted"
+    ],
+    "reviewableSubstatuses": [
+      "requires_review",
+      "accepted"
     ]
   },
   "heartbeatPolicy": {
@@ -1130,7 +1149,25 @@
       "no",
       "n",
       "false"
-    ]
+    ],
+    "candidateStatuses": [
+      "done",
+      "accepted",
+      "merge"
+    ],
+    "candidateSubstatuses": [
+      "requires_confirmation",
+      "requires_review"
+    ],
+    "mergeStatuses": [
+      "done",
+      "accepted",
+      "merge"
+    ],
+    "mergeSubstatuses": [
+      "requires_review"
+    ],
+    "keyChars": 80
   },
   "noop": {
     "statuses": [
@@ -1178,8 +1215,10 @@
   },
   "idea": {
     "summaryMin": 20,
-    "suffix": " \u2014 desktop parity gap.",
+    "suffix": " — desktop parity gap.",
     "summaryMax": 300,
+    "titleMax": 200,
+    "descriptionMax": 5000,
     "fallback": ""
   },
   "apiRepair": {
@@ -1206,6 +1245,13 @@
     "inboxPath": "/inbox"
   },
   "discover": {
+    "existingStatuses": ["open", "in_progress", "done", "merge", "resolved", "closed"],
+    "recentMergedStatuses": ["resolved", "closed"],
+    "recentMergedSubstatuses": ["on_dev", "on_staging", "on_prod"],
+    "contextIssueLimit": 300,
+    "contextMergedLimit": 60,
+    "contextTaskLimit": 40,
+    "ownerCandidateLimit": 25,
     "platformSuffixes": {
       "desktop": [
         "desktop",
@@ -1308,6 +1354,12 @@
     "maxPerFlush": 5,
     "fifo": true
   },
+  "offline": {
+    "maxPrs": 5,
+    "checkTimeoutMs": 600000,
+    "mutatingPattern": "format",
+    "excludedStatuses": ["done", "failed", "skipped"]
+  },
   "bootstrap": {
     "stateFile": "BOOTSTRAP.json",
     "needsFile": "NEEDS-HUMAN.md",
@@ -1317,10 +1369,14 @@
     "agentName": "bootstrap"
   },
   "loop": {
-    "drainMs": 60000,
+    "drainMs": 120000,
+    "stopDrainMs": 30000,
+    "killDrainMs": 5000,
+    "drainSliceMs": 1000,
     "truncLen": 120,
     "cacheMs": 600000,
-    "statusAgeMs": 120000
+    "statusAgeMs": 120000,
+    "pollFloorMs": 1000
   },
   "envFiles": [
     ".env",
