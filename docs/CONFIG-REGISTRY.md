@@ -1,14 +1,19 @@
 # Config registry — every hardcoded literal and its config home
 
-> P0 audit (dev `344fa80`, 210 tests green). Each row: where the literal lives,
-> what breaks on a Ziki/external change, the target config section, and the
-> implementation phase. Runtime rule after migration: missing key →
-> `config:missing_key` blocker + `config-doctor` proposal + NEEDS-HUMAN, never
-> a silent substitute. `init --discover` (backed by
-> `config/init-templates.json`) is the only place defaults exist — written
-> explicitly into `config.json`, never applied at runtime.
+> P0 audit (dev `344fa80`). Implementation: P1 (schema v4 + init-templates +
+> migrate + explain, `81811c4`) · P2a (operations invoke + transport,
+> `84e4b92`) · P2b (policy tables, `7937116`) · P2c (external surfaces,
+> `09ea63b`) · P3 (self-heal repair coverage, `5332f11`) · P4 (docs + drift
+> check + prompt-lint, this commit). 247 tests green.
+>
+> Runtime rule: missing key → `config:missing_key` blocker + deterministic
+> fill proposal + `config-doctor` agent + APPROVE gate, never a silent
+> substitute. `init --discover` (backed by `config/init-templates.json`) is
+> the only place defaults exist — written explicitly into `config.json`,
+> never applied at runtime. Statuses: ✅ done · 🔶 deliberate code (documented
+> below) · explicit literals were in `src/` at P0 unless noted.
 
-## A. Endpoints + transport + operations (P2a)
+## A. Endpoints + transport + operations (P2a ✅)
 
 | # | Source | Literal | Breaks when | Config home |
 |---|---|---|---|---|
@@ -22,7 +27,7 @@
 | A8 | `src/ziki.ts:384,471-484 etc.` | `expect: feed|list|object` per call; `assertResponseShape` + preview `slice(0,120)` | Ziki reshapes payload → empty queue instead of loud error | `ziki.operations.<op>.expect`; preview length → `ziki.transport.previewChars` |
 | A9 | `src/ziki.ts:547,551` | `idempotencyKey ?? randomUUID()` on createIdea | dupe-create policy change | `ziki.operations.ideas.list.idempotency` (bool) |
 
-## B. Queue + statuses + policy tables (P2b)
+## B. Queue + statuses + policy tables (P2b ✅)
 
 | # | Source | Literal | Breaks when | Config home |
 |---|---|---|---|---|
@@ -42,7 +47,7 @@
 | B14 | `src/capacity.ts:17-47` | `atLeastOne` floor 1; `"auto"`→worker-count resolution; discovery/owner pinned `1` | — (policy) | `capacity.{floor,autoRule,discoverySlots,ownerSlots}` (or keep `limits` + document rule in config schema) |
 | B15 | `src/work-key.ts:5-7`, `src/urls.ts` | `on_dev\|on_staging\|on_prod → dev\|staging\|prod`; `key:/issue:/idea:` prefixes; `/{org}/{project}/{n}`, `/ideas/{n}`, `/inbox`; labels `#n title` | Ziki renames envs/URL shape | `urls.{envSuffixes,keyPrefixes,issuePath,ideaPath,inboxPath,labelFormats}` |
 
-## C. External surfaces (P2c)
+## C. External surfaces (P2c ✅ — Ziki/GitHub-coupled items done; local-tooling items stay code, see §F)
 
 | # | Source | Literal | Breaks when | Config home |
 |---|---|---|---|---|
@@ -57,7 +62,7 @@
 | C9 | `prompts/generic/*.md` (19), `prompts/zedu-desktop/*.md` (18) | embedded status names, `/api/v1` paths, `project_zedu`, verdict language | Ziki renames → agent acts on stale instructions | prompt lint: raw literals banned, must use `{{var}}`; vars supplied from config in `loop-context.ts`/`agent.ts` |
 | C10 | `src/cli.ts:303-332,427-432` | check presets (flutter `pub get`/`analyze --fatal-infos`, npm `ci`, pip `install -e .`, `600s`), `commitTypes`, `branchPrefix fix`, `maxFiles 5/maxLines 400`, `pollSeconds 120`, `memoryRefresh 30`, `prTracking{on,10,10}`, `discovery{off,3}` | — (init-time only after P1; must move to `init-templates.json`) | `config/init-templates.json` (init reads, runtime never does) |
 
-## D. Health/timing/backoff (covered by P1/P3, listed for completeness)
+## D. Health/timing/backoff (P3 ✅)
 
 | # | Source | Literal | Config home |
 |---|---|---|---|
@@ -68,7 +73,39 @@
 | D5 | `src/scheduler.ts:111`, `src/orchestrator.ts` call sites | `drain 60s` default, `120s` waits, `pollSeconds*1000`, `truncate 120`, cache `10min`, `retryMs 5min`, rate-limit chunk | `loop.{drainMs,waitMs,truncLen,cacheMs}`, `timing.*` |
 | D6 | `src/agent.ts:48-62,150-164` | `ROLE_TIMEOUT_KEY`, `45min` fallback, `resultMode ?? "file"`, `timeoutMs` chain, tail `20_000`, evidence slices `6000/4000` | `executor.{roleTimeouts,resultMode,timeoutMs,tailBytes,evidenceChars}` |
 
-## E. Explicitly NOT config-driven (code stays, documented)
+## E. Explicitly NOT config-driven (code stays, documented) 🔶
+
+Deliberate: none of these can break from a Ziki update, or guarding them in
+code is the safety property itself.
+
+- Display/truncation (`truncate()` lengths, `tail` in logs, `status --line`
+  age threshold, `slice(0, N)` in history labels, notify truncation): pixel
+  choices, never behaviour.
+- Internal state machine (`TaskStatus` queued/claimed/working/…): ours, Ziki
+  can't rename it. (Queue's blocked/active lists ARE config because they gate
+  Ziki-bound dispatch.)
+- Local tooling: provider CLI flags/probes, `gh` field lists and GraphQL
+  shape, git plumbing, doctor env checks, service installers, notify
+  backends, scheduler slice mechanics. Provider/gh CLIs version with the
+  release; their breakage is a release event, not silent drift.
+- `NEVER_MUTABLE_PATTERNS` (repo/executor/providers/agents/prompts/pr/hitl/
+  repair/secrets): the security floor — agent proposals touching these are
+  refused even if allowlisted.
+- Zod-shape guards / `assertResponseShape` mechanics, regex compilation,
+  endpoint rendering: engine stays code; expected shapes/keys (expect,
+  pagination keys) are config.
+- `??`/`||` for display strings (`"(none)"`, `""`) and null-safe traversal.
+- Validation floors (`pollSeconds>=10`, timing minima, file mode 600,
+  node >= 20): schema/safety minima, documented in `docs/config.md`.
+- PR-body field vocabulary (`description` → What changed…): the loop's own
+  agent-result contract (`AgentResult`), not Ziki's.
+- Merge-review `requiredReviewers` default 0: absence means no requirement
+  (schema semantic, documented).
+- `prBody` 60k cap lives in `pr.maxBodyChars` (config); the PR template
+  fallback text (`GENERIC_PR_TEMPLATE`) is content, not a rule.
+- Config-doctor prompt text: instructs via `{{mutablePaths}}` /
+  `{{allowNewKeys}}` placeholders; `bin/lint-prompts.mjs` (CI) fails on raw
+  Ziki literals in any prompt.
 
 - `NEVER_MUTABLE` patterns (`config.ts:161-177`) — security floor; agent can never propose these paths even if allowlisted.
 - Zod-shape guards / `assertResponseShape` mechanics — the *mechanism* stays code; the *expected shape* (`expect`, keys) is config.

@@ -56,7 +56,7 @@ Usage:
   auto-work migrate [--dry-run]
   auto-work config [--show] [--validate] [--explain]
   auto-work prompts [--profile <name>]
-  auto-work doctor [--profile <name>] [--json]
+  auto-work doctor [--profile <name>] [--json] [--drift]
 
 Environment overrides:
   AUTO_WORK_HOME, AUTO_WORK_CONFIG_DIR, AUTO_WORK_STATE_DIR, AUTO_WORK_CACHE_DIR
@@ -1584,6 +1584,13 @@ async function prompts(flags) {
     }
 }
 async function doctor(flags) {
+    if (flags.drift) {
+        const { runDriftCheck, formatDrift } = await import("./drift.js");
+        const result = await runDriftCheck(str(flags, "profile"));
+        console.log(flags.json ? JSON.stringify(result, null, 2) : formatDrift(result));
+        process.exitCode = result.ok ? 0 : 1;
+        return;
+    }
     const result = await runDoctor({ profileName: str(flags, "profile") });
     console.log(flags.json ? JSON.stringify(result, null, 2) : formatDoctor(result));
     process.exitCode = result.ok ? 0 : 1;

@@ -16,12 +16,60 @@ proposal → `NEEDS-HUMAN.md`).
 - `auto-work migrate [--dry-run]` — v3 → v4, reports filled sections.
 - `auto-work config --explain` — per-section provenance: `explicit` (you
   wrote it), `template` (would fill from init templates), `missing`.
-- v4 requires `transport` + `operations`; all other new sections
-  (`queue`, `reviewGate`, `heartbeatPolicy`, `decisions`, `noop`, `votes`,
-  `idea`, `apiRepair`, `capacity`, `urls`, `discover`, `github`, `safety`,
-  `checksDefaults`, `outbox`, `bootstrap`, `loop`) warn when absent until
-  their P2 phase flips them to required. See
+- v4 requires every section listed in `validateV4Required` (transport,
+  operations, queue, reviewGate, heartbeatPolicy, decisions, noop, votes,
+  idea, apiRepair, capacity, urls, discover, github, safety, checksDefaults,
+  outbox, bootstrap, offline, loop, pr, repo, discovery, timing, statuses,
+  health, limits, workflow, prTracking, ziki.endpoints, …). See
   [`CONFIG-REGISTRY.md`](./CONFIG-REGISTRY.md) for the literal → section map.
+
+## Operations and transport (P2a)
+
+`ZikiClient` has four primitives: `route()` (endpoint templates only, throws
+`unknown endpoint` with no built-in fallback), `request()`, `invoke(group,
+name)` (method/expect/timeout/retries from `operations.<group>.<name>`), and
+`listAllOp()` (cursor pagination from `operations.<group>.<name>.pagination`,
+all keys required). The ~80 thin wrappers (`bid()`, `heartbeat()`, …) carry
+only field data; HTTP method, expected shape, pagination and transport
+(auth scheme, user agent, timeouts, backoff caps) are config. `route` in an
+operation maps to a different endpoint name when they differ
+(e.g. `withdrawBid` → `bid`).
+
+## Policy tables (P2b)
+
+Queue buckets/priorities, status vocabulary, review gate, heartbeat,
+decisions, noop patterns, votes, idea shaping, API repair, capacity, URLs —
+all required config with fail-loud readers. Unknown Ziki kinds sort after
+every known kind into the `other` bucket and raise a visible
+`unknown_vocabulary`/`unknown_kind` warning instead of dropping work.
+
+## External surfaces (P2c)
+
+Discovery scoring/suffixes/timeouts/stacks/check presets, GitHub state and
+merge maps, check defaults, secret/protected patterns, outbox, offline —
+all config. Local tooling (provider CLIs, gh plumbing, doctor env checks)
+stays code; see CONFIG-REGISTRY §E.
+
+## Self-healing (P3)
+
+Only hard failures park without repair: provider/model errors and missing
+keys (`config:missing_key` never fires for those — there is nothing to
+propose). Everything else gets a deterministic diagnosis first (template
+backfill for missing keys and unknown endpoints, aux-bucket placement for
+unknown kinds, `statuses.known` appends for drift vocabulary), then a
+`config-doctor` agent proposal, then a Ziki `human_approval` escalation
+(`APPROVE` applies; anything else re-proposes, bounded by `maxRounds`).
+New strategies: `config:missing_key`, `config:unknown_endpoint`,
+`*:unknown_kind`, `*:unknown_vocabulary`. New kind names are creatable under
+`queue.priorities.*` (numbers only); new endpoint names are never invented.
+
+## Drift review (P4)
+
+- `auto-work doctor --drift` — morning/evening check: tenant project list
+  vs `ziki.projectId`, platform filter resolution vs live platforms.
+  Read-only; exit 1 on drift.
+- `npm run lint:prompts` (CI) — fails on raw Ziki literals in prompts/;
+  prompts consume config through `{{placeholders}}` only.
 
 ```json
 {
