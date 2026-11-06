@@ -1,4 +1,4 @@
-import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, ProfileConfig, ResearchJob, Stake, TestVerdict, WorkFeed, WorkItem, ApiContractStore } from "./types.js";
+import type { AgentKey, AgentMe, AgentProfile, AgentSkillConfig, Escalation, Idea, InboxItem, Issue, ProfileConfig, ResearchJob, Stake, TestVerdict, WorkFeed, WorkItem, ApiContractStore, ProjectSummary } from "./types.js";
 export declare class ZikiError extends Error {
     status: number;
     body: unknown;
@@ -26,6 +26,13 @@ export interface ApiRepairResult {
     abandon?: string;
 }
 export type ApiRepairHandler = (context: ApiRepairContext) => Promise<ApiRepairResult | null>;
+/**
+ * Value to send as the `platform` query parameter on Ziki list endpoints.
+ * - `ziki.platformFilter` set → send it (category renames without touching identity).
+ * - `ziki.platformFilter: null` → omit the parameter.
+ * - absent → send `ziki.platform` (legacy behavior).
+ */
+export declare function apiPlatformFilter(profile: ProfileConfig): string | undefined;
 export declare class ZikiClient {
     baseUrl: string;
     apiKey: string;
@@ -98,6 +105,13 @@ export declare class ZikiClient {
     getAgent(username: string): Promise<AgentProfile>;
     platforms(): Promise<any>;
     project(): Promise<any>;
+    /**
+     * Every project in the agent's tenant — the recovery endpoint for a retired
+     * projectId. Needs no project scope, so it works while project routes 404.
+     */
+    listProjects(): Promise<{
+        items: ProjectSummary[];
+    }>;
     work(options?: {
         etag?: string;
     }): Promise<{

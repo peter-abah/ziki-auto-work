@@ -17,7 +17,8 @@ export type Role =
   | "jobReview"
   | "bidVote"
   | "commentVote"
-  | "apiRepair";
+  | "apiRepair"
+  | "configDoctor";
 export type CapacityLimit = number | "auto" | null;
 export type MergeMode = "handoff" | "never" | "auto";
 export type MergeMethod = "merge" | "squash" | "rebase";
@@ -39,7 +40,46 @@ export interface ZikiConfig {
   projectSlug: string;
   platform: string;
   platformCategoryId?: string;
+  /**
+   * Value sent as the `platform` query parameter on Ziki list endpoints.
+   * - `undefined` (absent): send `ziki.platform` (legacy behavior).
+   * - a slug: send that instead (category renames without touching identity).
+   * - `null`: omit the parameter entirely.
+   * Agent-mutable via the config-repair flow (see RepairConfig).
+   */
+  platformFilter?: string | null;
   projectName?: string;
+}
+
+/** One op in an agent-proposed config patch. Applied only after approval. */
+export interface ConfigPatchOp {
+  /** Dot path into the merged profile, e.g. `ziki.projectId`. */
+  path: string;
+  value: unknown;
+  reason?: string;
+}
+
+/** Per-failure-code repair strategy: which agent role diagnoses it. */
+export interface RepairStrategyConfig {
+  /** Master switch for this failure code. Default true when the entry exists. */
+  enabled?: boolean;
+  /** Agent role that diagnoses and proposes the patch. Default "configDoctor". */
+  role?: Role;
+  /** Max proposal rounds before the escalation expires. Default 3. */
+  maxRounds?: number | null;
+  /** Strategy-specific matching hints, e.g. `{ matchSlug: true, matchRepo: true }`. */
+  match?: Record<string, unknown>;
+}
+
+export interface RepairConfig {
+  /** Master switch for agent-driven config repair. Default true. */
+  enabled?: boolean;
+  /** Allowlisted dot-paths an agent may propose. Defaults apply when absent. */
+  mutablePaths?: string[];
+  /** Paths that may be created when missing (e.g. `ziki.platformFilter`). */
+  allowNewKeys?: string[];
+  /** Strategies keyed by health-blocker code, e.g. `"platform:not_found"`. */
+  strategies?: Record<string, RepairStrategyConfig>;
 }
 
 export interface AgentSkillConfig {
@@ -347,6 +387,8 @@ export interface ProfileConfig {
   pollSeconds: number;
   memoryRefreshMinutes: number;
   hitl: HitlConfig;
+  /** Agent-driven config repair (approval-gated). Absent = defaults apply. */
+  repair?: RepairConfig;
 }
 
 export interface DoctorConfig {
@@ -403,6 +445,8 @@ export interface ProfilePaths {
   historyFile: string;
   lastRunFile: string;
   lastRunMdFile: string;
+  /** Local approvals inbox (`auto-work approve`). Defaults to <stateDir>/approvals.json. */
+  approvalsFile?: string;
 }
 
 export interface AgentKey {
@@ -716,9 +760,25 @@ export interface EscalationRecord {
   body: string;
   agentName: string | null;
   createdAt: string;
-  status: "open" | "resolved" | "dismissed";
+  status: "open" | "resolved" | "dismissed" | "applied" | "expired";
   answer: string | null;
   resolvedAt: string | null;
+  /**
+   * Config-repair lifecycle (kind "config" only; see RepairConfig).
+   * - kind "issue": legacy per-issue escalations, fields below stay null/absent.
+   * - kind "config": loop-level repair proposals. `status` tracks OUR workflow
+   *   state (stays "open" across clarifying rounds); `remoteStatus` mirrors Ziki.
+   * - decision: how the latest human answer was interpreted.
+   * - rounds: proposal rounds used (escalation + re-escalations).
+   */
+  kind?: "issue" | "config";
+  strategy?: string | null;
+  configPatch?: ConfigPatchOp[] | null;
+  decision?: "approved" | "rejected" | "needs_info" | null;
+  rounds?: number;
+  remoteStatus?: "open" | "resolved" | "dismissed" | null;
+  appliedAt?: string | null;
+  previousId?: string | null;
 }
 
 export interface Counters {
@@ -832,6 +892,23 @@ export interface AgentResult {
   evidence?: string;
   tokens?: TokenUsage;
   providerLimit?: ProviderLimit;
+  /**
+   * Config-repair proposal (configDoctor role only). The orchestrator validates
+   * each op against RepairConfig.mutablePaths, applies NOTHING itself, and only
+   * persists the patch after human approval via escalation.
+   */
+  configPatch?: ConfigPatchOp[];
+}
+
+/** One project in the agent's tenant, from GET /api/v1/projects. */
+export interface ProjectSummary {
+  id: string;
+  slug: string;
+  name: string;
+  repoUrl?: string | null;
+  stagingUrl?: string | null;
+  openIssueCount?: number;
+  [key: string]: unknown;
 }
 
 export interface CheckResult {

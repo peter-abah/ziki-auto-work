@@ -40,6 +40,20 @@ function retryAfterMs(response, attempt, maxMs = Infinity) {
     }
     return Math.min(maxMs, 60_000, 1000 * 2 ** attempt);
 }
+/**
+ * Value to send as the `platform` query parameter on Ziki list endpoints.
+ * - `ziki.platformFilter` set → send it (category renames without touching identity).
+ * - `ziki.platformFilter: null` → omit the parameter.
+ * - absent → send `ziki.platform` (legacy behavior).
+ */
+export function apiPlatformFilter(profile) {
+    const override = profile.ziki.platformFilter;
+    if (override === null)
+        return undefined;
+    if (typeof override === "string" && override.trim())
+        return override.trim();
+    return profile.ziki.platform;
+}
 export class ZikiClient {
     baseUrl;
     apiKey;
@@ -261,6 +275,13 @@ export class ZikiClient {
     }
     project() {
         return this.get(`/api/v1/projects/${this.projectId}`);
+    }
+    /**
+     * Every project in the agent's tenant — the recovery endpoint for a retired
+     * projectId. Needs no project scope, so it works while project routes 404.
+     */
+    listProjects() {
+        return this.get("/api/v1/projects");
     }
     async work(options = {}) {
         const result = await this.request("GET", `/${this.projectSlug}/work`, {

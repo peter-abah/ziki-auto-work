@@ -5,12 +5,15 @@ import type {
   AgentKey,
   CheckSpec,
   Config,
+  ConfigPatchOp,
   ProfileConfig,
   ProfilePaths,
   LimitsConfig,
   LoadedProfile,
   ProviderName,
   PushMode,
+  RepairConfig,
+  RepairStrategyConfig,
   Role,
   RunLimitConfig,
   WorkflowConfig
@@ -69,6 +72,143 @@ export const DEFAULT_WORKFLOW: WorkflowConfig = {
 
 export const DEFAULT_ENV_FILES = [".env", ".env.local"];
 
+/**
+ * Agent-driven config repair (approval-gated) defaults.
+ *
+ * The agent may only PROPOSE patches; the orchestrator validates every op
+ * against the allowlist below, and nothing persists without human approval.
+ * Paths the agent must never touch — even if explicitly allowlisted — are
+ * refused in `validateConfig` (fail closed): repo/executor/providers/agents
+ * (push targets, command execution, key bindings), hitl/repair itself (the
+ * agent must not loosen its own gating), prompts, secrets, and config roots.
+ */
+export const DEFAULT_REPAIR_MUTABLE_PATHS = [
+  "ziki.projectId",
+  "ziki.projectSlug",
+  "ziki.platform",
+  "ziki.platformCategoryId",
+  "ziki.platformFilter",
+  "pollSeconds",
+  "memoryRefreshMinutes",
+  "discovery.enabled",
+  "discovery.maxIdeasPerRun"
+];
+
+export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = ["ziki.platformFilter"];
+
+export const DEFAULT_REPAIR_STRATEGIES: Record<string, RepairStrategyConfig> = {
+  "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
+  "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 }
+};
+
+const NEVER_MUTABLE_PATTERNS = [
+  /^repo\./,
+  /^executor\./,
+  /^providers\./,
+  /^agents\./,
+  /^prompts\./,
+  /^pr\./,
+  /^hitl\./,
+  /^repair\./,
+  /^doctor\./,
+  /^(version|activeProfile|defaults|profiles|doctor)\b/,
+  /secret|token|apikey|api_key|password|private/i
+];
+
+export function isNeverMutablePath(path: string): boolean {
+  return NEVER_MUTABLE_PATTERNS.some((pattern) => pattern.test(path));
+}
+
+function pathMatchesAllowlist(path: string, allowlist: readonly string[]): boolean {
+  return allowlist.some((entry) => {
+    if (entry.endsWith(".*")) return path === entry.slice(0, -2) || path.startsWith(`${entry.slice(0, -2)}.`);
+    return path === entry;
+  });
+}
+
+/** Read a dot-path (`ziki.projectId`) from a profile object. */
+export function getConfigPath(obj: unknown, path: string): unknown {
+  let current: unknown = obj;
+  for (const part of path.split(".")) {
+    if (!isPlainObject(current)) return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+/** Return a deep clone of `obj` with the dot-path set to `value`. */
+export function setConfigPath<T>(obj: T, path: string, value: unknown): T {
+  const clone = JSON.parse(JSON.stringify(obj ?? {})) as Record<string, unknown>;
+  const parts = path.split(".");
+  let current = clone;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index]!;
+    const next = current[part];
+    const holder = isPlainObject(next) ? (next as Record<string, unknown>) : {};
+    current[part] = holder;
+    current = holder;
+  }
+  current[parts[parts.length - 1]!] = value as unknown;
+  return clone as T;
+}
+
+export interface PatchValidation {
+  ok: boolean;
+  errors: string[];
+}
+
+/**
+ * Validate an agent-proposed patch WITHOUT applying it. Fails closed:
+ * unknown paths, denylisted paths, new keys outside allowNewKeys, and
+ * type changes are all rejected.
+ */
+export function validateConfigPatch(
+  profile: ProfileConfig,
+  ops: ConfigPatchOp[] | null | undefined,
+  repair?: RepairConfig
+): PatchValidation {
+  const errors: string[] = [];
+  if (!Array.isArray(ops) || !ops.length) {
+    return { ok: false, errors: ["patch must be a non-empty array of {path, value} ops"] };
+  }
+  const mutablePaths = repair?.mutablePaths ?? DEFAULT_REPAIR_MUTABLE_PATHS;
+  const allowNewKeys = repair?.allowNewKeys ?? DEFAULT_REPAIR_ALLOW_NEW_KEYS;
+  for (const [index, op] of ops.entries()) {
+    const label = `ops[${index}]`;
+    if (!op || typeof op !== "object" || typeof op.path !== "string" || !op.path.trim()) {
+      errors.push(`${label} must have a non-empty string path`);
+      continue;
+    }
+    const opPath = op.path.trim();
+    if (isNeverMutablePath(opPath)) {
+      errors.push(`${label} touches a protected path and can never be agent-modified: ${opPath}`);
+      continue;
+    }
+    if (!pathMatchesAllowlist(opPath, mutablePaths)) {
+      errors.push(`${label} is outside the repair allowlist: ${opPath}`);
+      continue;
+    }
+    const existing = getConfigPath(profile, opPath);
+    if (existing === undefined && !allowNewKeys.includes(opPath)) {
+      errors.push(`${label} creates a new key not in repair.allowNewKeys: ${opPath}`);
+      continue;
+    }
+    if (existing !== undefined && existing !== null && op.value !== undefined && op.value !== null) {
+      const expected = Array.isArray(existing) ? "array" : typeof existing;
+      const actual = Array.isArray(op.value) ? "array" : typeof op.value;
+      if (expected !== actual) {
+        errors.push(`${label} changes the type of ${opPath} from ${expected} to ${actual}`);
+      }
+    }
+    try {
+      JSON.stringify(op.value);
+    } catch {
+      errors.push(`${label} value for ${opPath} is not JSON-serializable`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
+}
+
 export function defaultConfig(): Config {
   return {
     version: 3,
@@ -90,7 +230,16 @@ export function defaultConfig(): Config {
       checks: [],
       prompts: { dir: "prompts/generic" },
       pr: { templateFile: "prompts/generic/pr.md" },
-      prTracking: { ...DEFAULT_PR_TRACKING }
+      prTracking: { ...DEFAULT_PR_TRACKING },
+      repair: {
+        enabled: true,
+        mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS],
+        allowNewKeys: [...DEFAULT_REPAIR_ALLOW_NEW_KEYS],
+        strategies: JSON.parse(JSON.stringify(DEFAULT_REPAIR_STRATEGIES)) as Record<
+          string,
+          RepairStrategyConfig
+        >
+      }
     },
     profiles: {},
     doctor: { minFreeGb: 3 }
@@ -390,9 +539,65 @@ export function validateConfig(config: Config): ValidationResult {
     if (typeof profile?.pollSeconds !== "number" || profile.pollSeconds < 10) {
       errors.push(`${prefix}.pollSeconds must be at least 10`);
     }
+    validateRepairConfig(prefix, profile?.repair, errors);
   }
 
   return { ok: errors.length === 0, errors, warnings };
+}
+
+function validateRepairConfig(prefix: string, repair: RepairConfig | undefined, errors: string[]): void {
+  if (repair === undefined) return;
+  if (typeof repair !== "object" || repair === null || Array.isArray(repair)) {
+    errors.push(`${prefix}.repair must be an object`);
+    return;
+  }
+  if (repair.enabled !== undefined && typeof repair.enabled !== "boolean") {
+    errors.push(`${prefix}.repair.enabled must be a boolean`);
+  }
+  for (const field of ["mutablePaths", "allowNewKeys"] as const) {
+    const list = (repair as Record<string, unknown>)[field];
+    if (list === undefined) continue;
+    if (!Array.isArray(list) || list.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      errors.push(`${prefix}.repair.${field} must be an array of non-empty strings`);
+      continue;
+    }
+    for (const entry of list as string[]) {
+      if (isNeverMutablePath(entry.trim())) {
+        errors.push(
+          `${prefix}.repair.${field} entry "${entry.trim()}" is protected and can never be agent-modified`
+        );
+      }
+    }
+  }
+  const strategies = repair.strategies;
+  if (strategies === undefined) return;
+  if (typeof strategies !== "object" || strategies === null || Array.isArray(strategies)) {
+    errors.push(`${prefix}.repair.strategies must be an object keyed by health-blocker code`);
+    return;
+  }
+  for (const [code, strategy] of Object.entries(strategies)) {
+    const sprefix = `${prefix}.repair.strategies[${JSON.stringify(code)}]`;
+    if (typeof strategy !== "object" || strategy === null || Array.isArray(strategy)) {
+      errors.push(`${sprefix} must be an object`);
+      continue;
+    }
+    if (strategy.enabled !== undefined && typeof strategy.enabled !== "boolean") {
+      errors.push(`${sprefix}.enabled must be a boolean`);
+    }
+    if (strategy.role !== undefined && (typeof strategy.role !== "string" || !strategy.role.trim())) {
+      errors.push(`${sprefix}.role must be a non-empty agent role name`);
+    }
+    if (
+      strategy.maxRounds !== undefined &&
+      strategy.maxRounds !== null &&
+      (!Number.isInteger(strategy.maxRounds) || strategy.maxRounds < 1)
+    ) {
+      errors.push(`${sprefix}.maxRounds must be a positive integer or null`);
+    }
+    if (strategy.match !== undefined && (typeof strategy.match !== "object" || strategy.match === null)) {
+      errors.push(`${sprefix}.match must be an object of strategy hints`);
+    }
+  }
 }
 
 export function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig {

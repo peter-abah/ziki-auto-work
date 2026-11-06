@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { ProfileConfig, WorkFeed } from "./types.js";
+import type { ProfileConfig, RepairStrategyConfig, WorkFeed } from "./types.js";
 import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, deepMerge, defaultConfig, resolveModel, validateConfig } from "./config.js";
 import { issueUrl, ideaUrl } from "./urls.js";
 import { buildQueue, textMatchesPlatform } from "./queue.js";
@@ -372,4 +372,36 @@ test("validateConfig rejects upstream mode with a fork owner", () => {
   const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
   assert.equal(result.ok, false);
   assert.ok(result.errors.some((error) => error.includes("must equal the upstream owner")));
+});
+
+test("validateConfig accepts the default repair section", () => {
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: fixtureProfile() } });
+  assert.equal(result.ok, true, result.errors.join("; "));
+});
+
+test("validateConfig rejects protected repair paths even when explicit", () => {
+  for (const bad of ["repo.pushMode", "hitl.enabled", "repair.enabled", "executor.provider", "agents.workers"]) {
+    const profile = fixtureProfile({ repair: { mutablePaths: [bad] } });
+    const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+    assert.equal(result.ok, false, bad);
+    assert.ok(result.errors.some((error) => error.includes("never be agent-modified")), bad);
+  }
+});
+
+test("validateConfig rejects malformed repair strategies", () => {
+  const profile = fixtureProfile({
+    repair: {
+      strategies: {
+        "platform:not_found": {
+          enabled: true,
+          role: "",
+          maxRounds: 0,
+          match: "slug"
+        } as unknown as RepairStrategyConfig
+      }
+    }
+  });
+  const result = validateConfig({ version: 3, activeProfile: "demo", profiles: { demo: profile } });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.length >= 3, result.errors.join("; "));
 });

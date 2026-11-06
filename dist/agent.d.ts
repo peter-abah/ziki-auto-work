@@ -47,6 +47,25 @@ export declare function runApiRepair(options: {
     onSpawn?: (pid: number) => void;
     onExit?: (pid: number) => void;
 }): Promise<AgentResult>;
+export declare function runConfigDoctor(options: {
+    profile: ProfileConfig;
+    profilePaths: ProfilePaths;
+    repoDir: string;
+    failureCode: string;
+    failureMessage: string;
+    attempts: number;
+    evidence: unknown;
+    configSlice: unknown;
+    mutablePaths: string[];
+    allowNewKeys: string[];
+    previousAnswer?: string | null;
+    loopContext?: string;
+    memoryText?: string;
+    logger?: Logger;
+    timeoutMs?: number;
+    onSpawn?: (pid: number) => void;
+    onExit?: (pid: number) => void;
+}): Promise<AgentResult>;
 export declare function runDiscovery(options: {
     profile: ProfileConfig;
     profilePaths: ProfilePaths;

@@ -46,7 +46,8 @@ const PROMPT_FILES: Partial<Record<Role | "pr", string>> = {
   senseCheck: "sense-check",
   jobReview: "job-review",
   bidVote: "bid-vote",
-  commentVote: "comment-vote"
+  commentVote: "comment-vote",
+  configDoctor: "config-doctor"
 };
 
 export async function loadPrompt(profile: ProfileConfig, role: Role | "pr"): Promise<string> {
@@ -391,6 +392,62 @@ export async function runApiRepair(options: {
     onExit: options.onExit
   });
   return result.apiRepair ? { ...result, ok: true, blocked: false } : result;
+}
+
+export async function runConfigDoctor(options: {
+  profile: ProfileConfig;
+  profilePaths: ProfilePaths;
+  repoDir: string;
+  failureCode: string;
+  failureMessage: string;
+  attempts: number;
+  evidence: unknown;
+  configSlice: unknown;
+  mutablePaths: string[];
+  allowNewKeys: string[];
+  previousAnswer?: string | null;
+  loopContext?: string;
+  memoryText?: string;
+  logger?: Logger;
+  timeoutMs?: number;
+  onSpawn?: (pid: number) => void;
+  onExit?: (pid: number) => void;
+}): Promise<AgentResult> {
+  const { profile, profilePaths } = options;
+  const { resultPath, logPath } = resultPaths(profilePaths, "configDoctor", options.failureCode);
+  const template = await loadPrompt(profile, "configDoctor");
+  const resultInstruction =
+    (getProvider(profile.executor.provider, profile).resultMode ?? "file") === "stdout"
+      ? "Print the final JSON result to stdout. Do not wrap it in Markdown or add other text."
+      : `Write valid JSON to \`${resultPath}\`.`;
+  const prompt = render(template, {
+    failureCode: options.failureCode,
+    failureMessage: options.failureMessage,
+    attempts: options.attempts,
+    evidence: JSON.stringify(options.evidence ?? null, null, 2).slice(0, 6000),
+    configSlice: JSON.stringify(options.configSlice ?? null, null, 2).slice(0, 4000),
+    mutablePaths: options.mutablePaths.map((entry) => `- ${entry}`).join("\n") || "(none)",
+    allowNewKeys: options.allowNewKeys.join(", ") || "(none)",
+    previousAnswer: options.previousAnswer
+      ? `The human replied (not an approval — keep discussing):\n\n${options.previousAnswer}\n\nAddress their message in a revised proposal, then re-escalate.`
+      : "",
+    loopContext: options.loopContext || "(none)",
+    memory: options.memoryText || "(none)",
+    resultInstruction
+  });
+  return runAgent({
+    profile,
+    profilePaths,
+    role: "configDoctor",
+    prompt,
+    cwd: options.repoDir,
+    resultPath,
+    logPath,
+    logger: options.logger,
+    timeoutMs: options.timeoutMs ?? 5 * 60_000,
+    onSpawn: options.onSpawn,
+    onExit: options.onExit
+  });
 }
 
 export async function runDiscovery(options: {
