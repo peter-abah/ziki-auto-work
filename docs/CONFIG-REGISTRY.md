@@ -82,6 +82,7 @@ Hard stops unchanged: provider/model errors, missing keys.
 | D4 | `src/config.ts:92-159` | `DEFAULT_REPAIR_MUTABLE_PATHS/ALLOW_NEW_KEYS/STRATEGIES` + `NEVER_MUTABLE` regexes | `repair.*` required in config; `NEVER_MUTABLE` stays code (security floor, documented) |
 | D5 | `src/scheduler.ts:111`, `src/orchestrator.ts` call sites | `drain 60s` default, `120s` waits, `pollSeconds*1000`, `truncate 120`, cache `10min`, `retryMs 5min`, rate-limit chunk | `loop.{drainMs,waitMs,truncLen,cacheMs}`, `timing.*` |
 | D6 | `src/agent.ts:48-62,150-164` | `ROLE_TIMEOUT_KEY`, `45min` fallback, `resultMode ?? "file"`, `timeoutMs` chain, tail `20_000`, evidence slices `6000/4000` | `executor.{roleTimeouts,resultMode,timeoutMs,tailBytes,evidenceChars}` |
+| D7 | `src/orchestrator.ts` cycle catch, agent start/timeout caps | consecutive-failure tolerance before a repeated failure parks the loop | `health.cycleErrorLimit` (positive int, default 5; `null` disables parking) |
 
 ## E. Explicitly NOT config-driven (code stays, documented) 🔶
 

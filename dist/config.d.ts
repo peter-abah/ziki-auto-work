@@ -94,6 +94,7 @@ export declare function validateConfig(config: Config): ValidationResult;
 export declare function validateZikiStatuses(value: unknown, label: string): string[];
 export declare function validateTiming(value: unknown, label: string): string[];
 export declare function validateHealthRetry(value: unknown, label: string): string[];
+export declare function validateCycleErrorLimit(value: unknown, label: string): string[];
 export declare function validateV4Required(profile: ProfileConfig, prefix: string): string[];
 export declare function validateV4Sections(profile: ProfileConfig, prefix: string): string[];
 export declare function resolveRunLimits(profile: ProfileConfig, override?: Partial<RunLimitConfig> | null): RunLimitConfig;

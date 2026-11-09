@@ -72,4 +72,55 @@ test("empty state has healthy health and old state files load a default health b
         await rm(dir, { recursive: true, force: true });
     }
 });
+test("loadState rejects an unknown schema version instead of merging it", async () => {
+    const { loadState, pruneState } = await import("./state.js");
+    const dir = await mkdtemp(path.join(os.tmpdir(), "auto-work-state-"));
+    const profilePaths = { stateDir: dir, stateFile: path.join(dir, "state.json") };
+    try {
+        await writeFile(profilePaths.stateFile, JSON.stringify({ version: 2, cycles: 99 }));
+        await assert.rejects(loadState(profilePaths), /unsupported version/);
+        // Corrupt JSON still resets (loud operator action follows); versioned
+        // JSON never silently merges.
+        await writeFile(profilePaths.stateFile, "{not json");
+        const reset = await loadState(profilePaths);
+        assert.equal(reset.cycles, 0);
+    }
+    finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+test("pruneState caps non-open escalations per group but keeps terminal answers", async () => {
+    const { pruneState } = await import("./state.js");
+    const state = emptyState();
+    const esc = (id, status, createdAt) => ({
+        id,
+        issueId: null,
+        issueNumber: null,
+        issueTitle: null,
+        type: "human_approval",
+        body: "x",
+        agentName: "a",
+        createdAt,
+        status,
+        answer: null,
+        resolvedAt: null,
+        kind: "config",
+        strategy: "platform:unknown_kind",
+        configPatch: null,
+        decision: "rejected",
+        rounds: 1,
+        remoteStatus: status,
+        appliedAt: null,
+        previousId: null
+    });
+    for (let i = 0; i < 6; i += 1) {
+        state.escalations[`old-${i}`] = esc(`old-${i}`, "dismissed", `2026-01-0${i + 1}T00:00:00.000Z`);
+    }
+    state.escalations["live"] = esc("live", "open", "2026-02-01T00:00:00.000Z");
+    pruneState(state);
+    const remaining = Object.keys(state.escalations);
+    assert.ok(remaining.includes("live"), "open escalation must survive");
+    assert.ok(remaining.includes("old-5"), "latest terminal answer must survive");
+    assert.equal(remaining.length, 4, `expected open + 3 latest, got ${remaining.join(",")}`);
+});
 //# sourceMappingURL=state.test.js.map

@@ -1,4 +1,4 @@
-import type { Config, ConfigPatchOp, HealthBlocker, Idea, Issue, ProfileConfig, ProfilePaths, LoadedProfile, Queue, RunLimitConfig, State, WorkFeed } from "./types.js";
+import type { Config, ConfigPatchOp, HealthBlocker, Idea, Issue, ProfileConfig, ProfilePaths, LoadedProfile, Queue, RepairStrategyConfig, RunLimitConfig, State, WorkFeed } from "./types.js";
 import type { Logger } from "./log.js";
 import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
@@ -48,7 +48,7 @@ interface Context {
         aux: number;
         errors: number;
     };
-    lastNeedsYouCount: number | null;
+    lastNeedsYouKey: string | null;
     tokenWarned: boolean;
     tokenLimitReached: boolean;
     providerLimit: "quota" | null;
@@ -62,6 +62,9 @@ interface Context {
         note: (message: string) => void;
     } | null;
     consecutiveNetworkErrors: number;
+    consecutiveCycleErrors: number;
+    consecutiveAgentStartFailures: number;
+    consecutiveGithubAuthFailures: number;
     capacity: Capacity;
     unsupportedKinds: Set<string>;
     profileSynced: boolean;
@@ -72,6 +75,17 @@ interface Context {
     reservedTargets: Set<string>;
     statusTimer: NodeJS.Timeout | null;
 }
+/** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. Exported for tests. */
+export declare function runRepairStateMachine(ctx: Context, code: string, blocker: HealthBlocker, strategy: RepairStrategyConfig): Promise<"wait" | "continue">;
+export interface RepairDeadEnd {
+    strategy: string;
+    escalation: string | null;
+    reason: string;
+    /** Config mtime when the dead-end was recorded; a change reopens the episode. */
+    configMtime: number | null;
+}
+/** The recorded dead-end for a repair strategy, if its details match. */
+export declare function repairDeadEndFor(ctx: Context, code: string): RepairDeadEnd | null;
 /**
  * Deterministic diagnosis for a repair code: live reads only, no agent.
  * Returns ops to propose plus a done flag when the diagnosis itself resolves
@@ -96,6 +110,8 @@ export declare function verifyEndpointOps(ctx: Context, ops: ConfigPatchOp[]): P
     notes: string[];
 }>;
 export declare function normalizeCommitMessage(message: string | undefined, issue: Issue, commitTypes: string[]): string;
+/** Persist state + status. Exported for tests. Never throws: a persist failure records a state:persist blocker instead. */
+export declare function save(ctx: Context): Promise<void>;
 export declare function runLoop(options?: {
     profileName?: string;
     foreground?: boolean;

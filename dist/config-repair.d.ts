@@ -130,6 +130,15 @@ export interface ApplyResult {
  * Pure file operation — never touches Ziki or agents.
  */
 export declare function applyConfigPatch(config: Config, profileName: string, profilePaths: ProfilePaths, ops: ConfigPatchOp[], logger?: Logger): Promise<ApplyResult>;
+/**
+ * Re-read the persisted config file and confirm every op path holds the
+ * expected value. Returns the mismatches, if any — the caller must treat a
+ * mismatch as a failed apply, never as "applied".
+ */
+export declare function verifyPersistedPatch(profileName: string, ops: ConfigPatchOp[], logger?: Logger): Promise<{
+    ok: boolean;
+    errors?: string[];
+}>;
 /** Escalation body for a config-repair proposal. */
 export declare function formatRepairEscalationBody(options: {
     strategy: string;
@@ -142,6 +151,13 @@ export declare function formatRepairEscalationBody(options: {
 }): string;
 /** Latest open config escalation for a strategy (reaps local CLI approvals first). */
 export declare function latestStrategyEscalation(state: State, strategy: string): EscalationRecord | null;
+/**
+ * Latest config escalation for a strategy regardless of status. The open-only
+ * lookup above cannot see terminal answers (rejected/dismissed/expired), so
+ * without this a rejection is silently re-proposed next cycle as if the
+ * human had never answered.
+ */
+export declare function latestStrategyEscalationAny(state: State, strategy: string): EscalationRecord | null;
 /**
  * Supersede check: returns the newly covered paths when the fresh diagnosis is
  * a strict superset of the pending proposal (monotonic growth guarantees the

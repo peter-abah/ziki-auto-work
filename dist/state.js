@@ -47,19 +47,26 @@ function todayKey(date = new Date()) {
 export async function loadState(profilePaths) {
     if (!existsSync(profilePaths.stateFile))
         return emptyState();
+    let parsed;
     try {
-        const parsed = JSON.parse(await readFile(profilePaths.stateFile, "utf8"));
-        const base = emptyState();
-        return {
-            ...base,
-            ...parsed,
-            run: { ...base.run, ...(parsed.run ?? {}) },
-            health: parsed.health ? { ...base.health, ...parsed.health, blockers: parsed.health.blockers ?? {} } : base.health
-        };
+        parsed = JSON.parse(await readFile(profilePaths.stateFile, "utf8"));
     }
     catch {
         return emptyState();
     }
+    // Schema drift must fail loud, never silently merge: an unknown version
+    // means another (newer/older) build owns this state dir.
+    if (parsed.version !== 1) {
+        throw new Error(`State ${profilePaths.stateFile} has unsupported version ${JSON.stringify(parsed.version ?? null)} (this build reads version 1). ` +
+            "Back it up, delete it to reset, or run a matching auto-work build.");
+    }
+    const base = emptyState();
+    return {
+        ...base,
+        ...parsed,
+        run: { ...base.run, ...(parsed.run ?? {}) },
+        health: parsed.health ? { ...base.health, ...parsed.health, blockers: parsed.health.blockers ?? {} } : base.health
+    };
 }
 export async function saveState(profilePaths, state) {
     const lock = mutexFor(`state:${profilePaths.stateFile}`);
@@ -119,6 +126,23 @@ export function pruneState(state, { keepDays = 14 } = {}) {
     for (const [key] of Object.entries(state.counters)) {
         if (new Date(`${key}T00:00:00Z`).getTime() < cutoff)
             delete state.counters[key];
+    }
+    // Bound escalation growth without breaking the repair state machine's
+    // terminal answers: open records always stay; per strategy/issue keep the
+    // latest 3 non-open records (the lookup only ever reads the latest).
+    const groups = new Map();
+    for (const escalation of Object.values(state.escalations)) {
+        const key = `${escalation.kind ?? "issue"}:${escalation.strategy ?? escalation.issueId ?? "?"}`;
+        const list = groups.get(key) ?? [];
+        list.push(escalation);
+        groups.set(key, list);
+    }
+    for (const list of groups.values()) {
+        const closed = list
+            .filter((escalation) => escalation.status !== "open")
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        for (const dropped of closed.slice(3))
+            delete state.escalations[dropped.id];
     }
     return state;
 }

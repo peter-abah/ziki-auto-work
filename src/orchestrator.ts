@@ -122,6 +122,7 @@ import {
   parseUnknownEndpoint,
   formatRepairEscalationBody,
   latestStrategyEscalation,
+  latestStrategyEscalationAny,
   maxRoundsFor,
   repairConfigFor,
   strategyFor,
@@ -354,7 +355,7 @@ interface Context {
   auxLastKind: string | null;
   reservedAgents: Set<string>;
   cycleStats: { deliveries: number; reviews: number; aux: number; errors: number };
-  lastNeedsYouCount: number | null;
+  lastNeedsYouKey: string | null;
   tokenWarned: boolean;
   tokenLimitReached: boolean;
   providerLimit: "quota" | null;
@@ -366,6 +367,9 @@ interface Context {
   phaseStartedAt: string | null;
   live: { note: (message: string) => void } | null;
   consecutiveNetworkErrors: number;
+  consecutiveCycleErrors: number;
+  consecutiveAgentStartFailures: number;
+  consecutiveGithubAuthFailures: number;
   capacity: Capacity;
   unsupportedKinds: Set<string>;
   profileSynced: boolean;
@@ -956,6 +960,16 @@ async function applyHealth(ctx: Context, report: HealthReport): Promise<void> {
 async function clearHealth(ctx: Context, component: HealthComponent, code?: string): Promise<void> {
   const removed = clearBlocker(ctx.state.health, component, code);
   if (!removed.length) return;
+  // A dead-end watches one blocker; when that blocker recovers on its own
+  // (e.g. Ziki restores a route), the dead-end is stale — clear it too so
+  // NEEDS-HUMAN stops telling the human to fix something already fixed.
+  const deadEnd = ctx.state.health.blockers["config:repair_dead_end"];
+  const watched = (deadEnd?.details as Record<string, unknown> | undefined)?.blocker;
+  if (deadEnd && typeof watched === "string" && removed.some((blocker) => blocker.id === watched)) {
+    clearBlocker(ctx.state.health, "config", "repair_dead_end");
+    history(ctx, { type: "health", detail: "recovered config:repair_dead_end (watched blocker cleared)" });
+    ctx.logger.info("Health recovered: config:repair_dead_end (watched blocker cleared)");
+  }
   history(ctx, {
     type: "health",
     detail: `recovered ${component}${code ? `:${code}` : ""}`,
@@ -1085,6 +1099,37 @@ async function flushOutboxPass(ctx: Context): Promise<void> {
     ctx.logger.info(`Outbox flush: ${result.flushed} applied, ${result.skipped} skipped as duplicates, ${result.pending} pending`);
   }
   await save(ctx).catch(() => {});
+}
+
+/**
+ * Mid-run GitHub auth check: an expired/revoked `gh` token otherwise shows
+ * up only as repeated task failures that requeue forever. Local, read-only,
+ * runs every cycle; warns first, parks as blocked at the failure limit.
+ */
+async function githubAuthPass(ctx: Context): Promise<void> {
+  let ok = false;
+  let detail = "";
+  try {
+    const status = await ctx.github.authStatus();
+    ok = status.ok;
+    if (!ok) detail = truncate(`${status.stderr}\n${status.stdout}`.trim(), 200) || "gh auth status failed";
+  } catch (error) {
+    detail = error instanceof Error ? error.message : String(error);
+  }
+  if (ok) {
+    ctx.consecutiveGithubAuthFailures = 0;
+    await clearHealth(ctx, "github", "auth");
+    return;
+  }
+  ctx.consecutiveGithubAuthFailures += 1;
+  const limit = cycleErrorLimit(ctx.profile);
+  await applyHealth(ctx, {
+    component: "github",
+    code: "auth",
+    severity: limit !== null && ctx.consecutiveGithubAuthFailures >= limit ? "blocked" : "warning",
+    message: `GitHub authentication failing (${ctx.consecutiveGithubAuthFailures} cycle(s) in a row): ${truncate(detail, 200) || "run `gh auth login`"}`,
+    retryMs: null
+  });
 }
 
 /** PR watch while the loop is blocked: GitHub reads only, local bookkeeping, no Ziki or Git writes. */
@@ -1326,8 +1371,8 @@ async function repairWarningLoop(ctx: Context): Promise<void> {
   }
 }
 
-/** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. */
-async function runRepairStateMachine(
+/** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. Exported for tests. */
+export async function runRepairStateMachine(
   ctx: Context,
   code: string,
   blocker: HealthBlocker,
@@ -1338,13 +1383,26 @@ async function runRepairStateMachine(
   await reapRepairAnswers(ctx);
   await consumeRepairApprovals(ctx);
 
+  // A recorded dead-end for this exact config parks the strategy: the human
+  // has answered (or rounds are exhausted) and re-proposing the same patch
+  // would burn agent runs while teaching the loop nothing. A config edit
+  // (mtime change) starts a fresh episode below.
+  const standing = repairDeadEndFor(ctx, code);
+  if (standing && standing.configMtime === ctx.configMtimeMs) {
+    ctx.logger.info(`Config repair for ${code} is at a recorded dead-end; staying parked until the config changes`);
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
+
   const existing = latestStrategyEscalation(ctx.state, code);
   if (existing) {
     if (existing.decision === "approved" && existing.configPatch?.length) {
       return applyApprovedRepair(ctx, code, existing);
     }
     if (existing.decision === "rejected" || existing.status === "dismissed") {
-      ctx.logger.info(`Config repair for ${code} was rejected; staying parked until the config changes`);
+      await recordRepairDeadEnd(ctx, code, `proposal ${existing.id} was rejected`, {
+        escalation: existing.id
+      });
       await save(ctx).catch(() => {});
       return "wait";
     }
@@ -1356,6 +1414,9 @@ async function runRepairStateMachine(
           existing.id,
           `max proposal rounds (${maxRounds}) reached without approval`
         );
+        await recordRepairDeadEnd(ctx, code, `max proposal rounds (${maxRounds}) reached without approval`, {
+          escalation: existing.id
+        });
         history(ctx, {
           type: "health",
           detail: `config repair expired: ${code}`,
@@ -1390,7 +1451,79 @@ async function runRepairStateMachine(
     await save(ctx).catch(() => {});
     return "wait";
   }
+  // No open escalation: check for a terminal answer the open-only lookup
+  // cannot see. A rejection or an exhausted round is a human-visible
+  // dead-end — never a silent re-proposal of the same patch. A config edit
+  // since the dead-end was recorded starts a fresh episode instead.
+  const terminal = latestStrategyEscalationAny(ctx.state, code);
+  if (terminal && (terminal.decision === "rejected" || terminal.status === "dismissed" || terminal.status === "expired")) {
+    const prior = repairDeadEndFor(ctx, code);
+    if (prior && prior.escalation === terminal.id && prior.configMtime !== ctx.configMtimeMs) {
+      ctx.logger.info(`Config changed since the ${code} dead-end; starting a fresh repair episode`);
+      return startRepairRound(ctx, code, blocker, strategy, null);
+    }
+    if (!prior || prior.escalation !== terminal.id) {
+      await recordRepairDeadEnd(ctx, code,
+        terminal.status === "expired" && terminal.decision !== "rejected"
+          ? `proposal rounds exhausted without approval (see ${terminal.id})`
+          : `proposal ${terminal.id} was rejected`,
+        { escalation: terminal.id }
+      );
+    }
+    await save(ctx).catch(() => {});
+    return "wait";
+  }
   return startRepairRound(ctx, code, blocker, strategy, null);
+}
+
+export interface RepairDeadEnd {
+  strategy: string;
+  escalation: string | null;
+  reason: string;
+  /** Config mtime when the dead-end was recorded; a change reopens the episode. */
+  configMtime: number | null;
+}
+
+/** The recorded dead-end for a repair strategy, if its details match. */
+export function repairDeadEndFor(ctx: Context, code: string): RepairDeadEnd | null {
+  const deadEnd = ctx.state.health.blockers["config:repair_dead_end"];
+  if (!deadEnd) return null;
+  const details = (deadEnd.details ?? {}) as Record<string, unknown>;
+  if (details.strategy !== code) return null;
+  return {
+    strategy: code,
+    escalation: typeof details.escalation === "string" ? details.escalation : null,
+    reason: typeof details.reason === "string" ? details.reason : "",
+    configMtime: typeof details.configMtime === "number" ? details.configMtime : null
+  };
+}
+
+/**
+ * Park a repair strategy at a human-visible dead-end: a warning health item
+ * (surfaced in NEEDS-HUMAN.md and status) plus history. The loop stays
+ * parked on the underlying blocker; nothing re-proposes until the config
+ * changes or the repair succeeds.
+ */
+async function recordRepairDeadEnd(
+  ctx: Context,
+  code: string,
+  reason: string,
+  data: { escalation?: string | null } = {}
+): Promise<void> {
+  ctx.logger.warn(`Config repair for ${code} reached a dead-end: ${reason}`);
+  await applyHealth(ctx, {
+    component: "config",
+    code: "repair_dead_end",
+    severity: "warning",
+    message: `Config repair for ${code} is parked: ${reason}. Fix it manually, then edit the config to resume repair.`,
+    details: { strategy: code, blocker: code, reason, escalation: data.escalation ?? null, configMtime: ctx.configMtimeMs },
+    retryMs: null
+  });
+  history(ctx, {
+    type: "health",
+    detail: `config repair dead-end: ${code} — ${reason}`,
+    data: { strategy: code, escalation: data.escalation ?? null }
+  });
 }
 
 /** Poll Ziki for escalation answers without touching other health state. */
@@ -1458,6 +1591,9 @@ async function applyApprovedRepair(
       escalation.id,
       `approved patch no longer validates: ${check.errors.join("; ")}`
     );
+    await recordRepairDeadEnd(ctx, code, `approved patch no longer validates: ${check.errors.join("; ")}`, {
+      escalation: escalation.id
+    });
     history(ctx, {
       type: "health",
       detail: `config repair expired (stale patch): ${code}`,
@@ -1473,6 +1609,9 @@ async function applyApprovedRepair(
       escalation.id,
       `approved patch failed to apply: ${(applied.errors ?? []).join("; ")}`
     );
+    await recordRepairDeadEnd(ctx, code, `approved patch failed to apply: ${(applied.errors ?? []).join("; ")}`, {
+      escalation: escalation.id
+    });
     history(ctx, {
       type: "health",
       detail: `config repair failed to apply: ${code}`,
@@ -1483,6 +1622,8 @@ async function applyApprovedRepair(
   }
   escalation.status = "applied";
   escalation.appliedAt = new Date().toISOString();
+  // A successful repair closes any standing dead-end for this strategy.
+  if (repairDeadEndFor(ctx, code)) await clearHealth(ctx, "config", "repair_dead_end");
   const [component, ...rest] = code.split(":");
   await clearHealth(ctx, component as HealthComponent, rest.join(":") || undefined);
   ctx.platform = { issues: [], ideas: [], fetchedAt: null };
@@ -1528,14 +1669,20 @@ export async function diagnoseForCode(
   let ops: ConfigPatchOp[] = [];
   let summary = "";
   const shortCode = code.includes(":") ? code.split(":").slice(1).join(":") : code;
-  if (shortCode === "not_found" && code === "platform:not_found") {
+  // Any 404 (retired project, moved feed route, removed endpoint): diff the
+  // tenant's live project identity against the profile. When identity
+  // already matches, the route itself moved — the agent investigates.
+  if (shortCode === "not_found") {
     try {
       const diagnosis = await diagnoseProjectMismatch(ctx.primary.client, ctx.profile, ctx.logger);
       evidence.push(
         `tenant projects: ${diagnosis.projects.map((project) => `${project.slug}=${project.id}`).join(", ") || "(none)"}`
       );
       ops = diagnosis.ops;
-      summary = diagnosis.detail;
+      summary = diagnosis.ops.length
+        ? `${code}: ${diagnosis.detail}`
+        : `${code}: project identity already matches the tenant, so the route itself moved or was removed. ` +
+          "Agent investigation required (see evidence); a human may need to add the route manually.";
     } catch (error) {
       summary = `Project lookup failed: ${error instanceof Error ? error.message : String(error)}`;
     }
@@ -1753,6 +1900,17 @@ async function startRepairRound(
   const check = validateConfigPatch(ctx.profile, ops, repair);
   if (!check.ok || !ops.length) {
     ctx.logger.warn(`Config-repair round produced no valid patch for ${code}`, { errors: check.errors });
+    // Deterministic dead-ends (unknown Ziki route, ambiguous project,
+    // unreadable platform list, protected-only gaps) park visibly instead of
+    // burning a config-doctor run every cycle with no escalation to show.
+    await recordRepairDeadEnd(
+      ctx,
+      code,
+      ops.length
+        ? `proposed patch failed validation: ${check.errors.join("; ")}`
+        : `no valid patch: ${deterministicSummary}`,
+      { escalation: previous?.id ?? null }
+    );
     history(ctx, {
       type: "health",
       detail: `config repair round ${round} produced no valid patch: ${code}`,
@@ -1794,13 +1952,32 @@ async function startRepairRound(
     agentName: ctx.primary.name
   });
   if (!escalated.ok) {
-    ctx.logger.warn(`Config-repair escalation failed: ${escalated.error ?? "unknown error"}`);
-    history(ctx, {
-      type: "health",
-      detail: `config repair escalation failed: ${code}`,
-      data: { error: escalated.error ?? "unknown" }
-    });
+    if (escalated.skipped) {
+      ctx.logger.warn(`Config-repair escalation skipped (cap): ${escalated.error ?? "too many open"}`);
+      history(ctx, {
+        type: "health",
+        detail: `config repair escalation skipped (cap): ${code}`,
+        data: { error: escalated.error ?? "too_many_open" }
+      });
+    } else {
+      // RPC failure / no-id: bounded retries, then a visible dead-end.
+      // Without the bound a Ziki outage re-proposes (and re-runs the doctor)
+      // every cycle forever with only a warn line to show for it.
+      const failures = (ctx.state.repairEscalationFailures ??= {});
+      failures[code] = (failures[code] ?? 0) + 1;
+      ctx.logger.warn(`Config-repair escalation failed (${failures[code]}/${maxRounds}): ${escalated.error ?? "unknown error"}`);
+      history(ctx, {
+        type: "health",
+        detail: `config repair escalation failed: ${code}`,
+        data: { error: escalated.error ?? "unknown", attempt: failures[code] }
+      });
+      if (failures[code]! >= maxRounds) {
+        failures[code] = 0;
+        await recordRepairDeadEnd(ctx, code, `repair escalation failed ${maxRounds} time(s) in a row: ${escalated.error ?? "unknown error"}`, {});
+      }
+    }
   } else {
+    if (ctx.state.repairEscalationFailures) delete ctx.state.repairEscalationFailures[code];
     ctx.logger.info(`Config repair proposed for ${code}; awaiting human approval`, {
       escalation: escalated.escalation?.id
     });
@@ -1998,16 +2175,19 @@ async function handleProviderLimit(ctx: Context, result: { providerLimit?: "quot
 async function notifyNeedsYou(ctx: Context): Promise<void> {
   const open = Object.values(ctx.state.escalations).filter((escalation) => escalation.status === "open");
   const count = open.length;
-  if (ctx.lastNeedsYouCount === count) return;
-  if (ctx.lastNeedsYouCount === null && count === 0) {
-    ctx.lastNeedsYouCount = 0;
+  // Notify on content change, not just count change: a new escalation that
+  // replaces a resolved one (same count) previously never notified anyone.
+  const key = open.map((escalation) => escalation.id).sort().join(",");
+  if (ctx.lastNeedsYouKey === key) return;
+  if (ctx.lastNeedsYouKey === null && count === 0) {
+    ctx.lastNeedsYouKey = key;
     return;
   }
   const link = inboxUrl(ctx.profile);
   const title = count ? `auto-work: ${count} item${count === 1 ? "" : "s"} need you on Ziki` : "auto-work: Ziki is clear";
   const body = count ? `Open Ziki to handle them: ${link}` : "Nothing is waiting on you.";
   await notifyProfile(ctx.profile, title, body, ctx.logger);
-  ctx.lastNeedsYouCount = count;
+  ctx.lastNeedsYouKey = key;
 }
 
 function fileEvidence(files: Array<string | { path: string; lines?: string }> | undefined): Array<{ path: string; lines?: string }> {
@@ -2218,6 +2398,17 @@ async function buildStatus(ctx: Context, extra: Record<string, unknown> = {}): P
       updatedAt: task.updatedAt
     })),
     counters: counter(ctx),
+    outbox: {
+      pending: ctx.state.outbox?.items.length ?? 0,
+      failed: (ctx.state.outbox?.failed ?? []).map((entry) => ({
+        id: entry.id,
+        kind: entry.kind,
+        title: entry.title ?? null,
+        issueNumber: entry.issueNumber ?? null,
+        attempts: entry.attempts,
+        lastError: entry.lastError ?? null
+      }))
+    },
     escalations: open.map((escalation) => ({
       id: escalation.id,
       issue: escalation.issueNumber,
@@ -2341,7 +2532,8 @@ async function writeBootStatus(
   await writeFile(loaded.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
 }
 
-async function save(ctx: Context): Promise<void> {
+/** Persist state + status. Exported for tests. Never throws: a persist failure records a state:persist blocker instead. */
+export async function save(ctx: Context): Promise<void> {
   if (ctx.state.lastCycleAt) {
     ctx.state.lastCycle = {
       at: ctx.state.lastCycleAt,
@@ -2364,7 +2556,29 @@ async function save(ctx: Context): Promise<void> {
     const status = await buildStatus(ctx);
     await mkdir(ctx.profilePaths.stateDir, { recursive: true });
     await writeFile(ctx.profilePaths.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
-  });
+  }).then(
+    async () => {
+      // A recovered persist path clears the parking blocker, if standing.
+      if (ctx.state.health.blockers["state:persist"]) {
+        await clearHealth(ctx, "state", "persist");
+      }
+    },
+    async (error: unknown) => {
+      // Persistence failure parks the loop: a loop that cannot persist is
+      // flying blind (claims, escalations, and counters would silently
+      // diverge from disk). Callers keep their `.catch(() => {})` — the
+      // blocker, not the throw, is the signal.
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.logger.error(`State persist failed: ${message}`);
+      await applyHealth(ctx, {
+        component: "state",
+        code: "persist",
+        severity: "blocked",
+        message: `Cannot persist loop state to ${ctx.profilePaths.stateDir}: ${truncate(message, 200)}`,
+        retryMs: null
+      });
+    }
+  );
 }
 
 async function fetchMergedFeed(ctx: Context): Promise<{ feed: WorkFeed | null; failures: FeedFailure[] }> {
@@ -2435,7 +2649,19 @@ async function loadPlatformSets(ctx: Context): Promise<Context["platform"]> {
   } catch (error) {
     ctx.logger.warn(`Platform set refresh failed: ${error instanceof Error ? error.message : String(error)}`);
     await applyHealth(ctx, classifyError(error, "platform", ctx.profile));
-    return cached ?? { fetchedAt: null, issues: [], ideas: [] };
+    if (!cached) {
+      // No cache and no live sets: the queue builds empty while health may
+      // only say "degraded". Make the empty queue itself visible.
+      await applyHealth(ctx, {
+        component: "platform",
+        code: "empty_sets",
+        severity: "warning",
+        message: "Platform issue/idea sets are unavailable and no cache exists; the queue will be empty until the next successful refresh.",
+        retryMs: null
+      });
+      return { fetchedAt: null, issues: [], ideas: [] };
+    }
+    return cached;
   }
 }
 
@@ -2470,6 +2696,56 @@ async function heartbeatPass(ctx: Context): Promise<void> {
       retryMinutes: failure.retryMs / 60_000
     });
   }
+}
+
+/**
+ * Claim reconciliation on startup: a crashed or killed loop leaves remote
+ * Ziki claims that outlive the process. For every recorded claim, send one
+ * heartbeat immediately (rather than waiting for the persisted
+ * nextHeartbeatAt): a claim-lost answer clears the claim locally and
+ * requeues the task, a success refreshes the heartbeat bookkeeping, and any
+ * other error leaves the task for the normal heartbeat pass. Read-only
+ * except for the heartbeat itself; never blocks startup.
+ */
+async function reconcileClaimsOnStartup(ctx: Context): Promise<void> {
+  const policy = ctx.profile.heartbeatPolicy;
+  let intervalMs: number;
+  try {
+    intervalMs = resolveHeartbeatIntervalMs({ timing: ctx.profile.timing, policy, zikiWorkflow: ctx.zikiWorkflow });
+  } catch (error) {
+    ctx.logger.warn(`Claim reconciliation skipped (heartbeat policy): ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const claimed = Object.values(ctx.state.tasks).filter(
+    (task) => Boolean(task.claimId) && ["claimed", "working", "queued", "waiting_human"].includes(task.status)
+  );
+  if (!claimed.length) return;
+  ctx.logger.info(`Reconciling ${claimed.length} recorded claim(s) with Ziki`, {
+    issues: claimed.map((task) => task.number)
+  });
+  for (const task of claimed) {
+    const agent = task.agentName ? clientByName(ctx, task.agentName) : ctx.primary;
+    if (!agent || !task.id) {
+      ctx.logger.warn(`Claim reconciliation: no agent key for #${task.number}; leaving claim for the heartbeat pass`);
+      continue;
+    }
+    try {
+      await agent.client.heartbeat(task.id);
+      applyHeartbeatSuccess(task, Date.now(), intervalMs);
+      ctx.logger.info(`Claim on #${task.number} is still live`, { agent: agent.name });
+    } catch (error) {
+      const failure = applyHeartbeatFailure(task, error, Date.now(), policy);
+      if (failure.claimLost) {
+        ctx.logger.warn(`Claim on #${task.number} is gone remotely; requeued`, { agent: agent.name });
+        history(ctx, { type: "failure", issue: typeof task.number === "number" ? task.number : null, detail: "claim lost before restart; requeued" });
+      } else {
+        ctx.logger.warn(`Claim check failed for #${task.number}; leaving claim for the heartbeat pass`, {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  }
+  await save(ctx).catch(() => {});
 }
 
 async function withScratch<T>(ctx: Context, label: string, fn: (dir: string) => Promise<T>): Promise<T> {
@@ -2695,6 +2971,42 @@ async function processWorkItem(ctx: Context, item: QueueEntry, preferredWorker?:
     markRecent(ctx, item.key);
     await save(ctx);
     return;
+  }
+
+  // Provider-level failures (binary missing, spawn error, timeout) used to
+  // requeue forever with per-task errors. Cap consecutive occurrences across
+  // tasks and escalate once, so a dead provider is human-visible.
+  if (
+    !result.ok &&
+    typeof result.error === "string" &&
+    (result.error.startsWith("agent failed to start") || result.error.startsWith("agent timed out"))
+  ) {
+    ctx.consecutiveAgentStartFailures += 1;
+    const limit = cycleErrorLimit(ctx.profile);
+    if (limit !== null && ctx.consecutiveAgentStartFailures >= limit) {
+      ctx.consecutiveAgentStartFailures = 0;
+      const body =
+        `The ${ctx.profile.executor.provider} agent failed to start or timed out ${limit} time(s) in a row ` +
+        `(latest: ${truncate(result.error, 200)}). Check the provider binary, auth, and quota — tasks keep requeueing until this is fixed.`;
+      try {
+        const escalation = await escalate(ctx.primary.client, ctx.profile, ctx.profilePaths, ctx.state, {
+          type: "blocker",
+          body,
+          agentName: ctx.primary.name,
+          logger: ctx.logger,
+          notifyCommand: ctx.profile.hitl.notifyCommand,
+          maxOpen: ctx.profile.limits.maxOpenEscalations
+        });
+        if (escalation.ok) {
+          history(ctx, { type: "escalation", issue: issue.number, detail: "provider start failure", data: { id: escalation.escalation?.id } });
+          await notifyNeedsYou(ctx);
+        }
+      } catch (error) {
+        ctx.logger.warn(`Provider-failure escalation failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  } else {
+    ctx.consecutiveAgentStartFailures = 0;
   }
 
   if (!result.ok) {
@@ -4507,14 +4819,35 @@ async function processMergeFix(ctx: Context, item: QueueEntry, preferred?: Agent
   await ctx.github.mergePr(issue.pullRequestUrl, resolveMergeMethod(ctx.profile));
   const merged = await ctx.github.prStatus(issue.pullRequestUrl).catch(() => null);
   const manager = managerFor(ctx, preferred, [issue.holder?.agentName ?? ""]);
+  let reported = false;
   if (merged && manager) {
-    await reportPrStatusWith(ctx, manager, issue, merged).catch(() => {});
+    const statusReport = await reportPrStatusWith(ctx, manager, issue, merged).then(
+      () => true,
+      () => false
+    );
     const inDefault = await isInDefaultBranch(ctx, merged.mergeCommitSha);
+    let resolved = false;
     if (inDefault) {
-      await manager.client.resolveIssue(issue.id, issue.pullRequestUrl).catch(() => {});
+      resolved = await manager.client
+        .resolveIssue(issue.id, issue.pullRequestUrl)
+        .then(() => true, () => false);
     }
+    reported = statusReport && (!inDefault || resolved);
   }
-  history(ctx, { type: "delivery", issue: issue.number, detail: "merged and reported", data: { pr: issue.pullRequestUrl } });
+  // Record the merge and the Ziki report as separate facts: a failed report
+  // must never hide behind "merged and reported".
+  history(ctx, { type: "delivery", issue: issue.number, detail: "merged", data: { pr: issue.pullRequestUrl } });
+  history(ctx, {
+    type: "delivery",
+    issue: issue.number,
+    detail: reported ? "reported to Ziki" : "merge NOT reported to Ziki (report or resolve failed — needs follow-up)",
+    data: { pr: issue.pullRequestUrl, reported }
+  });
+  if (!reported) {
+    ctx.logger.warn(`Merge of #${issue.number} was not reported to Ziki; follow-up required`, {
+      pr: issue.pullRequestUrl
+    });
+  }
   markRecent(ctx, item.key);
   return true;
 }
@@ -4879,7 +5212,10 @@ async function runCycle(ctx: Context): Promise<{
         return "wait" as const;
       });
       if (outcome === "wait") return parkBlocked(ctx);
-    } else if (nextRetryDelay(ctx.state.health) !== null) {
+    } else {
+      // Any blocked state parks the loop — even without a repair strategy
+      // or a scheduled retry. A blocked loop that keeps dispatching (e.g.
+      // with unwritable state) would act on records it cannot persist.
       return parkBlocked(ctx);
     }
   }
@@ -4941,6 +5277,11 @@ async function runCycle(ctx: Context): Promise<{
   }
 
   ctx.platform = await loadPlatformSets(ctx);
+  // Mid-run GitHub auth gate: fail here, visibly, instead of burning agent
+  // runs on tasks that can never push.
+  await githubAuthPass(ctx).catch((error) => {
+    ctx.logger.warn(`GitHub auth check failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
   // Flush anything queued while the loop was blocked before building the queue.
   await flushOutboxPass(ctx).catch((error) => {
     ctx.logger.warn(`Outbox flush failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -5290,7 +5631,7 @@ async function createContext(
     auxLastKind: null,
     reservedAgents: new Set(),
     cycleStats: { deliveries: 0, reviews: 0, aux: 0, errors: 0 },
-    lastNeedsYouCount: null,
+    lastNeedsYouKey: null,
     tokenWarned: false,
     tokenLimitReached: false,
     providerLimit: null,
@@ -5302,6 +5643,9 @@ async function createContext(
     phaseStartedAt: new Date().toISOString(),
     live: null,
     consecutiveNetworkErrors: 0,
+    consecutiveCycleErrors: 0,
+    consecutiveAgentStartFailures: 0,
+    consecutiveGithubAuthFailures: 0,
     capacity,
     unsupportedKinds: new Set(),
     profileSynced: false,
@@ -5345,8 +5689,12 @@ async function readRunLimitsFile(profilePaths: ProfilePaths): Promise<Partial<Ru
   if (!existsSync(profilePaths.runLimitsFile)) return null;
   try {
     return JSON.parse(await readFile(profilePaths.runLimitsFile, "utf8")) as Partial<RunLimitConfig>;
-  } catch {
-    return null;
+  } catch (error) {
+    // A malformed limits file must fail loud: silently ignoring it would run
+    // without the operator's --until/--max-cycles guard.
+    throw new Error(
+      `Run limits file ${profilePaths.runLimitsFile} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 }
 
@@ -5417,6 +5765,17 @@ async function reconcileWorktreesOnStartup(ctx: Context, blockedPids: number[] =
 
 function runLimitReached(ctx: Context): "max-cycles" | "max-deliveries" | "until" | "max-runtime" | null {
   return limitReached(ctx.state, ctx.runLimits);
+}
+
+/**
+ * Consecutive-failure tolerance from `health.cycleErrorLimit` (template
+ * default 5). Null disables parking — repeated failures warn forever.
+ */
+function cycleErrorLimit(profile: ProfileConfig): number | null {
+  const value = profile.health?.cycleErrorLimit;
+  if (value === null) return null;
+  if (value === undefined) return 5;
+  return value;
 }
 
 async function preflightHealth(ctx: Context): Promise<void> {
@@ -5570,6 +5929,9 @@ export async function runLoop(options: {
   }
   ctx.pool.onChange = () => scheduleStatus(ctx);
   await reconcileWorktreesOnStartup(ctx, stalePids).catch(() => {});
+  await reconcileClaimsOnStartup(ctx).catch((error) => {
+    ctx.logger.warn(`Claim reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
 
   const live = new LiveStatus({
     enabled: options.foreground !== false && !options.verbose,
@@ -5622,6 +5984,7 @@ export async function runLoop(options: {
       try {
         await runCycle(ctx);
         ctx.consecutiveNetworkErrors = 0;
+        ctx.consecutiveCycleErrors = 0;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const network = isTransientNetworkError(error);
@@ -5635,6 +5998,19 @@ export async function runLoop(options: {
         if (network) {
           ctx.state.run.networkErrors += 1;
           ctx.consecutiveNetworkErrors += 1;
+        } else {
+          // A repeated non-network cycle exception used to be only a log
+          // line plus lastError — invisible to health, NEEDS-HUMAN, and the
+          // agent. Now it is a warning that parks as blocked at the limit.
+          ctx.consecutiveCycleErrors += 1;
+          const limit = cycleErrorLimit(ctx.profile);
+          await applyHealth(ctx, {
+            component: "loop",
+            code: "cycle_error",
+            severity: limit !== null && ctx.consecutiveCycleErrors >= limit ? "blocked" : "warning",
+            message: `Cycle failed ${ctx.consecutiveCycleErrors} time(s) in a row: ${truncate(message, 200)}`,
+            retryMs: null
+          });
         }
         await save(ctx).catch(() => {});
         if (options.once) {

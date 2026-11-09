@@ -143,6 +143,11 @@ export async function runAgent(options) {
     await mkdir(path.dirname(resultPath), { recursive: true });
     await mkdir(path.dirname(logPath), { recursive: true });
     const stream = createWriteStream(logPath, { flags: "a" });
+    // A log write failure (disk full, permissions) must degrade to the
+    // in-memory tail — never an unhandled 'error' event crashing the loop.
+    stream.on("error", (error) => {
+        logger?.warn(`Agent log write failed (${logPath}); continuing with in-memory tail: ${error.message}`);
+    });
     let tail = "";
     logger?.info(`Starting ${role} agent`, {
         provider: profile.executor.provider,

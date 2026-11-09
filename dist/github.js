@@ -321,7 +321,16 @@ export class GitHub {
         ], { retry: true, timeoutMs: requireGithubPolicy(this.profile).timeouts.view });
         if (!result.ok)
             return null;
-        const list = JSON.parse(result.stdout || "[]");
+        let list;
+        try {
+            list = JSON.parse(result.stdout || "[]");
+        }
+        catch {
+            // A warning line, HTML login page, or truncated body is not "no PR" —
+            // but it is also not a usable answer. Treat as unknown (null) rather
+            // than throwing out of every caller.
+            return null;
+        }
         return list[0] ?? null;
     }
     async createPr(branch, title, body) {

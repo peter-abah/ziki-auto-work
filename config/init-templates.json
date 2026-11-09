@@ -317,6 +317,16 @@
         "role": "configDoctor",
         "maxRounds": 3
       },
+      "feed:not_found": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 3
+      },
+      "*:not_found": {
+        "enabled": true,
+        "role": "configDoctor",
+        "maxRounds": 2
+      },
       "feed:unexpected_response_shape": {
         "enabled": true,
         "role": "configDoctor",
@@ -1635,6 +1645,7 @@
     ]
   },
   "health": {
+    "cycleErrorLimit": 5,
     "retryMs": {
       "*:auth": 300000,
       "*:permission": 300000,

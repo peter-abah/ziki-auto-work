@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Fixed multi-op config patches persisting only the last op per section
+  (`applyConfigPatch` re-resolves its target every iteration), and added
+  read-back verification: the persisted config is re-read and every op path
+  compared before reporting success, `NEEDS-HUMAN.md` is stat-checked after
+  every escalation write, and backup paths are only reported when the copy
+  exists.
+- Repair rejections and exhausted proposal rounds now park at a visible
+  dead-end (`config:repair_dead_end` warning + NEEDS-HUMAN entry) instead of
+  silently re-proposing; a config edit starts a fresh episode and a
+  successful repair clears it. New repair strategies `feed:not_found` and
+  `*:not_found` route every 404 through project-rotation diagnosis, and
+  repair-escalation RPC failures retry bounded by `maxRounds` before
+  parking.
+- State persistence failures now park the loop (`state:persist` blocked)
+  instead of being swallowed; `loadState` rejects unknown schema versions;
+  repeated cycle exceptions surface as `loop:cycle_error` (blocked at
+  `health.cycleErrorLimit`, default 5); malformed run-limits files fail
+  loud; any blocked state without a strategy parks instead of dispatching.
+- Dropped outbox entries and expired escalations now appear in NEEDS-HUMAN.md
+  and `status`; non-open escalations are pruned to the latest 3 per group;
+  `notifyNeedsYou` fires on content change; empty platform sets raise a
+  visible warning; a mid-run `gh auth` check warns then parks; consecutive
+  agent start/timeout failures escalate once at the limit; the agent log
+  stream degrades to the in-memory tail on write failure; approval-queue
+  consume is mutex-guarded; startup reconciles recorded claims with one
+  heartbeat each.
+- `findOpenPr` treats non-JSON output as unknown instead of throwing, and
+  merge follow-up records "merged" and "reported to Ziki" as separate
+  history facts.
+
 - Added an adaptive Ziki API layer. Validation failures now strip unknown or
   rejected fields, repair oversized values, cache the learned contract per
   endpoint, and retry. Full Ziki error details are logged instead of the opaque

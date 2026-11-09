@@ -42,6 +42,9 @@ decisions, noop patterns, votes, idea shaping, API repair, capacity, URLs —
 all required config with fail-loud readers. Unknown Ziki kinds sort after
 every known kind into the `other` bucket and raise a visible
 `unknown_vocabulary`/`unknown_kind` warning instead of dropping work.
+`health.cycleErrorLimit` (default 5, `null` disables) is the
+consecutive-failure tolerance before a repeated cycle exception, agent
+start/timeout run, or GitHub auth failure parks the loop as blocked.
 
 ## External surfaces (P2c)
 
@@ -58,9 +61,13 @@ propose). Everything else gets a deterministic diagnosis first (template
 backfill for missing keys and unknown endpoints, aux-bucket placement for
 unknown kinds, `statuses.known` appends for drift vocabulary), then a
 `config-doctor` agent proposal, then a Ziki `human_approval` escalation
-(`APPROVE` applies; anything else re-proposes, bounded by `maxRounds`).
+(`APPROVE` applies; a clarifying reply re-proposes with rounds+1, bounded by
+`maxRounds`). A rejection or an exhausted round budget parks the strategy at
+a visible dead-end (`config:repair_dead_end` warning + NEEDS-HUMAN entry) —
+never a silent re-proposal; editing the config starts a fresh episode, and a
+successful repair clears it.
 New strategies: `config:missing_key`, `config:unknown_endpoint`,
-`*:unknown_kind`, `*:unknown_vocabulary`. New kind names are creatable under
+`*:unknown_kind`, `*:unknown_vocabulary`, `feed:not_found`, `*:not_found`. New kind names are creatable under
 `queue.priorities.*` (numbers only); new endpoint names are never invented.
 
 No deterministic bypasses: every non-hard failure (anything except
@@ -69,7 +76,9 @@ there is no code path that concludes "unfixable" on its own. The doctor may
 fetch unauthenticated public URLs (GET only) to investigate moved routes;
 the orchestrator live-verifies proposed endpoint ops (only a proven 404 +
 "no such API route" drops an op) before escalation. The human APPROVE gate
-is the only stop.
+is the only stop. Dead-ends (`config:repair_dead_end`) are reached only
+through the human — a rejection or rounds exhausted without approval —
+never by code concluding "unfixable" on its own.
 
 ## Drift review (P4)
 

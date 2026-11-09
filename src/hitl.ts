@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   ConfigPatchOp,
@@ -152,6 +152,13 @@ export async function escalate(
   });
   await notify(options.notifyCommand, `auto-work needs you: ${label}`, `${body}\n${link}`);
   await writeNeedsHuman(state, profile, profilePaths);
+  // Read-back: the escalation record must not claim NEEDS-HUMAN coverage
+  // that is not on disk. A missing/empty file here throws so the caller
+  // handles it (retry, park) instead of assuming the human was told.
+  const info = await stat(profilePaths.needsHumanFile).catch(() => null);
+  if (!info || info.size === 0) {
+    throw new Error(`NEEDS-HUMAN.md verification failed: ${profilePaths.needsHumanFile} missing or empty after write`);
+  }
   return { ok: true, escalation: record, link };
 }
 
@@ -335,6 +342,24 @@ export async function writeNeedsHuman(state: State, profile: ProfileConfig, prof
         ...(typeof blocker.details?.setupUrl === "string" ? [`  Setup: ${blocker.details.setupUrl}`] : []),
         ...(typeof blocker.details?.helpUrl === "string" ? [`  Help: ${blocker.details.helpUrl}`] : []),
         `  Last attempt: ${blocker.lastAttemptAt} · attempts: ${blocker.attempts}`
+      );
+    }
+    lines.push("");
+  }
+  const failedOutbox = state.outbox?.failed ?? [];
+  const expiredEscalations = Object.values(state.escalations).filter(
+    (escalation) => escalation.status === "expired"
+  );
+  if (failedOutbox.length || expiredEscalations.length) {
+    lines.push("## Dropped work (needs a human look)", "");
+    for (const entry of failedOutbox) {
+      lines.push(
+        `- outbox \`${entry.kind}\`${entry.issueNumber ? ` #${entry.issueNumber}` : ""}${entry.title ? ` (${entry.title})` : ""} — exhausted after ${entry.attempts} attempt(s): ${entry.lastError ?? "unknown error"}`
+      );
+    }
+    for (const escalation of expiredEscalations) {
+      lines.push(
+        `- expired ${escalation.kind ?? "issue"} escalation \`${escalation.id}\`${escalation.strategy ? ` (${escalation.strategy})` : ""}: ${escalation.answer ?? "no reason recorded"}`
       );
     }
     lines.push("");

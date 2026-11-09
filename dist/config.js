@@ -174,7 +174,9 @@ export const DEFAULT_TIMING = {
 };
 export const DEFAULT_REPAIR_STRATEGIES = {
     "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
+    "feed:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 },
     "feed:unexpected_response_shape": { enabled: true, role: "configDoctor", maxRounds: 3 },
+    "*:not_found": { enabled: true, role: "configDoctor", maxRounds: 2 },
     "*:unknown_filter": { enabled: true, role: "configDoctor", maxRounds: 2 },
     "config:missing_key": { enabled: true, role: "configDoctor", maxRounds: 2 },
     "config:unknown_endpoint": { enabled: true, role: "configDoctor", maxRounds: 2 },
@@ -674,6 +676,7 @@ export function validateConfig(config) {
         }
         errors.push(...validateTiming(profile?.timing, `${prefix}.timing`));
         errors.push(...validateHealthRetry(profile?.health?.retryMs, `${prefix}.health.retryMs`));
+        errors.push(...validateCycleErrorLimit(profile?.health?.cycleErrorLimit, `${prefix}.health.cycleErrorLimit`));
         validateRepairConfig(prefix, profile?.repair, errors);
         errors.push(...validateV4Sections(profile, `${prefix}`));
         if (Number(config.version) === 4) {
@@ -763,6 +766,14 @@ export function validateHealthRetry(value, label) {
         }
     }
     return errors;
+}
+export function validateCycleErrorLimit(value, label) {
+    if (value === undefined || value === null)
+        return [];
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+        return [`${label} must be a positive integer or null`];
+    }
+    return [];
 }
 function validateRepairConfig(prefix, repair, errors) {
     if (repair === undefined)

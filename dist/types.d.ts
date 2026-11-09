@@ -70,6 +70,12 @@ export interface ZikiStatusesConfig {
  */
 export interface HealthTuningConfig {
     retryMs?: Record<string, number | null>;
+    /**
+     * Consecutive-failure tolerance before a repeated failure parks the loop:
+     * applies to per-cycle exceptions (loop:cycle_error) and consecutive
+     * agent start/timeout failures. Null disables parking (warn forever).
+     */
+    cycleErrorLimit?: number | null;
 }
 /**
  * Timing policy (all ms). Every interval/timeout the loop uses lives here so
@@ -293,7 +299,7 @@ export interface TokenUsage {
 }
 export type ProviderLimit = "quota" | "rate-limit" | "context" | null;
 export type HealthSeverity = "warning" | "degraded" | "blocked";
-export type HealthComponent = "feed" | "inbox" | "platform" | "memory" | "provider" | "github" | "repo" | "config" | "agent" | "state";
+export type HealthComponent = "feed" | "inbox" | "platform" | "memory" | "provider" | "github" | "repo" | "config" | "agent" | "state" | "loop";
 export interface HealthBlocker {
     id: string;
     component: HealthComponent;
@@ -1065,6 +1071,13 @@ export interface State {
     /** Last ISO timestamps for the blocked-loop background passes. */
     lastOfflineWatchAt?: string | null;
     lastRepoHealthAt?: string | null;
+    /**
+     * Consecutive repair-escalation RPC failures per strategy code. Bounds
+     * re-proposal when Ziki cannot be reached: past the strategy's maxRounds
+     * the strategy parks at a visible dead-end instead of retrying forever.
+     * Reset on the next successful escalation.
+     */
+    repairEscalationFailures?: Record<string, number>;
 }
 export type OutboxKind = "createIdea" | "reportPrStatus" | "reportDeployment";
 export interface OutboxEntry {

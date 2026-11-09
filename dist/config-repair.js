@@ -5,6 +5,7 @@ import { DEFAULT_REPAIR_ALLOW_NEW_KEYS, DEFAULT_REPAIR_MUTABLE_PATHS, DEFAULT_RE
 import { apiPlatformFilter } from "./ziki.js";
 import { parseWorkUrl } from "./ziki-endpoints.js";
 import { fillProfileFromTemplates } from "./config-templates.js";
+import { mutexFor } from "./mutex.js";
 export const PROJECT_NOT_FOUND_MESSAGE = "Project not found.";
 /** True only for the retired-project signature — not for any other 404 (e.g. a renamed route). */
 export function isProjectNotFoundBlocker(code, message) {
@@ -32,20 +33,26 @@ export async function readLocalApprovals(profilePaths) {
     }
 }
 export async function consumeLocalApprovals(profilePaths) {
-    const approvals = await readLocalApprovals(profilePaths);
-    if (!approvals.length)
-        return [];
-    const file = approvalsFile(profilePaths);
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, "[]\n", "utf8").catch(() => { });
-    return approvals;
+    // Read + truncate must be atomic: the CLI's queueLocalApproval races the
+    // loop's consume, and a lost approval is a lost human decision.
+    return mutexFor(`approvals:${approvalsFile(profilePaths)}`).run(async () => {
+        const approvals = await readLocalApprovals(profilePaths);
+        if (!approvals.length)
+            return [];
+        const file = approvalsFile(profilePaths);
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, "[]\n", "utf8").catch(() => { });
+        return approvals;
+    });
 }
 export async function queueLocalApproval(profilePaths, approval) {
-    const current = await readLocalApprovals(profilePaths);
-    const next = [...current.filter((entry) => entry.id !== approval.id), approval];
-    const file = approvalsFile(profilePaths);
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    return mutexFor(`approvals:${approvalsFile(profilePaths)}`).run(async () => {
+        const current = await readLocalApprovals(profilePaths);
+        const next = [...current.filter((entry) => entry.id !== approval.id), approval];
+        const file = approvalsFile(profilePaths);
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    });
 }
 /** Merged repair config: profile values over built-in defaults. */
 export function repairConfigFor(profile) {
@@ -425,15 +432,16 @@ export async function applyConfigPatch(config, profileName, profilePaths, ops, l
     if (!patchCheck.ok)
         return { ok: false, errors: patchCheck.errors };
     const next = JSON.parse(JSON.stringify(config));
-    const nextRaw = next.profiles[profileName];
-    const nextDefaults = (next.defaults ?? {});
     for (const op of ops) {
-        // Prefer the raw profile section; fall back to defaults when the top-level
-        // key only lives there. New keys land in the raw profile section.
+        // Re-resolve the target from the accumulating `next` object on every
+        // iteration: setConfigPath returns a fresh clone, so holding a stale
+        // reference would silently drop every op but the last per section.
+        const currentRaw = next.profiles[profileName];
+        const currentDefaults = (next.defaults ?? {});
         const root = op.path.split(".")[0];
-        const target = root in nextRaw ? nextRaw : root in nextDefaults ? nextDefaults : nextRaw;
+        const target = root in currentRaw ? currentRaw : root in currentDefaults ? currentDefaults : currentRaw;
         const updated = setConfigPath(target, op.path, op.value);
-        if (target === nextRaw)
+        if (target === currentRaw)
             next.profiles[profileName] = updated;
         else
             next.defaults = updated;
@@ -445,11 +453,56 @@ export async function applyConfigPatch(config, profileName, profilePaths, ops, l
     const backupFile = `${profilePaths.stateDir}/config.backup-${stamp}.json`;
     await mkdir(path.dirname(backupFile), { recursive: true });
     await copyFile((await import("./platform/paths.js")).paths().configFile, backupFile).catch(() => { });
+    // Never report a backup path that does not exist: the copy above is
+    // best-effort (disk full, permissions), so check before claiming it.
+    const backupOk = existsSync(backupFile);
+    if (!backupOk) {
+        logger?.warn(`Config backup copy failed; proceeding without a backup at ${backupFile}`);
+    }
     await saveConfig(next);
-    logger?.info(`Config patch applied (${ops.length} op(s)), backup ${backupFile}`, {
+    // Read-back verification: the record must never overstate reality. Re-read
+    // the persisted config and confirm every op path holds the patched value
+    // (guards against partial writes, stale-reference bugs, and races).
+    const readBack = await verifyPersistedPatch(profileName, ops, logger);
+    if (!readBack.ok)
+        return { ok: false, errors: readBack.errors };
+    logger?.info(`Config patch applied (${ops.length} op(s))${backupOk ? `, backup ${backupFile}` : " (no backup)"}`, {
         ops: ops.map((op) => op.path)
     });
-    return { ok: true, backupFile };
+    return { ok: true, ...(backupOk ? { backupFile } : {}) };
+}
+/**
+ * Re-read the persisted config file and confirm every op path holds the
+ * expected value. Returns the mismatches, if any — the caller must treat a
+ * mismatch as a failed apply, never as "applied".
+ */
+export async function verifyPersistedPatch(profileName, ops, logger) {
+    const { paths } = await import("./platform/paths.js");
+    let raw;
+    try {
+        raw = JSON.parse(await readFile(paths().configFile, "utf8"));
+    }
+    catch (error) {
+        return { ok: false, errors: [`could not re-read config for verification: ${error instanceof Error ? error.message : String(error)}`] };
+    }
+    const stored = raw?.profiles?.[profileName];
+    const defaults = raw?.defaults;
+    const errors = [];
+    for (const op of ops) {
+        const root = op.path.split(".")[0];
+        const holder = stored && typeof stored === "object" && root in stored
+            ? stored
+            : defaults;
+        const actual = getConfigPath(holder, op.path);
+        if (JSON.stringify(actual) !== JSON.stringify(op.value)) {
+            errors.push(`read-back mismatch for ${op.path}: expected ${JSON.stringify(op.value)}, found ${JSON.stringify(actual)}`);
+        }
+    }
+    if (errors.length) {
+        logger?.warn(`Config patch verification failed (${errors.length} mismatch(es))`, { errors });
+        return { ok: false, errors };
+    }
+    return { ok: true };
 }
 /** Escalation body for a config-repair proposal. */
 export function formatRepairEscalationBody(options) {
@@ -479,6 +532,19 @@ export function latestStrategyEscalation(state, strategy) {
         escalation.status === "open")
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return open[0] ?? null;
+}
+/**
+ * Latest config escalation for a strategy regardless of status. The open-only
+ * lookup above cannot see terminal answers (rejected/dismissed/expired), so
+ * without this a rejection is silently re-proposed next cycle as if the
+ * human had never answered.
+ */
+export function latestStrategyEscalationAny(state, strategy) {
+    const all = Object.values(state.escalations)
+        .filter((escalation) => (escalation.kind ?? "issue") === "config" &&
+        escalation.strategy === strategy)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return all[0] ?? null;
 }
 /**
  * Supersede check: returns the newly covered paths when the fresh diagnosis is

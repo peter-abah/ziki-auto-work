@@ -499,3 +499,13 @@ test("validateConfigPatch enforces timing floors for agent proposals", () => {
   const forbidden = validateConfigPatch(profile, [{ path: "ziki.heartbeatMs", value: 1000 }], repair);
   assert.equal(forbidden.ok, false);
 });
+
+test("validateCycleErrorLimit accepts a positive int or null, rejects the rest", async () => {
+  const { validateCycleErrorLimit } = await import("./config.js");
+  assert.deepEqual(validateCycleErrorLimit(undefined, "health.cycleErrorLimit"), []);
+  assert.deepEqual(validateCycleErrorLimit(null, "health.cycleErrorLimit"), []);
+  assert.deepEqual(validateCycleErrorLimit(5, "health.cycleErrorLimit"), []);
+  assert.match(validateCycleErrorLimit(0, "health.cycleErrorLimit").join(";"), /positive integer/);
+  assert.match(validateCycleErrorLimit(1.5, "health.cycleErrorLimit").join(";"), /positive integer/);
+  assert.match(validateCycleErrorLimit("5", "health.cycleErrorLimit").join(";"), /positive integer/);
+});

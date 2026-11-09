@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DEFAULT_LIMITS, DEFAULT_WORKFLOW, validateConfigPatch } from "./config.js";
-import { APPROVAL_WORD, approveEscalation, applyRemoteAnswer, interpretHumanAnswer, isApprovalText, markEscalationExpired, openConfigEscalations, rejectEscalation } from "./hitl.js";
+import { APPROVAL_WORD, approveEscalation, applyRemoteAnswer, escalate, interpretHumanAnswer, isApprovalText, markEscalationExpired, openConfigEscalations, rejectEscalation } from "./hitl.js";
 import { applyConfigPatch, blockerCode, diagnoseProjectMismatch, matchReplacementProject, maxRoundsFor, repairConfigFor, strategyFor, supersedingPaths } from "./config-repair.js";
 function fixtureProfile(overrides = {}) {
     return {
@@ -313,6 +313,46 @@ test("applyConfigPatch persists an approved patch with backup", async () => {
             process.env.AUTO_WORK_CONFIG_DIR = previousHome;
     }
 });
+test("applyConfigPatch persists every op of a multi-op patch (no last-op-wins)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "aw-repair-"));
+    const previousHome = process.env.AUTO_WORK_CONFIG_DIR;
+    process.env.AUTO_WORK_CONFIG_DIR = dir;
+    try {
+        const { loadConfig } = await import("./config.js");
+        const profile = fixtureProfile({
+            repair: {
+                enabled: true,
+                mutablePaths: ["ziki.projectId", "ziki.projectSlug", "ziki.platformFilter"],
+                allowNewKeys: ["ziki.platformFilter"],
+                strategies: {
+                    "platform:not_found": { enabled: true, role: "configDoctor", maxRounds: 3 }
+                }
+            }
+        });
+        writeFileSync(path.join(dir, "config.json"), JSON.stringify({ version: 3, activeProfile: "demo", profiles: { demo: profile } }, null, 2));
+        writeFileSync(path.join(dir, "env"), "ZIKI_KEY1=test-key-1\nZIKI_KEY2=test-key-2\n");
+        const before = await loadConfig();
+        const { profilePaths } = await import("./platform/paths.js");
+        const paths = { ...profilePaths("demo"), stateDir: dir };
+        const ops = [
+            { path: "ziki.projectId", value: "c17fc461d8ec6105f842b1c84", reason: "rotation" },
+            { path: "ziki.projectSlug", value: "desktop", reason: "rotation" },
+            { path: "ziki.platformFilter", value: "desktop", reason: "remap" }
+        ];
+        const result = await applyConfigPatch(before, "demo", paths, ops);
+        assert.equal(result.ok, true);
+        const after = await loadConfig();
+        assert.equal(after.profiles["demo"]?.ziki.projectId, "c17fc461d8ec6105f842b1c84");
+        assert.equal(after.profiles["demo"]?.ziki.projectSlug, "desktop");
+        assert.equal(after.profiles["demo"]?.ziki.platformFilter, "desktop");
+    }
+    finally {
+        if (previousHome === undefined)
+            delete process.env.AUTO_WORK_CONFIG_DIR;
+        else
+            process.env.AUTO_WORK_CONFIG_DIR = previousHome;
+    }
+});
 test("applyConfigPatch refuses invalid patches without writing", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "aw-repair-"));
     const previousHome = process.env.AUTO_WORK_CONFIG_DIR;
@@ -338,6 +378,96 @@ test("applyConfigPatch refuses invalid patches without writing", async () => {
         else
             process.env.AUTO_WORK_CONFIG_DIR = previousHome;
     }
+});
+test("escalate verifies NEEDS-HUMAN.md is on disk before reporting ok", async () => {
+    const { emptyState } = await import("./state.js");
+    const dir = mkdtempSync(path.join(tmpdir(), "aw-escalate-"));
+    const profile = fixtureProfile({
+        urls: {
+            issuePath: "/{org?}/{project}/issues/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        }
+    });
+    const profilePaths = { needsHumanFile: path.join(dir, "NEEDS-HUMAN.md") };
+    const client = {
+        agentName: "test-agent",
+        escalate: async () => ({ escalation: { id: "esc-disk-1" } })
+    };
+    const state = emptyState();
+    const result = await escalate(client, profile, profilePaths, state, {
+        kind: "config",
+        type: "human_approval",
+        strategy: "platform:not_found",
+        body: "repair proposal"
+    });
+    assert.equal(result.ok, true);
+    const { readFileSync, statSync } = await import("node:fs");
+    assert.ok(statSync(profilePaths.needsHumanFile).size > 0);
+    assert.match(readFileSync(profilePaths.needsHumanFile, "utf8"), /repair proposal/);
+});
+test("escalate throws when NEEDS-HUMAN.md cannot be written (never claims coverage)", async () => {
+    const { emptyState } = await import("./state.js");
+    const dir = mkdtempSync(path.join(tmpdir(), "aw-escalate-"));
+    const blocker = path.join(dir, "blocker");
+    writeFileSync(blocker, "not a directory");
+    const profile = fixtureProfile({
+        urls: {
+            issuePath: "/{org?}/{project}/issues/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        }
+    });
+    const profilePaths = { needsHumanFile: path.join(blocker, "NEEDS-HUMAN.md") };
+    const client = {
+        agentName: "test-agent",
+        escalate: async () => ({ escalation: { id: "esc-disk-2" } })
+    };
+    await assert.rejects(escalate(client, profile, profilePaths, emptyState(), {
+        kind: "config",
+        type: "human_approval",
+        strategy: "platform:not_found",
+        body: "repair proposal"
+    }));
+});
+test("writeNeedsHuman surfaces dropped outbox entries and expired escalations", async () => {
+    const { emptyState } = await import("./state.js");
+    const { writeNeedsHuman } = await import("./hitl.js");
+    const dir = mkdtempSync(path.join(tmpdir(), "aw-nh-"));
+    const profile = fixtureProfile({
+        urls: {
+            issuePath: "/{org?}/{project}/issues/{issue}",
+            ideaPath: "/{org?}/{project}/ideas/{idea}",
+            inboxPath: "/inbox"
+        }
+    });
+    const profilePaths = { needsHumanFile: path.join(dir, "NEEDS-HUMAN.md") };
+    const state = emptyState();
+    state.outbox = {
+        items: [],
+        failed: [
+            {
+                id: "outbox-1",
+                kind: "createIdea",
+                body: { title: "Lost idea" },
+                title: "Lost idea",
+                addedAt: new Date().toISOString(),
+                attempts: 25,
+                lastError: "422 gone"
+            }
+        ]
+    };
+    state.escalations["esc-old"] = {
+        ...fixtureEscalation({ id: "esc-old", strategy: "platform:not_found" }),
+        status: "expired",
+        answer: "max proposal rounds (3) reached without approval"
+    };
+    await writeNeedsHuman(state, profile, profilePaths);
+    const { readFileSync } = await import("node:fs");
+    const text = readFileSync(profilePaths.needsHumanFile, "utf8");
+    assert.match(text, /Dropped work/);
+    assert.match(text, /Lost idea/);
+    assert.match(text, /esc-old/);
 });
 test("diagnoseUnknownFilter matches identity and single-platform cases", async () => {
     const { diagnoseUnknownFilter } = await import("./config-repair.js");
