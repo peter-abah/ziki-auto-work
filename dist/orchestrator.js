@@ -9,7 +9,7 @@ import { acquireLock, releaseLock, loadState, saveState, writePid, clearPid, isP
 import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
-import { apiPlatformFilter, ZikiError } from "./ziki.js";
+import { apiPlatformFilter, fetchLlmsText, ZikiError } from "./ziki.js";
 import { endpointVars, renderEndpoint } from "./ziki-endpoints.js";
 import { GitHub, branchName, slugify } from "./github.js";
 import { formatPrContext } from "./pr-context.js";
@@ -1119,6 +1119,31 @@ async function repairWarningLoop(ctx) {
         });
     }
 }
+/**
+ * Ziki's llms.txt API docs as doctor evidence, fetched once per run and
+ * reused by every round (a parked loop must not re-fetch it each cycle).
+ * The fetch is injectable for tests. Never throws: failures become an
+ * honest "unavailable" evidence line, never a missing one.
+ */
+export async function llmsEvidence(ctx, fetchFn = fetchLlmsText) {
+    try {
+        if (!ctx.llmsDocs) {
+            const transport = ctx.profile.transport;
+            const timeout = typeof transport?.defaultTimeoutMs === "number" && Number.isFinite(transport.defaultTimeoutMs) && transport.defaultTimeoutMs > 0
+                ? transport.defaultTimeoutMs
+                : 15_000;
+            const base = ctx.profile.ziki.baseUrl.replace(/\/+$/, "");
+            ctx.llmsDocs = await fetchFn(`${base}/llms.txt`, { timeoutMs: timeout, maxChars: 4000 });
+        }
+        const docs = ctx.llmsDocs;
+        return docs.text
+            ? `Ziki API docs (llms.txt, fetched live for this run):\n${docs.text}`
+            : `Ziki API docs (llms.txt) unavailable: ${docs.note}`;
+    }
+    catch (error) {
+        return `Ziki API docs (llms.txt) unavailable: ${error instanceof Error ? error.message : String(error)}`;
+    }
+}
 /** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. Exported for tests. */
 export async function runRepairStateMachine(ctx, code, blocker, strategy) {
     setPhase(ctx, "repair", code);
@@ -1564,6 +1589,9 @@ async function startRepairRound(ctx, code, blocker, strategy, previous, precompu
     if (diagnosed.done === "wait")
         return "wait";
     const { evidence, summary: deterministicSummary } = diagnosed;
+    // Every doctor round sees Ziki's live API docs (run-cached), whatever the
+    // failure: route context for endpoint gaps, vocabulary context for the rest.
+    evidence.push(await llmsEvidence(ctx));
     let deterministicOps = diagnosed.ops;
     if (ctx.dryRun) {
         ctx.logger.info(`Dry run: config-repair round ${round}/${maxRounds} for ${code} (no agent, no escalation)`, {
@@ -5165,6 +5193,7 @@ async function createContext(loaded, state, logger, options) {
         profileSynced: false,
         feedAgentCounts: {},
         configMtimeMs: await configFileMtimeMs(),
+        llmsDocs: null,
         zikiWorkflow,
         reservedTargets: new Set(),
         statusTimer: null

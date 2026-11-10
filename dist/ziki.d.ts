@@ -13,6 +13,18 @@ export declare class ZikiError extends Error {
         cause?: unknown;
     });
 }
+/**
+ * Fetch Ziki's public API docs for agent evidence. Unauthenticated GET,
+ * never throws: every failure mode returns a note explaining why the docs
+ * are absent, so the caller always has something truthful to show.
+ */
+export declare function fetchLlmsText(url: string, options?: {
+    timeoutMs?: number;
+    maxChars?: number;
+}): Promise<{
+    text: string | null;
+    note: string;
+}>;
 export interface ApiRepairContext {
     method: string;
     path: string;

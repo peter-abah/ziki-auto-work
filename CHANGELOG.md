@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The config-doctor now always sees Ziki's live `llms.txt` API docs: fetched
+  once per run (in-memory cache, honest "unavailable" line on failure) and
+  appended to every round's evidence, whatever the failure. Well-typed new
+  keys under `ziki.endpoints.*` / `operations.*` pass patch validation so
+  the doctor can propose llms-documented routes — still APPROVE-gated,
+  live-verified before escalation, and read-back verified on apply. The
+  agent acting alone still cannot invent routes.
+
 - Fixed multi-op config patches persisting only the last op per section
   (`applyConfigPatch` re-resolves its target every iteration), and added
   read-back verification: the persisted config is re-read and every op path

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ZikiClient } from "./ziki.js";
+import { ZikiClient, fetchLlmsText } from "./ziki.js";
 import { loadInitTemplates } from "./config-templates.js";
 const templates = await loadInitTemplates();
 const testTransport = templates.transport;
@@ -219,5 +219,32 @@ test("a valid work feed passes shape validation", async () => {
     const result = await client.work();
     assert.equal(result.notModified, false);
     assert.deepEqual(result.data, feed);
+});
+const originalFetch = globalThis.fetch;
+test("fetchLlmsText returns truncated docs text", async () => {
+    globalThis.fetch = originalFetch;
+    try {
+        const big = "x".repeat(100);
+        const result = await fetchLlmsText(`data:text/plain,${big}`, { timeoutMs: 5000, maxChars: 10 });
+        assert.equal(result.text, "xxxxxxxxxx");
+        assert.equal(result.note, "");
+        const empty = await fetchLlmsText("data:text/plain,", { timeoutMs: 5000 });
+        assert.equal(empty.text, null);
+        assert.match(empty.note, /empty/);
+    }
+    finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+test("fetchLlmsText never throws on unreachable hosts", async () => {
+    globalThis.fetch = originalFetch;
+    try {
+        const result = await fetchLlmsText("http://127.0.0.1:1/llms.txt", { timeoutMs: 2000 });
+        assert.equal(result.text, null);
+        assert.match(result.note, /unreachable/);
+    }
+    finally {
+        globalThis.fetch = originalFetch;
+    }
 });
 //# sourceMappingURL=ziki.test.js.map

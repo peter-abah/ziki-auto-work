@@ -57,7 +57,7 @@ import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
 import type { TaskKind } from "./scheduler.js";
 import { clientForAgent, normalizeIdea, normalizeIssue } from "./ziki.js";
-import { apiPlatformFilter, ZikiError } from "./ziki.js";
+import { apiPlatformFilter, fetchLlmsText, ZikiError } from "./ziki.js";
 import { endpointVars, renderEndpoint } from "./ziki-endpoints.js";
 import type { ApiRepairContext, ApiRepairHandler, ApiRepairResult, ZikiClient } from "./ziki.js";
 import { GitHub, branchName, slugify } from "./github.js";
@@ -376,6 +376,12 @@ interface Context {
   feedAgentCounts: Record<string, number>;
   /** mtime of config.json when ctx.profile was loaded; hot-reload on change. */
   configMtimeMs: number | null;
+  /**
+   * Ziki's llms.txt docs, fetched once per run and reused by every
+   * config-doctor round. Null until the first fetch; a failed fetch is
+   * cached as { text: null, note } so a dead docs page costs one GET.
+   */
+  llmsDocs: { text: string | null; note: string } | null;
   zikiWorkflow: Record<string, unknown> | null;
   reservedTargets: Set<string>;
   statusTimer: NodeJS.Timeout | null;
@@ -1371,6 +1377,35 @@ async function repairWarningLoop(ctx: Context): Promise<void> {
   }
 }
 
+/**
+ * Ziki's llms.txt API docs as doctor evidence, fetched once per run and
+ * reused by every round (a parked loop must not re-fetch it each cycle).
+ * The fetch is injectable for tests. Never throws: failures become an
+ * honest "unavailable" evidence line, never a missing one.
+ */
+export async function llmsEvidence(
+  ctx: Context,
+  fetchFn: typeof fetchLlmsText = fetchLlmsText
+): Promise<string> {
+  try {
+    if (!ctx.llmsDocs) {
+      const transport = ctx.profile.transport as { defaultTimeoutMs?: unknown } | undefined;
+      const timeout =
+        typeof transport?.defaultTimeoutMs === "number" && Number.isFinite(transport.defaultTimeoutMs) && transport.defaultTimeoutMs > 0
+          ? transport.defaultTimeoutMs
+          : 15_000;
+      const base = ctx.profile.ziki.baseUrl.replace(/\/+$/, "");
+      ctx.llmsDocs = await fetchFn(`${base}/llms.txt`, { timeoutMs: timeout, maxChars: 4000 });
+    }
+    const docs = ctx.llmsDocs;
+    return docs.text
+      ? `Ziki API docs (llms.txt, fetched live for this run):\n${docs.text}`
+      : `Ziki API docs (llms.txt) unavailable: ${docs.note}`;
+  } catch (error) {
+    return `Ziki API docs (llms.txt) unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 /** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. Exported for tests. */
 export async function runRepairStateMachine(
   ctx: Context,
@@ -1483,7 +1518,6 @@ export interface RepairDeadEnd {
   /** Config mtime when the dead-end was recorded; a change reopens the episode. */
   configMtime: number | null;
 }
-
 /** The recorded dead-end for a repair strategy, if its details match. */
 export function repairDeadEndFor(ctx: Context, code: string): RepairDeadEnd | null {
   const deadEnd = ctx.state.health.blockers["config:repair_dead_end"];
@@ -1869,6 +1903,9 @@ async function startRepairRound(
   if (diagnosed.done === "continue") return "continue";
   if (diagnosed.done === "wait") return "wait";
   const { evidence, summary: deterministicSummary } = diagnosed;
+  // Every doctor round sees Ziki's live API docs (run-cached), whatever the
+  // failure: route context for endpoint gaps, vocabulary context for the rest.
+  evidence.push(await llmsEvidence(ctx));
   let deterministicOps = diagnosed.ops;
 
   if (ctx.dryRun) {
@@ -5651,6 +5688,7 @@ async function createContext(
     profileSynced: false,
     feedAgentCounts: {},
     configMtimeMs: await configFileMtimeMs(),
+    llmsDocs: null,
     zikiWorkflow,
     reservedTargets: new Set(),
     statusTimer: null

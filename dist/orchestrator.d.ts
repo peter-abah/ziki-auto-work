@@ -2,6 +2,7 @@ import type { Config, ConfigPatchOp, HealthBlocker, Idea, Issue, ProfileConfig, 
 import type { Logger } from "./log.js";
 import { Mutex } from "./mutex.js";
 import { TaskPool } from "./scheduler.js";
+import { fetchLlmsText } from "./ziki.js";
 import type { ZikiClient } from "./ziki.js";
 import { GitHub } from "./github.js";
 import type { MemoryContext } from "./memory.js";
@@ -71,10 +72,26 @@ interface Context {
     feedAgentCounts: Record<string, number>;
     /** mtime of config.json when ctx.profile was loaded; hot-reload on change. */
     configMtimeMs: number | null;
+    /**
+     * Ziki's llms.txt docs, fetched once per run and reused by every
+     * config-doctor round. Null until the first fetch; a failed fetch is
+     * cached as { text: null, note } so a dead docs page costs one GET.
+     */
+    llmsDocs: {
+        text: string | null;
+        note: string;
+    } | null;
     zikiWorkflow: Record<string, unknown> | null;
     reservedTargets: Set<string>;
     statusTimer: NodeJS.Timeout | null;
 }
+/**
+ * Ziki's llms.txt API docs as doctor evidence, fetched once per run and
+ * reused by every round (a parked loop must not re-fetch it each cycle).
+ * The fetch is injectable for tests. Never throws: failures become an
+ * honest "unavailable" evidence line, never a missing one.
+ */
+export declare function llmsEvidence(ctx: Context, fetchFn?: typeof fetchLlmsText): Promise<string>;
 /** Shared repair state machine. "wait" = repair pending; "continue" = repaired or nothing pending. Exported for tests. */
 export declare function runRepairStateMachine(ctx: Context, code: string, blocker: HealthBlocker, strategy: RepairStrategyConfig): Promise<"wait" | "continue">;
 export interface RepairDeadEnd {

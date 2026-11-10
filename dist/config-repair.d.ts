@@ -94,8 +94,9 @@ export interface UnknownEndpointDiagnosis {
  * Deterministic unknown-endpoint repair: an operations entry points at an
  * endpoint name missing from ziki.endpoints. If init templates know that
  * endpoint (config drift), propose the template value. If templates don't
- * know it either, Ziki added a route — a human must add the endpoint first
- * (agents never invent API routes).
+ * know it either, Ziki added a route: no deterministic ops here (guessing
+ * routes is never deterministic) — the config-doctor proposes from the
+ * live llms.txt evidence instead, and the human APPROVE gate admits it.
  */
 export declare function diagnoseUnknownEndpoint(group: string, name: string, profile: ProfileConfig, templates: InitTemplates): UnknownEndpointDiagnosis;
 /** Parse "unknown endpoint: group.name" / "unknown operation: group.name" from a blocker message. */

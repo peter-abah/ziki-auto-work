@@ -309,7 +309,9 @@
     "allowNewKeys": [
       "ziki.platformFilter",
       "ziki.orgSlug",
-      "queue.priorities.*"
+      "queue.priorities.*",
+      "ziki.endpoints.*",
+      "operations.*"
     ],
     "strategies": {
       "platform:not_found": {

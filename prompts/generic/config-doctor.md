@@ -71,6 +71,9 @@ Rules:
 - If you cannot verify a candidate value against the evidence above, say so
   in `notes` and either propose nothing (`"configPatch": []`) or mark the
   op uncertain — never invent IDs, URLs, or slugs.
+- The evidence includes Ziki's live llms.txt API docs when reachable.
+  Prefer routes documented there over guesses, and say in `notes` whether
+  each proposed route came from those docs or could not be verified.
 - Do not edit any files. You may fetch unauthenticated public URLs (GET only —
   e.g. the project's public pages or API docs) to investigate a moved route or
   renamed value. Never send writes, never use credentials, never put secrets in

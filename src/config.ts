@@ -162,9 +162,14 @@ export const DEFAULT_REPAIR_ALLOW_NEW_KEYS = [
   "ziki.platformFilter",
   "ziki.orgSlug",
   // New Ziki work kinds arrive as new priority keys; values must be numbers
-  // (enforced in validateConfigPatch). Endpoint names stay closed: unknown
-  // API routes are never invented, only remapped.
-  "queue.priorities.*"
+  // (enforced in validateConfigPatch).
+  "queue.priorities.*",
+  // New endpoint/operation names are proposable ONLY behind the human
+  // APPROVE gate, with Ziki's live llms.txt in the doctor's evidence and
+  // live verification before escalation. The agent acting alone still
+  // cannot invent routes: unapproved proposals never persist.
+  "ziki.endpoints.*",
+  "operations.*"
 ];
 
 export const DEFAULT_ZIKI_STATUSES = {

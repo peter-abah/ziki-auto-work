@@ -21,6 +21,33 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 /**
+ * Fetch Ziki's public API docs for agent evidence. Unauthenticated GET,
+ * never throws: every failure mode returns a note explaining why the docs
+ * are absent, so the caller always has something truthful to show.
+ */
+export async function fetchLlmsText(url, options = {}) {
+    const timeoutMs = options.timeoutMs ?? 15_000;
+    const maxChars = options.maxChars ?? 4000;
+    let response;
+    try {
+        response = await fetch(url, {
+            headers: { Accept: "text/plain, text/markdown, */*" },
+            signal: AbortSignal.timeout(timeoutMs)
+        });
+    }
+    catch (error) {
+        return { text: null, note: `llms.txt unreachable (${error instanceof Error ? error.message : String(error)})` };
+    }
+    if (!response.ok) {
+        return { text: null, note: `llms.txt unreachable (HTTP ${response.status} at ${url})` };
+    }
+    const raw = await response.text().catch(() => null);
+    if (typeof raw !== "string" || !raw.trim()) {
+        return { text: null, note: "llms.txt empty" };
+    }
+    return { text: raw.slice(0, maxChars), note: "" };
+}
+/**
  * Guard against silent shape changes: an HTML login page, a moved endpoint
  * returning prose, or a restructured payload must fail loudly here instead of
  * flowing downstream as an empty-but-valid result.

@@ -592,4 +592,22 @@ test("diagnoseUnknownEndpoint backfills from templates, never invents", async ()
     assert.deepEqual(novel.ops, []);
     assert.match(novel.summary, /manually/);
 });
+test("validateConfigPatch accepts llms-backed new endpoint and operation keys", async () => {
+    const { DEFAULT_REPAIR_ALLOW_NEW_KEYS } = await import("./config.js");
+    assert.ok(DEFAULT_REPAIR_ALLOW_NEW_KEYS.includes("ziki.endpoints.*"));
+    assert.ok(DEFAULT_REPAIR_ALLOW_NEW_KEYS.includes("operations.*"));
+    const profile = fixtureProfile();
+    const repair = {
+        enabled: true,
+        mutablePaths: ["ziki.endpoints.*", "operations.*"],
+        allowNewKeys: ["ziki.endpoints.*", "operations.*"],
+        strategies: {}
+    };
+    const endpoint = validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.newRoute", value: "/api/v1/issues/new" }], repair);
+    assert.deepEqual(endpoint, { ok: true, errors: [] });
+    const operation = validateConfigPatch(profile, [{ path: "operations.issues.newOp", value: { method: "GET" } }], repair);
+    assert.equal(operation.ok, true);
+    const mistyped = validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.newRoute", value: 42 }], repair);
+    assert.equal(mistyped.ok, false);
+});
 //# sourceMappingURL=config-repair.test.js.map

@@ -136,7 +136,7 @@ test("template repair registry matches the built-in defaults (drift guard)", asy
     assert.deepEqual(repair.allowNewKeys, [...DEFAULT_REPAIR_ALLOW_NEW_KEYS]);
     assert.deepEqual(repair.strategies, JSON.parse(JSON.stringify(DEFAULT_REPAIR_STRATEGIES)));
 });
-test("repair patch accepts new queue priorities but rejects new endpoints", async () => {
+test("repair patch accepts new queue priorities and llms-backed new endpoints", async () => {
     const templates = await loadInitTemplates();
     const config = {
         version: 3,
@@ -149,7 +149,10 @@ test("repair patch accepts new queue priorities but rejects new endpoints", asyn
     const repair = { enabled: true, mutablePaths: [...DEFAULT_REPAIR_MUTABLE_PATHS], allowNewKeys: [...DEFAULT_REPAIR_ALLOW_NEW_KEYS], strategies: {} };
     assert.equal(validateConfigPatch(profile, [{ path: "queue.priorities.brand_new_kind", value: 40 }], repair).ok, true);
     assert.equal(validateConfigPatch(profile, [{ path: "queue.priorities.brand_new_kind", value: "high" }], repair).ok, false);
-    assert.equal(validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.newRoute", value: "/api/v1/x" }], repair).ok, false);
+    // New endpoint names are proposable behind the human APPROVE gate (with
+    // llms.txt in the doctor's evidence); mistyped values still fail loud.
+    assert.equal(validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.newRoute", value: "/api/v1/x" }], repair).ok, true);
+    assert.equal(validateConfigPatch(profile, [{ path: "ziki.endpoints.issues.newRoute", value: 42 }], repair).ok, false);
     assert.equal(validateConfigPatch(profile, [{ path: "statuses.terminal", value: ["done"] }], repair).ok, false);
 });
 test("migrated v3 config validates clean", async () => {

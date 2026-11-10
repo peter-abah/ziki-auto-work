@@ -68,7 +68,9 @@ never a silent re-proposal; editing the config starts a fresh episode, and a
 successful repair clears it.
 New strategies: `config:missing_key`, `config:unknown_endpoint`,
 `*:unknown_kind`, `*:unknown_vocabulary`, `feed:not_found`, `*:not_found`. New kind names are creatable under
-`queue.priorities.*` (numbers only); new endpoint names are never invented.
+`queue.priorities.*` (numbers only); new endpoint/operation names are
+proposable only from Ziki's live llms.txt evidence and only behind the
+human APPROVE gate — the loop never calls or persists an unapproved route.
 
 No deterministic bypasses: every non-hard failure (anything except
 provider/model errors and missing keys) reaches the config-doctor agent —

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { diagnoseForCode, runRepairStateMachine, save, verifyEndpointOps } from "./orchestrator.js";
+import { diagnoseForCode, llmsEvidence, runRepairStateMachine, save, verifyEndpointOps } from "./orchestrator.js";
 import { strategyFor } from "./config-repair.js";
 import { loadInitTemplates, fillProfileFromTemplates } from "./config-templates.js";
 import { ZikiError } from "./ziki.js";
@@ -326,4 +326,30 @@ test("save() parks on state:persist when the state dir is unwritable, and recove
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("llmsEvidence fetches once per run and stays honest on failure", async () => {
+  const profile = filledProfile();
+  let calls = 0;
+  const stub = async (url: string) => {
+    calls += 1;
+    return { text: `docs from ${url}`, note: "" };
+  };
+  const ctx = { profile, llmsDocs: null } as never;
+  const first = await llmsEvidence(ctx, stub);
+  const second = await llmsEvidence(ctx, stub);
+  assert.equal(calls, 1);
+  assert.match(first, /docs from https:\/\/ziki\.dev\/llms\.txt/);
+  assert.equal(first, second);
+  let failCalls = 0;
+  const failing = async () => {
+    failCalls += 1;
+    return { text: null as string | null, note: "down" };
+  };
+  const ctx2 = { profile, llmsDocs: null } as never;
+  const a = await llmsEvidence(ctx2, failing);
+  const b = await llmsEvidence(ctx2, failing);
+  assert.equal(failCalls, 1);
+  assert.match(a, /unavailable: down/);
+  assert.equal(a, b);
 });
